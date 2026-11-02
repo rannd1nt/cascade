@@ -3,15 +3,22 @@
 //! All Win32 behaviour lives in `fontaine-win`; this binary parses argv and
 //! reports results. See `docs/architecture.md` §2.
 
+// GUI subsystem: starting the daemon must never create a console window
+// (M1-F, measured flash of ~100 ms with focus steal on a console build).
+// The CLI re-attaches to a console in `console::prepare_stdio`.
+#![windows_subsystem = "windows"]
+
 use std::process::ExitCode;
 
-use fontaine_win::{control, daemon, doctor, dpi, host, registry};
+use fontaine_win::{console, control, daemon, doctor, dpi, host, registry};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
-    dpi::set_per_monitor_v2();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // First: every path below may print.
+    console::prepare_stdio(is_daemon_role(&args));
+    dpi::set_per_monitor_v2();
     match dispatch(&args) {
         Ok(code) => code,
         Err(message) => {
@@ -19,6 +26,15 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `run`, `--autostart`, and the bare form start the long-lived daemon;
+/// everything else is a one-shot CLI command that must print.
+fn is_daemon_role(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        None | Some("run") | Some("--autostart")
+    )
 }
 
 fn dispatch(args: &[String]) -> Result<ExitCode, String> {
@@ -91,7 +107,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     match daemon::run(options) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(err) => {
-            eprintln!("fontaine: {err}");
+            // Best effort: a console close may already have invalidated the
+            // handles, and a panic here would be reported as a crash.
+            fontaine_win::derr!("fontaine: {err}");
             Ok(ExitCode::from(1))
         }
     }

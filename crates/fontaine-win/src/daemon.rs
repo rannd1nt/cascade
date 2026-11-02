@@ -19,7 +19,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_CLOSE, WM_QUIT,
 };
 
-use crate::console;
 use crate::control::{self, ControlWindow};
 use crate::host::{self, Host, HostOptions};
 use crate::monitor::{self, MonitorInfo};
@@ -209,10 +208,6 @@ pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
         return Err(DaemonError::AlreadyRunning(existing as usize));
     }
 
-    // Started by the Run key or by double-click: close the console window we
-    // own so the daemon stays silent. Started from a terminal: keep it.
-    let console_detached = console::detach_if_private();
-
     install_panic_hook();
 
     let store = Store::open();
@@ -225,15 +220,7 @@ pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
     unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 1) };
 
     let snapshot = crate::wallpaper::snapshot();
-    println!(
-        "fontaine {} starting{}",
-        env!("CARGO_PKG_VERSION"),
-        if console_detached {
-            " (console detached)"
-        } else {
-            ""
-        }
-    );
+    println!("fontaine {} starting", env!("CARGO_PKG_VERSION"));
     // The executable path makes bug reports unambiguous: it shows exactly
     // which build is running and from where (install dir vs. a temp copy).
     if let Ok(exe) = std::env::current_exe() {
