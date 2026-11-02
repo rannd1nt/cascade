@@ -1,6 +1,8 @@
 //! Public API for `fontaine-win`.
 
+pub mod console;
 pub mod control;
+pub mod daemon;
 pub mod doctor;
 pub mod dpi;
 pub mod host;
@@ -9,6 +11,7 @@ pub mod present;
 pub mod registry;
 pub mod repaint;
 pub mod shell;
+pub mod state;
 pub mod system;
 pub mod wallpaper;
 pub mod wide;
