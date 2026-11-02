@@ -523,7 +523,7 @@ impl Host {
                             // Falling back to GDI keeps the classic desktop
                             // working; on the raised desktop it will not be
                             // visible, so say so loudly.
-                            eprintln!("host: {} presenter unavailable: {err}", monitor.id);
+                            crate::derr!("host: {} presenter unavailable: {err}", monitor.id);
                             None
                         }
                     };

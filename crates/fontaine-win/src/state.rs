@@ -95,7 +95,7 @@ impl Store {
         match serde_json::from_str::<DaemonState>(&text) {
             Ok(state) if state.version == STATE_VERSION => Some(state),
             Ok(state) => {
-                eprintln!(
+                crate::derr!(
                     "state: ignoring {} (version {}, expected {STATE_VERSION})",
                     path.display(),
                     state.version
@@ -103,7 +103,7 @@ impl Store {
                 None
             }
             Err(err) => {
-                eprintln!("state: ignoring unreadable {}: {err}", path.display());
+                crate::derr!("state: ignoring unreadable {}: {err}", path.display());
                 None
             }
         }
