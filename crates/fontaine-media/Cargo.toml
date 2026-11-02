@@ -1,0 +1,8 @@
+[package]
+name = "fontaine-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fontaine-core = { workspace = true }

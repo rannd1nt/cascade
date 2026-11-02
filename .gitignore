@@ -1,0 +1,13 @@
+target/
+**/*.rs.bk
+*.pdb
+*.exe
+*.dll
+*.zip
+
+# local dev assets, never committed
+/dev-assets/
+*.mp4
+*.mkv
+*.mov
+*.webm
