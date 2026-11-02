@@ -66,7 +66,8 @@ A wallpaper app must never eat the wallpaper. Fontaine:
 
 - **does not install itself as your wallpaper** — it draws over the desktop, leaving your
   wallpaper configuration untouched;
-- restores the desktop on every exit path (tray, Ctrl+C, logoff, panic);
+- restores the desktop on every exit path (tray, Ctrl+C, closing the terminal that
+  launched it, logoff, panic);
 - repairs a blank desktop on the next start after a crash or a Task Manager kill;
 - reattaches within ~5 seconds if Explorer restarts;
 - pauses when the desktop is not visible (fullscreen, lock, display off).
@@ -76,7 +77,8 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
 ## Known limitations
 
 - **Antivirus false positives.** An unsigned `fontaine.exe` that writes a Run-key
-  autostart entry, hides its console, and stays resident matches the behavioural
+  autostart entry, starts with no console window of its own (GUI subsystem), and stays
+  resident matches the behavioural
   signature of persistence malware — Microsoft Defender flagged it as
   `Behavior:Win32/Persistence.A!ml` during development. Two things reduce this: install
   outside temp/download folders, and **code signing** (not yet done; it costs money and
