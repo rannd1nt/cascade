@@ -1,0 +1,16 @@
+//! Public API for `fontaine-win`.
+
+pub mod control;
+pub mod doctor;
+pub mod dpi;
+pub mod host;
+pub mod monitor;
+pub mod present;
+pub mod registry;
+pub mod repaint;
+pub mod shell;
+pub mod system;
+pub mod wallpaper;
+pub mod wide;
+
+pub use fontaine_core;

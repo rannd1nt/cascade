@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/fontaine-core",
     "crates/fontaine-media",
+    "crates/fontaine-win",
 ]
 
 [workspace.package]
@@ -14,6 +15,7 @@ rust-version = "1.80"
 [workspace.dependencies]
 fontaine-core = { path = "crates/fontaine-core" }
 fontaine-media = { path = "crates/fontaine-media" }
+fontaine-win = { path = "crates/fontaine-win" }
 
 [profile.release]
 opt-level = 2

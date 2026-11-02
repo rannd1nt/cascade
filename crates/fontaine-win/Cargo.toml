@@ -1,0 +1,31 @@
+[package]
+name = "fontaine-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fontaine-core = { workspace = true }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+] }
+# `windows-sys` no longer ships the D3D11/DXGI (nor Media Foundation) bindings,
+# and the renderer needs COM interfaces with vtable dispatch. The two crates
+# coexist: `windows-sys` for the flat Win32 calls, `windows` for graphics.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
