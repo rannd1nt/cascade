@@ -3,30 +3,30 @@
 version = 4
 
 [[package]]
-name = "fontaine"
+name = "cascade"
 version = "0.1.0-alpha.0"
 dependencies = [
- "fontaine-core",
- "fontaine-media",
- "fontaine-win",
+ "cascade-core",
+ "cascade-media",
+ "cascade-win",
 ]
 
 [[package]]
-name = "fontaine-core"
+name = "cascade-core"
 version = "0.1.0-alpha.0"
 
 [[package]]
-name = "fontaine-media"
+name = "cascade-media"
 version = "0.1.0-alpha.0"
 dependencies = [
- "fontaine-core",
+ "cascade-core",
 ]
 
 [[package]]
-name = "fontaine-win"
+name = "cascade-win"
 version = "0.1.0-alpha.0"
 dependencies = [
- "fontaine-core",
+ "cascade-core",
  "serde",
  "serde_json",
  "windows",

@@ -1,6 +1,6 @@
 //! Read-only snapshot of the user's wallpaper configuration.
 //!
-//! Fontaine never installs itself as the wallpaper. This snapshot exists for
+//! Cascade never installs itself as the wallpaper. This snapshot exists for
 //! diagnostics and for the last-resort repaint level (re-applying the *current*
 //! setting without changing it).
 

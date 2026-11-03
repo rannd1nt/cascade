@@ -1,6 +1,6 @@
 //! Minimal registry helpers.
 //!
-//! Read/write only what Fontaine needs: autostart and a few diagnostics values.
+//! Read/write only what Cascade needs: autostart and a few diagnostics values.
 //! Nothing here touches another application's data.
 
 // Win32 `HKEY` is a raw pointer. Every caller passes one of the predefined
@@ -21,7 +21,7 @@ use crate::wide;
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub const STARTUP_APPROVED_KEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
-pub const AUTOSTART_VALUE: &str = "Fontaine";
+pub const AUTOSTART_VALUE: &str = "Cascade";
 
 /// Read a `REG_SZ` value. Returns `None` when the key or value is absent.
 pub fn read_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
@@ -182,7 +182,7 @@ pub fn delete_value(subkey: &str, value: &str) -> Result<(), u32> {
     }
 }
 
-/// Registry-visible state of Fontaine's autostart entry.
+/// Registry-visible state of Cascade's autostart entry.
 #[derive(Clone, Debug, Default)]
 pub struct AutostartState {
     pub registered: bool,
@@ -231,7 +231,7 @@ pub fn autostart_enable(exe: &Path) -> Result<(), u32> {
     write_string(RUN_KEY, AUTOSTART_VALUE, &autostart_command(exe))
 }
 
-/// Remove Fontaine's `Run` value. The video files are untouched.
+/// Remove Cascade's `Run` value. The video files are untouched.
 pub fn autostart_disable() -> Result<(), u32> {
     delete_value(RUN_KEY, AUTOSTART_VALUE)
 }

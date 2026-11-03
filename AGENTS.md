@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Instructions for anyone (human or agent) working on Fontaine.
+Instructions for anyone (human or agent) working on Cascade.
 
 **Read order:** this file → `docs/architecture.md` → `docs/reliability.md` →
 `docs/quality.md` → `docs/ipc.md` → `docs/spike-m0.md`.
@@ -22,9 +22,9 @@ Current state: **docs complete, M0 complete, implementation starts at M1.**
 The app has three roles in one binary:
 
 ```
-fontaine.exe               daemon + tray (runs from logon to logoff)
-fontaine.exe --ui          GUI client (only while the window is open)
-fontaine.exe <command>     CLI client (one-shot)
+cascade.exe               daemon + tray (runs from logon to logoff)
+cascade.exe --ui          GUI client (only while the window is open)
+cascade.exe <command>     CLI client (one-shot)
 ```
 
 Keep answers and reasoning in the language the user writes in (Indonesian is fine), but
@@ -56,7 +56,7 @@ idea does not fit one of them, it is a v1.1 idea.
 
 1. **The desktop must never be left blank.** Every exit path restores/repaints. A hard
    kill must be repaired on the next start. This is the product's core promise.
-2. **Fontaine never owns the wallpaper setting.** Do not call `SetWallpaper` /
+2. **Cascade never owns the wallpaper setting.** Do not call `SetWallpaper` /
    `SPI_SETDESKWALLPAPER` to install itself. Only the last-resort repaint may call SPI
    with a path, under the conditions in `docs/reliability.md` §3.
 3. **Never delete, move, or modify user media.** "Remove" edits the library list only.
@@ -70,10 +70,10 @@ idea does not fit one of them, it is a v1.1 idea.
    injection, no patching Explorer.
 8. **No elevation.** Manifest stays `asInvoker`.
 9. **No network calls** in the product.
-10. **One distributable binary.** The release is one `fontaine.exe` plus OS DLLs.
-11. **No async runtime** in `fontaine-core` / `fontaine-win`. Threads + channels.
-12. **Don't touch other apps' data.** Only `%APPDATA%\Fontaine` and
-    `%LOCALAPPDATA%\Fontaine` are ours.
+10. **One distributable binary.** The release is one `cascade.exe` plus OS DLLs.
+11. **No async runtime** in `cascade-core` / `cascade-win`. Threads + channels.
+12. **Don't touch other apps' data.** Only `%APPDATA%\Cascade` and
+    `%LOCALAPPDATA%\Cascade` are ours.
 13. **Never prevent sleep, shutdown, or logoff.** Return TRUE from `WM_QUERYENDSESSION`
     unconditionally. No `SetThreadExecutionState(ES_DISPLAY_REQUIRED)`.
 
@@ -82,16 +82,16 @@ idea does not fit one of them, it is a v1.1 idea.
 ## 4. Architecture rules
 
 - Dependency direction (enforced by review, later by CI):
-  - `fontaine-win` must not depend on `fontaine-media`.
-  - `fontaine-media` must not depend on `fontaine-win`.
-  - `fontaine-ui` must not depend on `fontaine-win` (no desktop-hack code in the UI).
-  - IPC types live in `fontaine-core`.
+  - `cascade-win` must not depend on `cascade-media`.
+  - `cascade-media` must not depend on `cascade-win`.
+  - `cascade-ui` must not depend on `cascade-win` (no desktop-hack code in the UI).
+  - IPC types live in `cascade-core`.
 - `HostSurface { hwnd, monitor, rect, dpi }` is the only win → media boundary.
 - `RuleEngine` is pure: events in, `DesiredPlayback` out. No Win32 inside.
 - One host window per monitor. Do not "simplify" to one window spanning the desktop.
 - COM: apartment-initialized per thread, RAII wrappers, released before thread exit.
 - Every `unsafe` block needs a `// SAFETY:` comment. Prefer confining `unsafe` to
-  `fontaine-win` and `fontaine-media`.
+  `cascade-win` and `cascade-media`.
 - No `unwrap()`/`expect()` in library code. `anyhow` only in the binary; libraries use
   `thiserror`.
 - Prefer the `windows` crate over hand-written `extern "system"`. Link the Microsoft docs
@@ -103,7 +103,7 @@ idea does not fit one of them, it is a v1.1 idea.
 ## 5. Environment
 
 - Development shell: **WSL (Ubuntu 22.04)**. The repository lives at
-  `\\wsl.localhost\Ubuntu-22.04\home\rannd1nt\Projects\Fontaine`.
+  `\\wsl.localhost\Ubuntu-22.04\home\rannd1nt\Projects\Cascade`.
 - Rust: stable toolchain in WSL. **`~/.cargo/bin` is not on `PATH` in non-interactive
   shells** — use `export PATH="$HOME/.cargo/bin:$PATH"` or the full path.
 - Windows has **no** Rust, no VS Build Tools, no Windows SDK, and only ~14 GB free on C:.
@@ -138,10 +138,10 @@ cargo fmt --all -- --check
 Running the app (from Windows PowerShell, not WSL, for realistic window behaviour):
 
 ```powershell
-.\fontaine.exe doctor
-.\fontaine.exe run
-.\fontaine.exe status
-.\fontaine.exe restore
+.\cascade.exe doctor
+.\cascade.exe run
+.\cascade.exe status
+.\cascade.exe restore
 ```
 
 Dev harness (manual, never in tests/CI):

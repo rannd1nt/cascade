@@ -2,7 +2,7 @@
 //!
 //! It gives us, without any IPC yet:
 //! * single-instance detection (`FindWindowW`),
-//! * a target for `fontaine stop` / `fontaine restore`,
+//! * a target for `cascade stop` / `cascade restore`,
 //! * shutdown/logoff notifications,
 //! * a place to run emergency cleanup from the window procedure.
 //!
@@ -25,14 +25,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::wide;
 
-pub const CONTROL_CLASS: &str = "FontaineDaemon";
-pub const CONTROL_TITLE: &str = "Fontaine";
+pub const CONTROL_CLASS: &str = "CascadeDaemon";
+pub const CONTROL_TITLE: &str = "Cascade";
 
 /// Ask a running daemon to detach, repaint, and reattach without quitting.
-pub const WM_FONTAINE_RESTORE: u32 = WM_APP + 1;
+pub const WM_CASCADE_RESTORE: u32 = WM_APP + 1;
 
 /// Ask a running daemon to stop gracefully (repaint, then exit).
-pub const WM_FONTAINE_STOP: u32 = WM_CLOSE;
+pub const WM_CASCADE_STOP: u32 = WM_CLOSE;
 
 static RESTORE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -169,7 +169,7 @@ unsafe extern "system" fn control_wndproc(
             }
             0
         }
-        WM_FONTAINE_RESTORE => {
+        WM_CASCADE_RESTORE => {
             RESTORE_REQUESTED.store(true, Ordering::Release);
             0
         }

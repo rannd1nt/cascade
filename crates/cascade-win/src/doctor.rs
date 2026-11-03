@@ -1,4 +1,4 @@
-//! `fontaine doctor` — one command that answers "why is it not working?".
+//! `cascade doctor` — one command that answers "why is it not working?".
 //!
 //! Runs in-process, is safe to execute while the daemon is running, and changes
 //! nothing except asking Explorer for the wallpaper surface (the same message
@@ -130,7 +130,7 @@ pub fn collect(version: &str) -> DoctorReport {
 
 impl DoctorReport {
     pub fn print(&self) {
-        println!("Fontaine doctor");
+        println!("Cascade doctor");
         println!("  version         {}", self.version);
         println!("  os              {}", self.os);
         println!("  dpi awareness   {} (wanted: per-monitor-v2)", self.dpi);

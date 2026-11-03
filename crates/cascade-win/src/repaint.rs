@@ -1,6 +1,6 @@
 //! The repaint ladder.
 //!
-//! Fontaine does not own the wallpaper setting, so "restore" means "make
+//! Cascade does not own the wallpaper setting, so "restore" means "make
 //! Explorer paint the desktop again". Levels run in order; the first successful
 //! level stops the ladder, except that L1 always runs.
 //!

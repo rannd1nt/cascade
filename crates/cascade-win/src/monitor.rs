@@ -1,6 +1,6 @@
 //! Monitor enumeration.
 
-use fontaine_core::Rect;
+use cascade_core::Rect;
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{

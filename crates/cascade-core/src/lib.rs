@@ -1,4 +1,4 @@
-//! Platform-independent types for Fontaine.
+//! Platform-independent types for Cascade.
 //!
 //! Nothing in this crate may depend on Win32, Media Foundation, or a GUI toolkit.
 

@@ -61,7 +61,7 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// `%LOCALAPPDATA%\Fontaine`, or `None` when the environment is unusable.
+/// `%LOCALAPPDATA%\Cascade`, or `None` when the environment is unusable.
 pub fn data_dir() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -69,7 +69,7 @@ pub fn data_dir() -> Option<PathBuf> {
             std::env::var_os("USERPROFILE")
                 .map(|home| PathBuf::from(home).join("AppData").join("Local"))
         })?;
-    Some(base.join("Fontaine"))
+    Some(base.join("Cascade"))
 }
 
 /// Handle to `state.json`. All methods are best-effort: a missing file or a

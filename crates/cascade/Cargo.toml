@@ -1,0 +1,14 @@
+[package]
+name = "cascade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cascade"
+path = "src/main.rs"
+
+[dependencies]
+cascade-core = { workspace = true }
+cascade-win = { workspace = true }
+cascade-media = { workspace = true }

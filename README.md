@@ -1,8 +1,8 @@
-# Fontaine
+# Cascade
 
 A native, lightweight video live-wallpaper engine for Windows 11.
 
-Fontaine plays your own video files **behind the desktop icons**, comes back by itself
+Cascade plays your own video files **behind the desktop icons**, comes back by itself
 after a reboot, and never touches your files.
 
 No WebView2. No Electron. No bundled mpv/ffmpeg. One small executable.
@@ -53,7 +53,7 @@ Target machine: Windows 11 25H2 build 26200.9711, Intel UHD Graphics (driver
 | `--vo=gpu-next` + Lanczos / linear light | — | — | **80–90%** | — |
 | paused / exited | ~0% | — | 0–7% | 0% |
 
-These are mpv numbers, not Fontaine's. Two conclusions shaped the design:
+These are mpv numbers, not Cascade's. Two conclusions shaped the design:
 
 1. Decode is essentially free; **composition is the cost**, and pausing is the only real
    battery lever.
@@ -62,7 +62,7 @@ These are mpv numbers, not Fontaine's. Two conclusions shaped the design:
 
 ## The safety promise
 
-A wallpaper app must never eat the wallpaper. Fontaine:
+A wallpaper app must never eat the wallpaper. Cascade:
 
 - **does not install itself as your wallpaper** — it draws over the desktop, leaving your
   wallpaper configuration untouched;
@@ -76,7 +76,7 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
 
 ## Known limitations
 
-- **Antivirus false positives.** An unsigned `fontaine.exe` that writes a Run-key
+- **Antivirus false positives.** An unsigned `cascade.exe` that writes a Run-key
   autostart entry, starts with no console window of its own (GUI subsystem), and stays
   resident matches the behavioural
   signature of persistence malware — Microsoft Defender flagged it as
@@ -85,7 +85,7 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
   needs a certificate). Until a release is signed, some AV products may prompt on first
   run. This is stated here rather than hidden — see `docs/reliability.md` §11.
 - On Windows 11 24H2+ the desktop is a "raised desktop" where **GDI painting never
-  appears**; Fontaine must present through DXGI. The GDI path only works on the classic
+  appears**; Cascade must present through DXGI. The GDI path only works on the classic
   layout and is kept as a fallback. If DXGI device creation fails on the raised desktop,
   the host is invisible (reported loudly at attach, never silently).
 - Scaling a 1080p video to a 768p panel is inherent; we use a good filter, not the most
@@ -123,9 +123,9 @@ Run the resulting `.exe` from Windows. Release artifacts are built by GitHub Act
 
 ## Uninstall
 
-1. Quit Fontaine (tray → Quit, or `fontaine quit`).
-2. `fontaine autostart off`.
-3. Delete the executable and `%APPDATA%\Fontaine` / `%LOCALAPPDATA%\Fontaine`.
+1. Quit Cascade (tray → Quit, or `cascade quit`).
+2. `cascade autostart off`.
+3. Delete the executable and `%APPDATA%\Cascade` / `%LOCALAPPDATA%\Cascade`.
 
 Your videos are untouched — they were never copied or modified.
 

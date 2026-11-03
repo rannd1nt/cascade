@@ -1,6 +1,6 @@
-//! `fontaine` — role dispatch only.
+//! `cascade` — role dispatch only.
 //!
-//! All Win32 behaviour lives in `fontaine-win`; this binary parses argv and
+//! All Win32 behaviour lives in `cascade-win`; this binary parses argv and
 //! reports results. See `docs/architecture.md` §2.
 
 // GUI subsystem: starting the daemon must never create a console window
@@ -10,7 +10,7 @@
 
 use std::process::ExitCode;
 
-use fontaine_win::{console, control, daemon, doctor, dpi, host, registry};
+use cascade_win::{console, control, daemon, doctor, dpi, host, registry};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -22,7 +22,7 @@ fn main() -> ExitCode {
     match dispatch(&args) {
         Ok(code) => code,
         Err(message) => {
-            eprintln!("fontaine: {message}");
+            eprintln!("cascade: {message}");
             ExitCode::from(2)
         }
     }
@@ -43,12 +43,12 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Some("run") => cmd_run(&args[1..]),
         Some("--autostart") => cmd_run(&args[1..]),
         Some("doctor") => cmd_doctor(),
-        Some("stop") => cmd_signal(control::WM_FONTAINE_STOP, "stop"),
-        Some("restore") => cmd_signal(control::WM_FONTAINE_RESTORE, "restore"),
+        Some("stop") => cmd_signal(control::WM_CASCADE_STOP, "stop"),
+        Some("restore") => cmd_signal(control::WM_CASCADE_RESTORE, "restore"),
         Some("status") => cmd_status(),
         Some("autostart") => cmd_autostart(&args[1..]),
         Some("version") | Some("--version") | Some("-V") => {
-            println!("fontaine {VERSION}");
+            println!("cascade {VERSION}");
             Ok(ExitCode::SUCCESS)
         }
         Some("help") | Some("--help") | Some("-h") => {
@@ -57,7 +57,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         }
         Some("ui") | Some("--ui") => {
             println!("The library window is not implemented yet (milestone M5).");
-            println!("Use `fontaine run` for the engine and `fontaine doctor` for diagnostics.");
+            println!("Use `cascade run` for the engine and `cascade doctor` for diagnostics.");
             Ok(ExitCode::SUCCESS)
         }
         Some(other) => {
@@ -109,7 +109,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         Err(err) => {
             // Best effort: a console close may already have invalidated the
             // handles, and a panic here would be reported as a crash.
-            fontaine_win::derr!("fontaine: {err}");
+            cascade_win::derr!("cascade: {err}");
             Ok(ExitCode::from(1))
         }
     }
@@ -145,7 +145,7 @@ fn cmd_signal(message: u32, label: &str) -> Result<ExitCode, String> {
                 Err(format!("{label}: could not reach the running daemon"))
             }
         }
-        None => Err(format!("{label}: Fontaine is not running")),
+        None => Err(format!("{label}: Cascade is not running")),
     }
 }
 
@@ -205,14 +205,14 @@ fn cmd_autostart(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn print_help() {
-    println!("fontaine {VERSION}");
+    println!("cascade {VERSION}");
     println!();
     println!("USAGE:");
-    println!("  fontaine [run] [--color RRGGBB] [--repaint 1-4] [--host auto|workerw|layered]");
-    println!("  fontaine doctor");
-    println!("  fontaine stop | restore | status");
-    println!("  fontaine autostart on|off|status");
-    println!("  fontaine ui");
+    println!("  cascade [run] [--color RRGGBB] [--repaint 1-4] [--host auto|workerw|layered]");
+    println!("  cascade doctor");
+    println!("  cascade stop | restore | status");
+    println!("  cascade autostart on|off|status");
+    println!("  cascade ui");
     println!();
     println!("  run is the default. --autostart is accepted for the Run key.");
 }

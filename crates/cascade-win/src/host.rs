@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use fontaine_core::Rect;
+use cascade_core::Rect;
 use windows_sys::Win32::Foundation::{
     GetLastError, SetLastError, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
@@ -34,7 +34,7 @@ use crate::present::Presenter;
 use crate::shell::{self, DesktopMode, ShellSurface};
 use crate::wide;
 
-pub const HOST_CLASS: &str = "FontaineHost";
+pub const HOST_CLASS: &str = "CascadeHost";
 
 /// The painted background. `COLORREF` is `0x00BBGGRR`.
 pub fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
@@ -333,7 +333,7 @@ fn create_window(surface: &ShellSurface, monitor: &MonitorInfo) -> Result<HWND, 
     // SAFETY: null requests the module handle of the running executable.
     let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
     let class = wide::to_wide(HOST_CLASS);
-    let title = wide::to_wide("Fontaine wallpaper");
+    let title = wide::to_wide("Cascade wallpaper");
     let (x, y, w, h) = monitor_rect_in_parent(surface, monitor.rect);
     let layered = surface.mode == DesktopMode::LayeredProgmanChild;
 

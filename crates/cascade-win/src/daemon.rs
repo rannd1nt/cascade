@@ -5,7 +5,7 @@
 //! an Explorer restart recreates `Progman` and every `WorkerW`, a resolution
 //! change moves the monitors, and another wallpaper app can push its window
 //! above ours. All of those show up as "the host is no longer healthy" and are
-//! repaired in place, so the user never has to restart Fontaine after a crash,
+//! repaired in place, so the user never has to restart Cascade after a crash,
 //! a logon, or an Explorer restart.
 
 use std::ffi::c_void;
@@ -71,7 +71,7 @@ impl std::fmt::Display for DaemonError {
         match self {
             Self::AlreadyRunning(hwnd) => write!(
                 f,
-                "Fontaine is already running (control window 0x{hwnd:x}); use `fontaine restore` or `fontaine stop`"
+                "Cascade is already running (control window 0x{hwnd:x}); use `cascade restore` or `cascade stop`"
             ),
             Self::Control(code) => write!(f, "could not create the daemon window (error {code})"),
             Self::Shell(err) => write!(f, "{err}"),
@@ -154,7 +154,7 @@ impl Drop for ExitSignal {
 
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
-        derr!("fontaine: panic: {info}");
+        derr!("cascade: panic: {info}");
         // Best effort: never panic inside the panic hook.
         host::emergency_cleanup(2);
     }));
@@ -287,7 +287,7 @@ pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
     unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 1) };
 
     let snapshot = crate::wallpaper::snapshot();
-    dlog!("fontaine {} starting", env!("CARGO_PKG_VERSION"));
+    dlog!("cascade {} starting", env!("CARGO_PKG_VERSION"));
     // The executable path makes bug reports unambiguous: it shows exactly
     // which build is running and from where (install dir vs. a temp copy).
     if let Ok(exe) = std::env::current_exe() {
@@ -336,7 +336,7 @@ pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
     if let Some(path) = store.path() {
         dlog!("  state: {}", path.display());
     }
-    dlog!("  Ctrl+C in this console, or `fontaine stop`, restores the wallpaper and quits");
+    dlog!("  Ctrl+C in this console, or `cascade stop`, restores the wallpaper and quits");
 
     let mut msg = MSG::default();
     while !control::quit_requested() {

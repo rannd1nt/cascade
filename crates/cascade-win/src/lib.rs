@@ -1,4 +1,4 @@
-//! Public API for `fontaine-win`.
+//! Public API for `cascade-win`.
 
 pub mod console;
 pub mod control;
@@ -16,4 +16,4 @@ pub mod system;
 pub mod wallpaper;
 pub mod wide;
 
-pub use fontaine_core;
+pub use cascade_core;
