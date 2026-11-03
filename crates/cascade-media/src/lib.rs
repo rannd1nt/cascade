@@ -1,3 +1,5 @@
-//! Media backends. Implementation starts at M2.
+//! Media backends (design-m2 §2).
 
-pub fn placeholder() {}
+mod engine;
+
+pub use engine::MediaEngineBackend;

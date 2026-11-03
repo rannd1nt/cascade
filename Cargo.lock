@@ -23,6 +23,8 @@ name = "cascade-media"
 version = "0.1.0-alpha.0"
 dependencies = [
  "cascade-core",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

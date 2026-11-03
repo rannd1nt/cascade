@@ -191,6 +191,9 @@ pub struct HostWindow {
 pub struct Host {
     windows: Vec<HostWindow>,
     surface: ShellSurface,
+    /// The solid background, kept so a failed video attach can bring the
+    /// colour back (ownership table, design-m2 §4).
+    color: COLORREF,
 }
 
 fn ensure_class() -> Result<(), HostError> {
@@ -496,6 +499,20 @@ fn unregister_live() {
     }
 }
 
+/// Flip `HostState.presented` for a live host window: `true` keeps GDI away
+/// from a swap chain, `false` lets `WM_PAINT` fill the colour again.
+fn set_presented(hwnd: HWND, presented: bool) {
+    // SAFETY: GWLP_USERDATA holds a `*mut HostState` for host windows.
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut HostState;
+    if !ptr.is_null() {
+        // SAFETY: the pointer was created from `Box::into_raw` and lives
+        // until WM_NCDESTROY.
+        unsafe {
+            (*ptr).presented = presented;
+        }
+    }
+}
+
 impl Host {
     /// Create and show one host window per monitor.
     pub fn attach(
@@ -561,7 +578,11 @@ impl Host {
 
         restack(&surface, &windows);
         register_live(&windows, &surface);
-        Ok(Self { windows, surface })
+        Ok(Self {
+            windows,
+            surface,
+            color: opts.color,
+        })
     }
 
     pub fn surface(&self) -> &ShellSurface {
@@ -576,6 +597,47 @@ impl Host {
     /// system wallpaper above us; the watchdog calls this when it detects it.
     pub fn restack(&self) {
         restack(&self.surface, &self.windows);
+    }
+
+    /// Give up DXGI ownership of every host client area so the media engine
+    /// can draw into it (gate variant A, design-m2 §4). `HostState.presented`
+    /// stays `true`, so `WM_PAINT` keeps its hands off and the last
+    /// presented pixels (the solid colour) remain visible until the engine
+    /// draws — the desktop is never blank (AGENTS §3.1).
+    pub fn release_presenter(&mut self) {
+        for window in &mut self.windows {
+            // Dropped while the HWND is still alive (HostWindow::presenter).
+            window.presenter = None;
+        }
+    }
+
+    /// Recreate the swap chain after a video attach failed (ownership table,
+    /// design-m2 §4): the client area goes back to the solid colour.
+    pub fn restore_presenter(&mut self) {
+        for window in &mut self.windows {
+            if window.presenter.is_some() {
+                continue;
+            }
+            let width = window.monitor.rect.w.max(1) as u32;
+            let height = window.monitor.rect.h.max(1) as u32;
+            match Presenter::new(window.hwnd as isize, width, height) {
+                Ok(presenter) => {
+                    presenter.clear(color_rgba(self.color));
+                    window.presenter = Some(presenter);
+                    // `presented` was never cleared: paint() still skips
+                    // GDI and the swap chain owns the area again.
+                }
+                Err(err) => {
+                    crate::derr!(
+                        "host: presenter restore failed for {}: {err}",
+                        window.monitor.id
+                    );
+                    // No swap chain means GDI must paint the colour, or the
+                    // window would show whatever DWM last had (AGENTS §3.1).
+                    set_presented(window.hwnd, false);
+                }
+            }
+        }
     }
 
     /// Destroy every host window. The caller must run the repaint ladder next.

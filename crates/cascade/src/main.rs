@@ -8,9 +8,12 @@
 // The CLI re-attaches to a console in `console::prepare_stdio`.
 #![windows_subsystem = "windows"]
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use cascade_win::{console, control, daemon, doctor, dpi, host, registry};
+use cascade_core::MediaBackend;
+use cascade_media::MediaEngineBackend;
+use cascade_win::{console, control, daemon, doctor, dpi, host, registry, state};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -68,6 +71,32 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
+    let options = parse_run_options(args)?;
+
+    // A backend is only worth constructing when a source exists
+    // (design-m2 §2.2): `--video` wins, otherwise the last successful path
+    // replays. The daemon resolves the same pair again and loads it.
+    let source = options.video.clone().or_else(|| {
+        state::Store::open()
+            .load()
+            .and_then(|previous| previous.video)
+            .map(PathBuf::from)
+    });
+    let backend = build_backend(source.as_deref());
+    match daemon::run(options, backend) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(err) => {
+            // Best effort: a console close may already have invalidated the
+            // handles, and a panic here would be reported as a crash.
+            cascade_win::derr!("cascade: {err}");
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
+/// Parse `run`/`--autostart` options. Kept free of side effects so the
+/// `--video` handling is unit-testable without starting a daemon.
+fn parse_run_options(args: &[String]) -> Result<daemon::DaemonOptions, String> {
     let mut options = daemon::DaemonOptions::default();
     let mut index = 0;
     while index < args.len() {
@@ -100,19 +129,30 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
                     .ok_or_else(|| format!("--host expects auto|workerw|layered, got {value}"))?;
                 index += 2;
             }
+            "--video" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--video needs a path to a video file".to_string())?;
+                options.video = Some(PathBuf::from(value));
+                index += 2;
+            }
             other => return Err(format!("unknown option for run: {other}")),
         }
     }
+    Ok(options)
+}
 
-    // Slice 1 injects no backend: behaviour must equal M1 (design-m2 §6).
-    // Slice 2 constructs the MediaEngine backend here when `--video` is set.
-    match daemon::run(options, None) {
-        Ok(()) => Ok(ExitCode::SUCCESS),
+/// Build the Media Foundation backend, but only when a source exists:
+/// constructing it runs `MFStartup`, which a colour-only run must not pay
+/// for (design-m2 §2.2). A construction failure degrades to the colour
+/// background instead of refusing to start (AGENTS §3.1).
+fn build_backend(source: Option<&Path>) -> Option<Box<dyn MediaBackend>> {
+    let _ = source?;
+    match MediaEngineBackend::new() {
+        Ok(backend) => Some(Box::new(backend)),
         Err(err) => {
-            // Best effort: a console close may already have invalidated the
-            // handles, and a panic here would be reported as a crash.
-            cascade_win::derr!("cascade: {err}");
-            Ok(ExitCode::from(1))
+            cascade_win::derr!("cascade: media backend unavailable: {err}");
+            None
         }
     }
 }
@@ -211,12 +251,14 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  cascade [run] [--color RRGGBB] [--repaint 1-4] [--host auto|workerw|layered]");
+    println!("           [--video <path>]   play this file behind the desktop icons");
     println!("  cascade doctor");
     println!("  cascade stop | restore | status");
     println!("  cascade autostart on|off|status");
     println!("  cascade ui");
     println!();
     println!("  run is the default. --autostart is accepted for the Run key.");
+    println!("  Without --video, the last successfully played path replays.");
 }
 
 #[cfg(test)]
@@ -237,6 +279,32 @@ mod tests {
         // Run options only count after `run`; a bare flag is a CLI typo.
         assert!(!is_daemon_role(&args(&["--repaint", "2"])));
         assert!(!is_daemon_role(&args(&["--color", "FF0000"])));
+        assert!(!is_daemon_role(&args(&["--video", "clip.mp4"])));
+    }
+
+    #[test]
+    fn run_options_parse_video_path() {
+        let options = parse_run_options(&args(&["--video", r"C:\videos\my clip.mp4"]))
+            .expect("valid options");
+        assert_eq!(
+            options.video.as_deref(),
+            Some(Path::new(r"C:\videos\my clip.mp4"))
+        );
+        // Everything else keeps the documented baseline.
+        assert_eq!(options.repaint_level, 1);
+        assert!(options.video.is_some());
+    }
+
+    #[test]
+    fn run_options_without_video_have_no_source() {
+        let options = parse_run_options(&args(&["--color", "187A86"])).expect("valid options");
+        assert!(options.video.is_none());
+    }
+
+    #[test]
+    fn run_options_reject_missing_video_value() {
+        let err = parse_run_options(&args(&["--video"])).expect_err("needs a value");
+        assert!(err.contains("--video"), "unexpected error: {err}");
     }
 
     #[test]

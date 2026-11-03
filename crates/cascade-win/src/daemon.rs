@@ -9,10 +9,11 @@
 //! a logon, or an Explorer restart.
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use cascade_core::{HostSurface, MediaBackend, MonitorId};
+use cascade_core::{HostSurface, MediaBackend, MonitorId, PlaybackOptions};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{
@@ -40,12 +41,15 @@ const WATCHDOG_TICK: Duration = Duration::from_millis(2_000);
 /// How long a single repair may wait for Explorer to come back.
 const RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DaemonOptions {
     pub color: COLORREF,
     pub repaint_level: u32,
     pub shell_timeout: Duration,
     pub host_mode: host::HostModePreference,
+    /// `--video <path>` (design-m2 §2.2). Not `Copy` any more: a `PathBuf`
+    /// rides along. `None` means "replay the persisted path, if any".
+    pub video: Option<PathBuf>,
 }
 
 impl Default for DaemonOptions {
@@ -55,6 +59,7 @@ impl Default for DaemonOptions {
             repaint_level: 1,
             shell_timeout: Duration::from_secs(60),
             host_mode: host::HostModePreference::Auto,
+            video: None,
         }
     }
 }
@@ -268,17 +273,24 @@ fn watchdog_tick(
 
 /// Owns the optional media backend so Media Foundation is shut down on
 /// every exit path (design-m2 §3.2: `MFStartup` runs in the constructor).
-struct BackendGuard(Option<Box<dyn MediaBackend>>);
+struct BackendGuard {
+    backend: Option<Box<dyn MediaBackend>>,
+    /// True only after `load` succeeded. Without a validated source the
+    /// backend stays out of the host path entirely, so a run with no video
+    /// behaves exactly like M1 (design-m2 §2.2).
+    loaded: bool,
+}
 
 impl BackendGuard {
     fn take(&mut self) -> Option<Box<dyn MediaBackend>> {
-        self.0.take()
+        self.loaded = false;
+        self.backend.take()
     }
 }
 
 impl Drop for BackendGuard {
     fn drop(&mut self) {
-        if let Some(backend) = self.0.take() {
+        if let Some(backend) = self.backend.take() {
             backend.shutdown();
         }
     }
@@ -299,15 +311,29 @@ fn host_surface(window: &host::HostWindow) -> HostSurface {
 /// Attach the backend to the first host window (design-m2 §5: one engine,
 /// the other monitors keep colour). Failures are logged, never fatal — the
 /// desktop must stay up even when the engine cannot draw.
-fn attach_backend(backend: &mut BackendGuard, host: &Host) {
-    let Some(backend) = backend.0.as_mut() else {
+fn attach_backend(backend: &mut BackendGuard, host: &mut Host) {
+    if !backend.loaded {
+        return;
+    }
+    let Some(surface) = host.windows().first().map(host_surface) else {
         return;
     };
-    let Some(window) = host.windows().first() else {
+    // Gate experiment B (`CASCADE_GATE=B`, design-m2 §4): keep our swap
+    // chain to observe the fight. Default A releases it first so the engine
+    // owns the client area; the last presented pixels (the colour) stay on
+    // screen meanwhile, so the desktop is never blank (AGENTS §3.1).
+    let keep_presenter = std::env::var("CASCADE_GATE").is_ok_and(|value| value == "B");
+    if !keep_presenter {
+        host.release_presenter();
+    }
+    let Some(engine) = backend.backend.as_mut() else {
         return;
     };
-    if let Err(err) = backend.attach_surface(host_surface(window)) {
+    if let Err(err) = engine.attach_surface(surface) {
         derr!("backend: attach failed: {err}");
+        // Ownership table (design-m2 §4): video failure returns the client
+        // area to the colour presenter.
+        host.restore_presenter();
     }
 }
 
@@ -322,7 +348,10 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
     // Declared second, therefore dropped before `_exit`: an early return
     // still shuts the engine down, and the normal exit path takes it out
     // explicitly first (design-m2 §3.3 ordering: shutdown → detach → repaint).
-    let mut backend_guard = BackendGuard(backend);
+    let mut backend_guard = BackendGuard {
+        backend,
+        loaded: false,
+    };
 
     if let Some(existing) = control::find_existing() {
         return Err(DaemonError::AlreadyRunning(existing as usize));
@@ -359,6 +388,32 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
         );
     }
 
+    // Resolve the video source before anything is drawn: `--video` wins,
+    // otherwise the last successful path replays (design-m2 §5). A load
+    // failure degrades to the colour background — never a blank desktop
+    // (AGENTS §3.1) — and does not persist the broken path.
+    let video = opts.video.clone().or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|state| state.video.as_ref())
+            .map(PathBuf::from)
+    });
+    if let Some(source) = &video {
+        match backend_guard.backend.as_mut() {
+            Some(backend) => match backend.load(source, &PlaybackOptions::default()) {
+                Ok(()) => {
+                    dlog!("  video: {}", source.display());
+                    backend_guard.loaded = true;
+                }
+                Err(err) => derr!("video: {err}; continuing with the colour background"),
+            },
+            None => derr!(
+                "video: {} requested but no backend was built",
+                source.display()
+            ),
+        }
+    }
+
     let mut surface = shell::discover(opts.shell_timeout).map_err(DaemonError::Shell)?;
 
     // A previous session that died without a clean exit can leave Explorer
@@ -376,13 +431,21 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
 
     let mut host = attach(surface, &monitors, &opts).map_err(DaemonError::Host)?;
     print_attach(&host);
-    attach_backend(&mut backend_guard, &host);
+    attach_backend(&mut backend_guard, &mut host);
 
+    // Only a source that actually loaded is persisted (design-m2 §5): a
+    // failed path must not come back on the next start.
+    let persisted_video = backend_guard
+        .loaded
+        .then_some(video)
+        .flatten()
+        .map(|path| path.display().to_string());
     let mut state = DaemonState::running_now(
         std::process::id(),
         host::rgb_hex(opts.color),
         opts.repaint_level,
         opts.host_mode.label().to_string(),
+        persisted_video,
     );
     if let Err(err) = store.save(&state) {
         derr!("state: {err}");
@@ -448,7 +511,7 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
                     surface = new_surface;
                     host = new_host;
                     print_attach(&host);
-                    attach_backend(&mut backend_guard, &host);
+                    attach_backend(&mut backend_guard, &mut host);
                 }
                 None => {
                     derr!("restore: Explorer did not return; the watchdog will keep trying");
@@ -466,7 +529,7 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
                         surface = new_surface;
                         host = new_host;
                         print_attach(&host);
-                        attach_backend(&mut backend_guard, &host);
+                        attach_backend(&mut backend_guard, &mut host);
                     }
                     None => {
                         derr!("display change: reattach failed; the watchdog will keep trying");
@@ -529,5 +592,7 @@ mod tests {
         assert_eq!(options.shell_timeout, Duration::from_secs(60));
         assert_eq!(options.host_mode, host::HostModePreference::Auto);
         assert_eq!(options.color, host::HostOptions::default().color);
+        // Slice 2: no `--video`, no persisted path -> no backend source.
+        assert!(options.video.is_none());
     }
 }

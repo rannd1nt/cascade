@@ -31,10 +31,21 @@ pub struct DaemonState {
     pub color: String,
     pub repaint_level: u32,
     pub host_mode: String,
+    /// Last video that played successfully, if any (design-m2 §5): a bare
+    /// `cascade run` replays it. Additive — `STATE_VERSION` stays 1 and a
+    /// `state.json` written before slice 2 still loads (`serde(default)`).
+    #[serde(default)]
+    pub video: Option<String>,
 }
 
 impl DaemonState {
-    pub fn running_now(pid: u32, color: String, repaint_level: u32, host_mode: String) -> Self {
+    pub fn running_now(
+        pid: u32,
+        color: String,
+        repaint_level: u32,
+        host_mode: String,
+        video: Option<String>,
+    ) -> Self {
         Self {
             version: STATE_VERSION,
             running: true,
@@ -43,6 +54,7 @@ impl DaemonState {
             color,
             repaint_level,
             host_mode,
+            video,
         }
     }
 
@@ -145,7 +157,7 @@ mod tests {
     }
 
     fn running() -> DaemonState {
-        DaemonState::running_now(42, "187A86".to_string(), 2, "auto".to_string())
+        DaemonState::running_now(42, "187A86".to_string(), 2, "auto".to_string(), None)
     }
 
     #[test]
@@ -157,7 +169,24 @@ mod tests {
         assert_eq!(state.color, "187A86");
         assert_eq!(state.repaint_level, 2);
         assert_eq!(state.host_mode, "auto");
+        assert!(state.video.is_none());
         assert!(state.updated_unix > 0);
+    }
+
+    #[test]
+    fn state_written_before_slice2_still_loads() {
+        // The exact shape slice 1 wrote: no `video` field at all.
+        let (store, dir) = temp_store("legacy");
+        let path = store.path.clone().expect("temp store has a path");
+        fs::create_dir_all(path.parent().expect("path has a parent")).expect("mkdir");
+        fs::write(
+            &path,
+            r#"{"version":1,"running":true,"pid":1,"updated_unix":0,"color":"187A86","repaint_level":1,"host_mode":"auto"}"#,
+        )
+        .expect("write");
+        let loaded = store.load().expect("legacy state must load");
+        assert!(loaded.video.is_none());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -174,7 +203,8 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let (store, dir) = temp_store("roundtrip");
-        let state = DaemonState::running_now(7, "00FF00".to_string(), 4, "layered".to_string());
+        let state =
+            DaemonState::running_now(7, "00FF00".to_string(), 4, "layered".to_string(), None);
         store.save(&state).expect("save should succeed");
         let loaded = store.load().expect("load should succeed");
         assert!(loaded.running);
