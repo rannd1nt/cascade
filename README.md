@@ -7,11 +7,12 @@ after a reboot, and never touches your files.
 
 No WebView2. No Electron. No bundled mpv/ffmpeg. One small executable.
 
-> **Status: M0 complete (feasibility), M1 host + lifecycle gates A–D passing on the
+> **Status: M0 complete (feasibility), M1 host + lifecycle gates A–F passing on the
 > target machine.** Solid colour renders behind the icons via DXGI; clean stop, hard
-> kill, unclean-exit recovery, and Explorer-restart recovery are measured working.
-> Reboot (M1-E) and focus/sleep (M1-F) are still open. Evidence:
-> [`docs/spike-m0.md`](docs/spike-m0.md) and [`docs/reliability.md`](docs/reliability.md) §11.
+> kill, unclean-exit recovery, Explorer-restart recovery, reboot autostart (M1-E) and
+> focus/sleep (M1-F) are measured working. Next: M2 — native player Tier 1 (design
+> approved). Evidence: [`docs/spike-m0.md`](docs/spike-m0.md) and
+> [`docs/reliability.md`](docs/reliability.md) §11.
 
 ---
 

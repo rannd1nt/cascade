@@ -76,6 +76,12 @@ idea does not fit one of them, it is a v1.1 idea.
     `%LOCALAPPDATA%\Cascade` are ours.
 13. **Never prevent sleep, shutdown, or logoff.** Return TRUE from `WM_QUERYENDSESSION`
     unconditionally. No `SetThreadExecutionState(ES_DISPLAY_REQUIRED)`.
+14. **The shipped binary stem must never be 6 or 8 characters.** On build
+    26200.9711 Windows allocates ≈250 MB (stem 8) / ≈550 MB (stem 6) into *this*
+    PE's address space for those filename classes — measured, deterministic,
+    survives reboot; the mechanism is external and unidentified
+    (`docs/spike-m0.md` §10.4). Any rename re-measures first with a
+    path-verified harness. `cascade` (7) is a cold class.
 
 ---
 
