@@ -104,7 +104,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         }
     }
 
-    match daemon::run(options) {
+    // Slice 1 injects no backend: behaviour must equal M1 (design-m2 §6).
+    // Slice 2 constructs the MediaEngine backend here when `--video` is set.
+    match daemon::run(options, None) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(err) => {
             // Best effort: a console close may already have invalidated the

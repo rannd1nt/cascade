@@ -12,12 +12,14 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use cascade_core::{HostSurface, MediaBackend, MonitorId};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
 };
 use windows_sys::Win32::System::Threading::{WaitOnAddress, WakeByAddressSingle};
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, TranslateMessage,
     MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_CLOSE, WM_QUIT,
@@ -227,6 +229,7 @@ fn watchdog_tick(
     monitors: &[MonitorInfo],
     opts: &DaemonOptions,
     snapshot: &WallpaperSnapshot,
+    backend: &mut BackendGuard,
 ) -> bool {
     if host.is_healthy() {
         return true;
@@ -253,6 +256,7 @@ fn watchdog_tick(
             *surface = new_surface;
             *host = new_host;
             print_attach(host);
+            attach_backend(backend, host);
             true
         }
         None => {
@@ -262,14 +266,63 @@ fn watchdog_tick(
     }
 }
 
+/// Owns the optional media backend so Media Foundation is shut down on
+/// every exit path (design-m2 §3.2: `MFStartup` runs in the constructor).
+struct BackendGuard(Option<Box<dyn MediaBackend>>);
+
+impl BackendGuard {
+    fn take(&mut self) -> Option<Box<dyn MediaBackend>> {
+        self.0.take()
+    }
+}
+
+impl Drop for BackendGuard {
+    fn drop(&mut self) {
+        if let Some(backend) = self.0.take() {
+            backend.shutdown();
+        }
+    }
+}
+
+/// Build the win → media boundary value for a host window.
+fn host_surface(window: &host::HostWindow) -> HostSurface {
+    // SAFETY: `hwnd` is a live window this process created; no pointers pass.
+    let dpi = unsafe { GetDpiForWindow(window.hwnd) };
+    HostSurface {
+        hwnd: window.hwnd as isize,
+        monitor: MonitorId(window.monitor.id.clone()),
+        rect: window.monitor.rect,
+        dpi,
+    }
+}
+
+/// Attach the backend to the first host window (design-m2 §5: one engine,
+/// the other monitors keep colour). Failures are logged, never fatal — the
+/// desktop must stay up even when the engine cannot draw.
+fn attach_backend(backend: &mut BackendGuard, host: &Host) {
+    let Some(backend) = backend.0.as_mut() else {
+        return;
+    };
+    let Some(window) = host.windows().first() else {
+        return;
+    };
+    if let Err(err) = backend.attach_surface(host_surface(window)) {
+        derr!("backend: attach failed: {err}");
+    }
+}
+
 /// Run the daemon until asked to stop. Always repaints the desktop before
 /// returning, including on the restore path.
-pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
+pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Result<(), DaemonError> {
     // Declared first, therefore dropped last on every exit path (`Ok`, an
     // early `Err`, and panic unwinding): only then is `EXIT_DONE` signalled,
     // which lets a waiting console-control handler return — and Windows only
     // kills the process after that return.
     let _exit = ExitSignal;
+    // Declared second, therefore dropped before `_exit`: an early return
+    // still shuts the engine down, and the normal exit path takes it out
+    // explicitly first (design-m2 §3.3 ordering: shutdown → detach → repaint).
+    let mut backend_guard = BackendGuard(backend);
 
     if let Some(existing) = control::find_existing() {
         return Err(DaemonError::AlreadyRunning(existing as usize));
@@ -323,6 +376,7 @@ pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
 
     let mut host = attach(surface, &monitors, &opts).map_err(DaemonError::Host)?;
     print_attach(&host);
+    attach_backend(&mut backend_guard, &host);
 
     let mut state = DaemonState::running_now(
         std::process::id(),
@@ -351,7 +405,14 @@ pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
             )
         };
         if wait == WAIT_TIMEOUT {
-            watchdog_tick(&mut host, &mut surface, &monitors, &opts, &snapshot);
+            watchdog_tick(
+                &mut host,
+                &mut surface,
+                &monitors,
+                &opts,
+                &snapshot,
+                &mut backend_guard,
+            );
             continue;
         }
         if wait != WAIT_OBJECT_0 {
@@ -387,6 +448,7 @@ pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
                     surface = new_surface;
                     host = new_host;
                     print_attach(&host);
+                    attach_backend(&mut backend_guard, &host);
                 }
                 None => {
                     derr!("restore: Explorer did not return; the watchdog will keep trying");
@@ -404,6 +466,7 @@ pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
                         surface = new_surface;
                         host = new_host;
                         print_attach(&host);
+                        attach_backend(&mut backend_guard, &host);
                     }
                     None => {
                         derr!("display change: reattach failed; the watchdog will keep trying");
@@ -419,6 +482,11 @@ pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
     // function. The desktop must be repainted and the state saved before
     // anything else, including logging.
     dlog!("stopping");
+    // design-m2 §3.3: the engine releases its playback window first, then
+    // the host dies, then the repaint ladder runs.
+    if let Some(backend) = backend_guard.take() {
+        backend.shutdown();
+    }
     CONTROL_HWND.store(0, Ordering::Release);
     host.detach();
     let report = repaint::ladder(&surface, &snapshot, opts.repaint_level);
