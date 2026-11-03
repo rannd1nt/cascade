@@ -79,3 +79,21 @@ pub fn enumerate() -> Vec<MonitorInfo> {
     monitors.sort_by_key(|m| (!m.primary, m.rect.x, m.rect.y));
     monitors
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn width_and_height_follow_the_rect() {
+        let monitor = MonitorInfo {
+            handle: 0,
+            id: r"\\.\DISPLAY1".to_string(),
+            rect: Rect::new(0, 0, 1366, 768),
+            work: Rect::new(0, 0, 1366, 728),
+            primary: true,
+        };
+        assert_eq!(monitor.width(), 1366);
+        assert_eq!(monitor.height(), 768);
+    }
+}

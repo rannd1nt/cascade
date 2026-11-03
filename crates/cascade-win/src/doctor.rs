@@ -242,3 +242,14 @@ fn yes_no(v: bool) -> &'static str {
         "no"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yes_no_formats() {
+        assert_eq!(yes_no(true), "yes");
+        assert_eq!(yes_no(false), "no");
+    }
+}

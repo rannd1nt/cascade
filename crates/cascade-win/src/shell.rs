@@ -335,3 +335,55 @@ pub fn is_above(upper: HWND, lower: HWND) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_mode_labels_are_stable() {
+        // `doctor` prints these; keep them in sync with docs/architecture.md.
+        assert_eq!(DesktopMode::WorkerWChild.label(), "workerw_child");
+        assert_eq!(
+            DesktopMode::LayeredProgmanChild.label(),
+            "layered_progman_child"
+        );
+    }
+
+    #[test]
+    fn host_parent_follows_mode() {
+        let progman = 0x111usize as HWND;
+        let workerw = 0x222usize as HWND;
+
+        let classic = ShellSurface {
+            progman,
+            workerw,
+            defview: std::ptr::null_mut(),
+            mode: DesktopMode::WorkerWChild,
+        };
+        assert_eq!(classic.host_parent(), workerw);
+
+        let raised = ShellSurface {
+            mode: DesktopMode::LayeredProgmanChild,
+            ..classic
+        };
+        assert_eq!(raised.host_parent(), progman);
+    }
+
+    #[test]
+    fn null_handles_report_not_above() {
+        assert!(!is_above(std::ptr::null_mut(), std::ptr::null_mut()));
+        assert!(!is_above(0x111usize as HWND, std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn shell_error_messages_are_actionable() {
+        assert_eq!(
+            ShellError::ProgmanTimeout { waited_ms: 60_000 }.to_string(),
+            "Explorer's Progman window did not appear within 60000 ms"
+        );
+        assert!(ShellError::NoWallpaperSurface
+            .to_string()
+            .contains("no wallpaper WorkerW"));
+    }
+}

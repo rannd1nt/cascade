@@ -157,3 +157,47 @@ pub fn ladder(
 
     report
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attempt(level: u32, ok: bool) -> RepaintAttempt {
+        RepaintAttempt {
+            level,
+            action: "test",
+            ok,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn empty_report_has_no_success() {
+        let report = RepaintReport::default();
+        assert!(!report.any_success());
+        assert_eq!(report.highest_success(), None);
+    }
+
+    #[test]
+    fn highest_success_is_the_last_ok_level() {
+        // Attempts are pushed in ascending level order, so "last ok" is the
+        // highest level that actually ran.
+        let mut report = RepaintReport::default();
+        report.attempts.push(attempt(1, true));
+        report.attempts.push(attempt(2, false));
+        assert!(report.any_success());
+        assert_eq!(report.highest_success(), Some(1));
+
+        report.attempts.push(attempt(3, true));
+        assert_eq!(report.highest_success(), Some(3));
+    }
+
+    #[test]
+    fn only_failures_report_no_success() {
+        let mut report = RepaintReport::default();
+        report.attempts.push(attempt(1, false));
+        report.attempts.push(attempt(2, false));
+        assert!(!report.any_success());
+        assert_eq!(report.highest_success(), None);
+    }
+}

@@ -432,3 +432,34 @@ pub fn run(opts: DaemonOptions) -> Result<(), DaemonError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_messages_tell_the_user_what_to_do() {
+        assert_eq!(
+            DaemonError::AlreadyRunning(0xABCD).to_string(),
+            "Cascade is already running (control window 0xabcd); use `cascade restore` or `cascade stop`"
+        );
+        assert_eq!(
+            DaemonError::Control(5).to_string(),
+            "could not create the daemon window (error 5)"
+        );
+        assert_eq!(
+            DaemonError::NoMonitors.to_string(),
+            "no monitors were reported by the system"
+        );
+    }
+
+    #[test]
+    fn default_options_match_the_documented_baseline() {
+        // docs/architecture.md: level 1, 60 s shell discovery, teal, auto.
+        let options = DaemonOptions::default();
+        assert_eq!(options.repaint_level, 1);
+        assert_eq!(options.shell_timeout, Duration::from_secs(60));
+        assert_eq!(options.host_mode, host::HostModePreference::Auto);
+        assert_eq!(options.color, host::HostOptions::default().color);
+    }
+}

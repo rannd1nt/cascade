@@ -105,3 +105,34 @@ pub fn session_info() -> SessionInfo {
     let remote = unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 };
     SessionInfo { id, remote }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(build: u32, ubr: Option<u32>) -> OsInfo {
+        OsInfo {
+            major: 11,
+            build,
+            ubr,
+            ..OsInfo::default()
+        }
+    }
+
+    #[test]
+    fn build_string_appends_ubr_when_present() {
+        assert_eq!(info(26_200, Some(9_711)).build_string(), "26200.9711");
+    }
+
+    #[test]
+    fn build_string_is_plain_build_without_ubr() {
+        assert_eq!(info(26_200, None).build_string(), "26200");
+        // UBR present but zero means "no update component" on some builds.
+        assert_eq!(info(26_200, Some(0)).build_string(), "26200");
+    }
+
+    #[test]
+    fn default_os_info_is_zeroed_not_panicking() {
+        assert_eq!(OsInfo::default().build_string(), "0");
+    }
+}

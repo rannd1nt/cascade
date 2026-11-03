@@ -691,3 +691,60 @@ pub fn has_live_windows() -> bool {
         .map(|live| !live.is_empty())
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colorref_packs_as_0x00bbggrr() {
+        assert_eq!(rgb(0x12, 0x34, 0x56), 0x0056_3412);
+        assert_eq!(rgb(0, 0, 0), 0);
+        assert_eq!(rgb(255, 255, 255), 0x00FF_FFFF);
+    }
+
+    #[test]
+    fn rgb_hex_is_rrggbb_and_roundtrips() {
+        for (r, g, b) in [(0x18u8, 0x7Au8, 0x86u8), (0, 0, 0), (255, 255, 255)] {
+            let hex = rgb_hex(rgb(r, g, b));
+            assert_eq!(hex.len(), 6);
+            assert_eq!(hex, format!("{r:02X}{g:02X}{b:02X}"));
+        }
+        assert_eq!(rgb_hex(rgb(0x18, 0x7A, 0x86)), "187A86");
+    }
+
+    #[test]
+    fn clear_value_is_srgb_without_alpha_shift() {
+        // B8G8R8A8_UNORM reads the COLORREF channels directly.
+        let rgba = color_rgba(rgb(0x18, 0x7A, 0x86));
+        assert_eq!(rgba[0], 0x18 as f32 / 255.0);
+        assert_eq!(rgba[1], 0x7A as f32 / 255.0);
+        assert_eq!(rgba[2], 0x86 as f32 / 255.0);
+        assert_eq!(rgba[3], 1.0);
+    }
+
+    #[test]
+    fn host_mode_label_and_parse_roundtrip() {
+        for mode in [
+            HostModePreference::Auto,
+            HostModePreference::WorkerW,
+            HostModePreference::Layered,
+        ] {
+            assert_eq!(HostModePreference::parse(mode.label()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn host_mode_parse_rejects_unknown() {
+        assert_eq!(HostModePreference::parse("progman"), None);
+        assert_eq!(HostModePreference::parse(""), None);
+        assert_eq!(HostModePreference::parse("WORKERW"), None);
+    }
+
+    #[test]
+    fn default_options_are_the_teal_baseline() {
+        let options = HostOptions::default();
+        assert_eq!(rgb_hex(options.color), "187A86");
+        assert_eq!(options.mode, HostModePreference::Auto);
+    }
+}

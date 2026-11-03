@@ -229,3 +229,24 @@ fn create_swapchain(
     }
     Err(PresenterError::SwapChain(last))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swap_effect_labels_are_stable() {
+        // These strings appear in the daemon log (`present=dxgi/...`).
+        assert_eq!(SwapEffect::FlipDiscard.label(), "flip_discard");
+        assert_eq!(SwapEffect::FlipSequential.label(), "flip_sequential");
+        assert_eq!(SwapEffect::Discard.label(), "discard");
+    }
+
+    #[test]
+    fn swap_effect_buffer_counts_match_contract() {
+        // Flip models need a back buffer of 2; the legacy discard path uses 1.
+        assert_eq!(SwapEffect::FlipDiscard.raw().1, 2);
+        assert_eq!(SwapEffect::FlipSequential.raw().1, 2);
+        assert_eq!(SwapEffect::Discard.raw().1, 1);
+    }
+}

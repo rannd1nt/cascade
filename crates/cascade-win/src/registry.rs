@@ -235,3 +235,25 @@ pub fn autostart_enable(exe: &Path) -> Result<(), u32> {
 pub fn autostart_disable() -> Result<(), u32> {
     delete_value(RUN_KEY, AUTOSTART_VALUE)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autostart_command_quotes_path_and_adds_flag() {
+        let exe = Path::new(r"C:\Users\Zahraan Dzakii\AppData\Local\Cascade\cascade.exe");
+        assert_eq!(
+            autostart_command(exe),
+            r#""C:\Users\Zahraan Dzakii\AppData\Local\Cascade\cascade.exe" --autostart"#
+        );
+    }
+
+    #[test]
+    fn key_and_value_names_are_stable() {
+        // Renaming these breaks detection of an existing install.
+        assert_eq!(AUTOSTART_VALUE, "Cascade");
+        assert!(RUN_KEY.ends_with(r"\CurrentVersion\Run"));
+        assert!(STARTUP_APPROVED_KEY.ends_with(r"\StartupApproved\Run"));
+    }
+}

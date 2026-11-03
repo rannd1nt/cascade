@@ -216,3 +216,49 @@ fn print_help() {
     println!();
     println!("  run is the default. --autostart is accepted for the Run key.");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn daemon_role_is_bare_run_and_autostart_only() {
+        assert!(is_daemon_role(&[]));
+        assert!(is_daemon_role(&args(&["run"])));
+        assert!(is_daemon_role(&args(&["--autostart"])));
+        assert!(!is_daemon_role(&args(&["status"])));
+        assert!(!is_daemon_role(&args(&["doctor"])));
+        // Run options only count after `run`; a bare flag is a CLI typo.
+        assert!(!is_daemon_role(&args(&["--repaint", "2"])));
+        assert!(!is_daemon_role(&args(&["--color", "FF0000"])));
+    }
+
+    #[test]
+    fn parse_color_accepts_common_hex_forms() {
+        let teal = host::rgb(0x18, 0x7A, 0x86);
+        assert_eq!(parse_color("187A86").expect("plain"), teal);
+        assert_eq!(parse_color("187a86").expect("lowercase"), teal);
+        assert_eq!(parse_color("#187A86").expect("hash"), teal);
+        assert_eq!(parse_color("0x187A86").expect("0x prefix"), teal);
+        assert_eq!(parse_color("  187A86 ").expect("trimmed"), teal);
+        assert_eq!(parse_color("000000").expect("black"), 0);
+        // Fewer than six digits is still a valid RRGGBB value.
+        assert_eq!(
+            parse_color("187A8").expect("short form"),
+            host::rgb(0x01, 0x87, 0xA8)
+        );
+    }
+
+    #[test]
+    fn parse_color_rejects_bad_input() {
+        assert!(parse_color("").is_err());
+        assert!(parse_color("xyz").is_err());
+        assert!(parse_color("GGGGGG").is_err());
+        assert!(parse_color("1000000").is_err()); // 7 digits > 0xFFFFFF
+        assert!(parse_color("187A86FF").is_err()); // 8 digits > 0xFFFFFF
+    }
+}
