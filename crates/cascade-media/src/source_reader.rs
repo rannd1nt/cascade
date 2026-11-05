@@ -354,15 +354,22 @@ impl SourceReaderBackend {
                 return;
             }
         };
-        let staging = match create_staging(&device, config.width, config.height, surface_format) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("cascade: SourceReader error: staging: {e}");
-                let _ = unsafe { MFShutdown() };
-                unsafe {
-                    windows::Win32::System::Com::CoUninitialize();
+        // E3b renders straight into the back buffer via VideoProcessorBlt;
+        // the staging texture is only needed by the E3a / CPU convert path.
+        // Skip it in pure E3b mode to save ~8-15 MB of private working set.
+        let staging: Option<ID3D11Texture2D> = if e3b && e3_active {
+            None
+        } else {
+            match create_staging(&device, config.width, config.height, surface_format) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("cascade: SourceReader error: staging: {e}");
+                    let _ = unsafe { MFShutdown() };
+                    unsafe {
+                        windows::Win32::System::Com::CoUninitialize();
+                    }
+                    return;
                 }
-                return;
             }
         };
         // SAFETY: the swap chain owns its buffer; it is released by Drop.
@@ -446,6 +453,7 @@ impl SourceReaderBackend {
         let mut warned_map = false;
         let mut warned_present = false;
         let mut warned_alloc = false;
+        let mut warned_staging = false;
         // E3: one-shot log of the consume path and of each distinct error.
         let mut last_e3_path: Option<E3Path> = None;
         let mut last_e3_err: Option<String> = None;
@@ -689,7 +697,7 @@ impl SourceReaderBackend {
                     consume_e3_sample(
                         &sample,
                         &context,
-                        &staging,
+                        staging.as_ref().unwrap(), // E3a path: staging is always Some
                         &back_buffer,
                         out_w,
                         out_h,
@@ -716,6 +724,17 @@ impl SourceReaderBackend {
 
             if cpu_frame {
                 // ── NV12 → BGR8 → copy → present ──
+                // E3b GPU path doesn't use staging; only the CPU fallback
+                // path needs it. If staging is None (pure E3b mode), skip.
+                let Some(staging) = &staging else {
+                    if !warned_staging {
+                        warned_staging = true;
+                        eprintln!("cascade: SourceReader E3b: CPU fallback without staging texture; skipping frame");
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+
                 // SAFETY: sample is live.
                 let Ok(buffer) = (unsafe { sample.ConvertToContiguousBuffer() }) else {
                     if !warned_convert {
@@ -755,7 +774,7 @@ impl SourceReaderBackend {
 
                 let mut mapped: D3D11_MAPPED_SUBRESOURCE = unsafe { std::mem::zeroed() };
                 // SAFETY: staging texture has CPU write access.
-                if unsafe { context.Map(&staging, 0, D3D11_MAP_WRITE, 0, Some(&mut mapped)) }
+                if unsafe { context.Map(staging, 0, D3D11_MAP_WRITE, 0, Some(&mut mapped)) }
                     .is_err()
                 {
                     unsafe {
@@ -830,13 +849,13 @@ impl SourceReaderBackend {
                 }
 
                 unsafe {
-                    context.Unmap(&staging, 0);
+                    context.Unmap(staging, 0);
                     let _ = buffer.Unlock();
                 }
 
                 // staging → back buffer (the DEFAULT back buffer cannot be mapped).
                 unsafe {
-                    context.CopyResource(&back_buffer, &staging);
+                    context.CopyResource(&back_buffer, staging);
                 }
             }
 
