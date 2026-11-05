@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use cascade_core::MediaBackend;
-use cascade_media::MediaEngineBackend;
+use cascade_media::{MediaEngineBackend, SourceReaderBackend};
 use cascade_win::{console, control, daemon, doctor, dpi, host, registry, state};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -142,18 +142,49 @@ fn parse_run_options(args: &[String]) -> Result<daemon::DaemonOptions, String> {
     Ok(options)
 }
 
-/// Build the Media Foundation backend, but only when a source exists:
-/// constructing it runs `MFStartup`, which a colour-only run must not pay
-/// for (design-m2 §2.2). A construction failure degrades to the colour
-/// background instead of refusing to start (AGENTS §3.1).
+/// Build the media backend.
+///
+/// Default (no env): slice 2's Media Engine backend first — it is the
+/// measured-heavier-but-stable path (9.0-10.3% CPU, hardware decode) and
+/// Tier 2's SourceReader is currently a CPU regression (11.78% vs slice
+/// 2), so it must not ship as the default (E3a gate decision,
+/// docs/rnd-tier2-step5-measurement.md Appendix D).
+///
+/// Opt-in: any `CASCADE_TIER2*` env var selects the Tier 2 SourceReader
+/// first (RND experiments run through `deploy-tier2.ps1`, which sets
+/// them). A construction failure falls through to the next backend; a
+/// failure of both degrades to the colour background instead of refusing
+/// to start (AGENTS §3.1).
 fn build_backend(source: Option<&Path>) -> Option<Box<dyn MediaBackend>> {
     let _ = source?;
-    match MediaEngineBackend::new() {
-        Ok(backend) => Some(Box::new(backend)),
+    let tier2_opted_in =
+        std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("CASCADE_TIER2"));
+
+    let source_reader = || match SourceReaderBackend::new() {
+        Ok(backend) => {
+            cascade_win::dlog!("cascade: media backend: SourceReader (Tier 2)");
+            Some(Box::new(backend) as Box<dyn MediaBackend>)
+        }
+        Err(err) => {
+            cascade_win::dlog!("cascade: SourceReader backend unavailable: {err}");
+            None
+        }
+    };
+    let media_engine = || match MediaEngineBackend::new() {
+        Ok(backend) => {
+            cascade_win::dlog!("cascade: media backend: MediaEngine (slice 2)");
+            Some(Box::new(backend) as Box<dyn MediaBackend>)
+        }
         Err(err) => {
             cascade_win::derr!("cascade: media backend unavailable: {err}");
             None
         }
+    };
+
+    if tier2_opted_in {
+        source_reader().or_else(media_engine)
+    } else {
+        media_engine().or_else(source_reader)
     }
 }
 
