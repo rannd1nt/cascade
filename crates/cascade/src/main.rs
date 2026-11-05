@@ -144,25 +144,19 @@ fn parse_run_options(args: &[String]) -> Result<daemon::DaemonOptions, String> {
 
 /// Build the media backend.
 ///
-/// Default (no env): slice 2's Media Engine backend first — it is the
-/// measured-heavier-but-stable path (9.0-10.3% CPU, hardware decode) and
-/// Tier 2's SourceReader is currently a CPU regression (11.78% vs slice
-/// 2), so it must not ship as the default (E3a gate decision,
-/// docs/rnd-tier2-step5-measurement.md Appendix D).
+/// Default: Tier 2 SourceReader (IMFSourceReader + own DXGI presenter,
+/// `CASCADE_TIER2_E3B` path) first — measured ~0.9% CPU on the target
+/// machine, matching mpv. Media Engine (slice 2, `IMFMediaEngine` + EVR)
+/// is the fallback; colour background is the last resort (AGENTS §3.1).
 ///
-/// Opt-in: any `CASCADE_TIER2*` env var selects the Tier 2 SourceReader
-/// first (RND experiments run through `deploy-tier2.ps1`, which sets
-/// them). A construction failure falls through to the next backend; a
-/// failure of both degrades to the colour background instead of refusing
-/// to start (AGENTS §3.1).
+/// A construction failure falls through to the next backend; a failure of
+/// both degrades to the colour background instead of refusing to start.
 fn build_backend(source: Option<&Path>) -> Option<Box<dyn MediaBackend>> {
     let _ = source?;
-    let tier2_opted_in =
-        std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("CASCADE_TIER2"));
 
     let source_reader = || match SourceReaderBackend::new() {
         Ok(backend) => {
-            cascade_win::dlog!("cascade: media backend: SourceReader (Tier 2)");
+            cascade_win::dlog!("cascade: media backend: SourceReader (Tier 2 E3b)");
             Some(Box::new(backend) as Box<dyn MediaBackend>)
         }
         Err(err) => {
@@ -181,11 +175,7 @@ fn build_backend(source: Option<&Path>) -> Option<Box<dyn MediaBackend>> {
         }
     };
 
-    if tier2_opted_in {
-        source_reader().or_else(media_engine)
-    } else {
-        media_engine().or_else(source_reader)
-    }
+    source_reader().or_else(media_engine)
 }
 
 fn parse_color(text: &str) -> Result<u32, String> {
