@@ -6,6 +6,8 @@ use std::path::Path;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+pub mod rule_engine;
+
 /// Unique identifier for a monitor, e.g. `\\.\DISPLAY1`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MonitorId(pub String);
