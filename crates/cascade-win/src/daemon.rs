@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use cascade_core::{HostSurface, MediaBackend, MonitorId, PlaybackOptions};
+use cascade_core::{BackendResult, HostSurface, MediaBackend, MonitorId, PlaybackOptions};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{
@@ -250,6 +250,12 @@ fn watchdog_tick(
         }
     }
 
+    // Detach backend before destroying host windows so engine Shutdown()
+    // runs while its playback HWND is still alive (design-m2 §3.3).
+    if let Err(err) = backend.detach_surface() {
+        derr!("watchdog: backend detach failed: {err}");
+    }
+
     host.detach();
     if shell::surface_is_alive(surface) {
         let report = repaint::ladder(surface, snapshot, 1);
@@ -285,6 +291,18 @@ impl BackendGuard {
     fn take(&mut self) -> Option<Box<dyn MediaBackend>> {
         self.loaded = false;
         self.backend.take()
+    }
+
+    /// Detach the backend from its current surface without dropping it.
+    /// Called before `host.detach()` in repair paths so the engine's
+    /// `Shutdown()` runs while its playback HWND is still alive
+    /// (design-m2 §3.3 ordering). Without this, reattach-with-video wedges
+    /// the main thread (benchmark-m2.md §7.1).
+    fn detach_surface(&mut self) -> BackendResult<()> {
+        if let Some(backend) = self.backend.as_mut() {
+            backend.detach_surface()?;
+        }
+        Ok(())
     }
 }
 
@@ -503,6 +521,9 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
 
         if control::take_restore_request() {
             dlog!("restore requested");
+            if let Err(err) = backend_guard.detach_surface() {
+                derr!("restore: backend detach failed: {err}");
+            }
             host.detach();
             let report = repaint::ladder(&surface, &snapshot, opts.repaint_level);
             print_repaint("restore", &report);
@@ -523,6 +544,9 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
             dlog!("display change; re-reading monitors");
             monitors = monitor::enumerate();
             if !monitors.is_empty() {
+                if let Err(err) = backend_guard.detach_surface() {
+                    derr!("display change: backend detach failed: {err}");
+                }
                 host.detach();
                 match reattach(&monitors, &opts) {
                     Some((new_surface, new_host)) => {
