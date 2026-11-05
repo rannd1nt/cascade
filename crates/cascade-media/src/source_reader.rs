@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cascade_core::{
     BackendError, BackendResult, BackendStats, HostSurface, MediaBackend, PlaybackOptions,
@@ -179,6 +179,11 @@ struct PlaybackConfig {
     looping: Arc<AtomicBool>,
     frames_read: Arc<AtomicU64>,
     frames_presented: Arc<AtomicU64>,
+    measured_fps: Arc<AtomicU32>,
+    /// Optional FPS cap from PlaybackOptions::max_fps. When set, the frame
+    // loop sleeps between frames to stay at or below this rate instead of
+    // running uncapped at display refresh.
+    max_fps: Option<u32>,
 }
 
 /// One backend instance.
@@ -188,6 +193,8 @@ pub struct SourceReaderBackend {
     opts: PlaybackOptions,
     /// True when `probe_h264_hw_decoder()` succeeded in `load()`.
     hw_decoder_available: bool,
+    /// Measured video FPS, updated on each presented frame for `stats()`.
+    measured_fps: Arc<AtomicU32>,
     /// Command channel to the playback thread.
     cmd_tx: Option<mpsc::Sender<PlaybackCmd>>,
     /// Playback thread handle.
@@ -218,6 +225,7 @@ impl SourceReaderBackend {
             source: None,
             opts: PlaybackOptions::default(),
             hw_decoder_available: false,
+            measured_fps: Arc::new(AtomicU32::new(0)),
             cmd_tx: None,
             thread: None,
             want_playing: Arc::new(AtomicBool::new(true)),
@@ -520,8 +528,17 @@ impl SourceReaderBackend {
             None
         };
 
+        // Log video FPS for diagnostics. Query here (works for all paths,
+        // not just E3b) so the startup line always shows the source frame rate.
+        let video_fps = query_frame_rate(&reader).unwrap_or((0, 1));
+        let video_fps_num = if video_fps.1 > 0 {
+            video_fps.0 as f32 / video_fps.1 as f32
+        } else {
+            0.0
+        };
+
         eprintln!(
-            "cascade: SourceReader playback started: video {video_w}x{video_h} -> surface {}x{}",
+            "cascade: SourceReader playback started: video {video_w}x{video_h}@{video_fps_num:.1} fps -> surface {}x{}",
             config.width, config.height
         );
 
@@ -554,6 +571,13 @@ impl SourceReaderBackend {
         if debug_top {
             eprintln!("cascade: SourceReader: diagnosis CASCADE_TIER2_DEBUG_TOP=1 active");
         }
+
+        // Frame pacing: max_fps cap (if set) vsync is the default pacing.
+        let max_fps = config.max_fps;
+        let mut last_present = Instant::now();
+        // FPS measurement: count frames over 1-second windows for stats().
+        let mut frames_this_second: u64 = 0;
+        let mut fps_last_update = Instant::now();
 
         loop {
             // Check for commands (non-blocking).
@@ -948,6 +972,29 @@ impl SourceReaderBackend {
                 eprintln!("cascade: SourceReader error: Present {hr:?}");
             }
 
+            // FPS measurement for stats().
+            frames_this_second += 1;
+            if fps_last_update.elapsed() >= Duration::from_secs(1) {
+                let elapsed = fps_last_update.elapsed().as_secs_f32();
+                let fps = (frames_this_second as f32 / elapsed).round() as u32;
+                config.measured_fps.store(fps, Ordering::Release);
+                frames_this_second = 0;
+                fps_last_update = Instant::now();
+            }
+
+            // max_fps cap: if the caller asked for a frame-rate limit,
+            // sleep after presenting so we don't run uncapped at display
+            // refresh. vsync already caps at the display rate; this is for
+            // battery saving or heavy videos that can't keep up.
+            if let Some(fps) = max_fps {
+                let target_interval = Duration::from_secs_f32(1.0 / fps as f32);
+                let elapsed = last_present.elapsed();
+                if elapsed < target_interval {
+                    thread::sleep(target_interval - elapsed);
+                }
+            }
+            last_present = Instant::now();
+
             frame_count = frame_count.wrapping_add(1);
             config.frames_read.fetch_add(1, Ordering::Release);
             config.frames_presented.fetch_add(1, Ordering::Release);
@@ -989,6 +1036,8 @@ impl SourceReaderBackend {
             looping: Arc::clone(&self.looping),
             frames_read: Arc::clone(&self.frames_read),
             frames_presented: Arc::clone(&self.frames_presented),
+            measured_fps: Arc::clone(&self.measured_fps),
+            max_fps: self.opts.max_fps,
         };
 
         let thread = thread::spawn(move || {
@@ -1067,7 +1116,7 @@ impl MediaBackend for SourceReaderBackend {
                 self.width.load(Ordering::Acquire),
                 self.height.load(Ordering::Acquire),
             ),
-            fps: 0.0,
+            fps: self.measured_fps.load(Ordering::Acquire) as f32,
         }
     }
 
@@ -2268,5 +2317,15 @@ mod tests {
         // On a machine without any hardware video decoder it returns Err —
         // either is valid; the test just ensures the probe doesn't panic.
         let _ = probe_h264_hw_decoder();
+    }
+
+    #[test]
+    fn stats_reports_zero_fps_before_frames() {
+        // measured_fps starts at 0; stats() must not return NaN or garbage
+        // before any frame has been presented.
+        let backend = SourceReaderBackend::new().expect("backend must construct");
+        let stats = backend.stats();
+        assert_eq!(stats.fps, 0.0);
+        assert!(!stats.hardware_decode); // probe not called yet
     }
 }
