@@ -18,16 +18,14 @@ No WebView2. No Electron. No bundled mpv/ffmpeg. One small executable.
 
 ## What it is
 
-- **Video only.** MP4/MKV/MOV, decoded by Windows Media Foundation.
+- **Video only.** MP4/MKV/MOV with H.264 8-bit 4:2:0 ≤ 1080p60, decoded by Windows Media Foundation. Other codecs (HEVC, VP9, AV1, HDR, 10-bit) are rejected with a clear message — no silent fallback.
 - **Windows 11 only.** One platform, one desktop-host path, no legacy branches.
-- **Runs behind the icons.** A child window of the desktop's wallpaper surface, not an
-  overlay, not a second desktop, not a hook.
-- **A tiny daemon plus an optional UI.** The wallpaper engine keeps running when the
-  app window is closed.
-- **Your library, not your files.** Adding a video stores its path. Nothing is copied,
-  moved, or deleted.
-- **Comes back after reboot.** Autostart that waits for the shell, a persisted selection,
-  and a watchdog that repairs the desktop after a crash or an Explorer restart.
+- **Cross-GPU.** Developed on Intel UHD iGPU; D3D11 hardware selection adapts to dedicated GPU (NVIDIA/AMD) when present.
+- **Any monitor size, any video resolution, any video FPS.** Swapchain is created per-monitor; `ID3D11VideoProcessor` handles scaling. Higher resolution/FPS costs more compute — expected, not a regression.
+- **Runs behind the icons.** A child window of the desktop's wallpaper surface, not an overlay, not a second desktop, not a hook.
+- **A tiny daemon plus an optional UI.** The wallpaper engine keeps running when the app window is closed.
+- **Your library, not your files.** Adding a video stores its path. Nothing is copied, moved, or deleted.
+- **Comes back after reboot.** Autostart that waits for the shell, a persisted selection, and a watchdog that repairs the desktop after a crash or an Explorer restart.
 - **MIT OR Apache-2.0.** No GPL anywhere in the shipped binary.
 
 ## What it is not
@@ -93,7 +91,7 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
   expensive one. "No re-encoding, no bit-depth loss, correct colour" is the promise —
   not "pixel-identical to 1080p".
 - HDR is detected and reported, not tone-mapped (v1).
-- HEVC needs a hardware decoder (often the OS codec extension). VP9/AV1 are best-effort.
+- HEVC / VP9 / AV1 / HDR / 10-bit are rejected in v1 with a clear message — only H.264 8-bit 4:2:0 ≤ 1080p60 is supported.
 - A clip looping has a visible seam; crossfade is not in v1.
 - An external drive that is unplugged counts as "missing"; the entry is pruned from the
   library (no relocate flow, by design).
