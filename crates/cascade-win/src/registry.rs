@@ -242,10 +242,10 @@ mod tests {
 
     #[test]
     fn autostart_command_quotes_path_and_adds_flag() {
-        let exe = Path::new(r"C:\Users\Zahraan Dzakii\AppData\Local\Cascade\Cascade.exe");
+        let exe = Path::new(r"C:\Users\Zahraan Dzakii\AppData\Local\Cascade\cascade.exe");
         assert_eq!(
             autostart_command(exe),
-            r#""C:\Users\Zahraan Dzakii\AppData\Local\Cascade\Cascade.exe" --autostart"#
+            r#""C:\Users\Zahraan Dzakii\AppData\Local\Cascade\cascade.exe" --autostart"#
         );
     }
 

@@ -22,9 +22,9 @@ Current state: **docs complete, M0 complete, implementation starts at M1.**
 The app has three roles in one binary:
 
 ```
-Cascade.exe               daemon + tray (runs from logon to logoff)
-Cascade.exe --ui          GUI client (only while the window is open)
-Cascade.exe <command>     CLI client (one-shot)
+cascade.exe               daemon + tray (runs from logon to logoff)
+cascade.exe --ui          GUI client (only while the window is open)
+cascade.exe <command>     CLI client (one-shot)
 ```
 
 Keep answers and reasoning in the language the user writes in (Indonesian is fine), but
@@ -70,7 +70,7 @@ idea does not fit one of them, it is a v1.1 idea.
    injection, no patching Explorer.
 8. **No elevation.** Manifest stays `asInvoker`.
 9. **No network calls** in the product.
-10. **One distributable binary.** The release is one `Cascade.exe` plus OS DLLs.
+10. **One distributable binary.** The release is one `cascade.exe` plus OS DLLs.
 11. **No async runtime** in `cascade-core` / `cascade-win`. Threads + channels.
 12. **Don't touch other apps' data.** Only `%APPDATA%\Cascade` and
     `%LOCALAPPDATA%\Cascade` are ours.
@@ -81,7 +81,8 @@ idea does not fit one of them, it is a v1.1 idea.
     PE's address space for those filename classes — measured, deterministic,
     survives reboot; the mechanism is external and unidentified
     (`docs/spike-m0.md` §10.4). Any rename re-measures first with a
-    path-verified harness. `Cascade` (7) is a cold class.
+    path-verified harness. `cascade` (7, the shipped name) is a cold class
+    (`docs/spike-m0.md` §10.5–§10.8).
 
 ---
 
@@ -144,10 +145,10 @@ cargo fmt --all -- --check
 Running the app (from Windows PowerShell, not WSL, for realistic window behaviour):
 
 ```powershell
-.\Cascade.exe doctor
-.\Cascade.exe run
-.\Cascade.exe status
-.\Cascade.exe restore
+.\cascade.exe doctor
+.\cascade.exe run
+.\cascade.exe status
+.\cascade.exe restore
 ```
 
 Dev harness (manual, never in tests/CI):

@@ -1,6 +1,6 @@
 //! Console handling for a GUI-subsystem binary.
 //!
-//! `Cascade.exe` is linked as a GUI-subsystem executable: launching it must
+//! `cascade.exe` is linked as a GUI-subsystem executable: launching it must
 //! never create a console window. A console-subsystem build was measured to
 //! flash a Terminal window and steal focus for ~100 ms on every Run-key start
 //! (see `docs/spike-m0.md`, "M1-F corrections"), which fails M1-F.

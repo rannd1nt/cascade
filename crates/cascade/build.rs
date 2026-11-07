@@ -134,9 +134,9 @@ BEGIN
   BEGIN
    VALUE "FileDescription", "Cascade"
    VALUE "FileVersion", "{version}"
-   VALUE "InternalName", "Cascade"
+   VALUE "InternalName", "cascade"
    VALUE "LegalCopyright", "Copyright (C) Cascade contributors"
-   VALUE "OriginalFilename", "Cascade.exe"
+   VALUE "OriginalFilename", "cascade.exe"
    VALUE "ProductName", "Cascade"
    VALUE "ProductVersion", "{version}"
   END

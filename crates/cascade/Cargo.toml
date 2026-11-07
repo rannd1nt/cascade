@@ -5,11 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-# Deliberately `Cascade` (7-char stem): see AGENTS.md §3.14 — stems of 6 or
+# Lowercase `cascade` (7-char stem): see AGENTS.md §3.14 — stems of 6 or
 # 8 characters trigger the unexplained address-space allocation on
-# build 26200.9711, and `Cascade.exe` was re-measured as a cold class
-# (docs/spike-m0.md §10.5). Renaming requires a re-measure first.
-name = "Cascade"
+# build 26200.9711. Both `Cascade` and `cascade` were re-measured as cold
+# 7-char classes (docs/spike-m0.md §10.5–§10.6 and the revert note there).
+# Renaming requires a re-measure first.
+name = "cascade"
 path = "src/main.rs"
 
 [dependencies]
