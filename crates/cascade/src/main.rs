@@ -155,8 +155,9 @@ fn parse_run_options(args: &[String]) -> Result<daemon::DaemonOptions, String> {
 /// Opt-in: any `CASCADE_TIER2*` env var selects the Tier 2 SourceReader
 /// first (RND experiments run through `deploy-tier2.ps1`, which sets
 /// them). `CASCADE_TIER2_E3B=1` additionally enables the E3b GPU path
-/// (measured 0.90-1.56% CPU, 172.8 MB private bytes) — it stays an
-/// experiment until it is re-measured as the default. A construction
+/// (measured 0.90-1.56% CPU, 172.8 MB private bytes) — frozen as an
+/// opt-in experiment (design-m4.md §1, decision D1): re-measured only if
+/// MediaEngine fails in the field. A construction
 /// failure falls through to the next backend; a failure of both degrades
 /// to the colour background instead of refusing to start (AGENTS §3.1).
 fn build_backend(source: Option<&Path>) -> Option<Box<dyn MediaBackend>> {
