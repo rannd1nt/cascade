@@ -17,10 +17,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, FindWindowW, LoadCursorW, PostMessageW, PostQuitMessage,
     RegisterClassExW, IDC_ARROW, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_ENDSESSION,
-    WM_QUERYENDSESSION, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use crate::wide;
@@ -51,6 +55,49 @@ pub fn quit_requested() -> bool {
 /// Consume a pending display/resolution change (monitors may have moved).
 pub fn take_display_change() -> bool {
     DISPLAY_CHANGED.swap(false, Ordering::AcqRel)
+}
+
+/// Current session lock state as last seen in `WM_WTSSESSION_CHANGE`.
+static SESSION_LOCKED: AtomicBool = AtomicBool::new(false);
+/// Set whenever the lock state changes; consumed by [`take_session_lock`].
+static SESSION_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// Register the control window for session lock/unlock notifications
+/// (M3 pause slice, design-m3 §3). Returns the Win32 error on failure; the
+/// caller degrades to running without pause-on-lock.
+///
+/// The registration is keyed to this window and is never unregistered: like
+/// `SetConsoleCtrlHandler`, it lives exactly as long as the process (neither
+/// `windows-sys` 0.61 nor `windows` 0.62 exposes
+/// `WTSUnregisterSessionNotification`, and the exit path gains nothing from
+/// a hand-written extern because the window dies with the process anyway).
+pub fn register_session_notifications(hwnd: HWND) -> Result<(), u32> {
+    // SAFETY: `hwnd` is our own live control window on this thread;
+    // NOTIFY_FOR_THIS_SESSION limits events to the console session Cascade
+    // draws into (design-m3 §3).
+    let ok = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
+    if ok == 0 {
+        // SAFETY: reads the thread's last-error value.
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(())
+}
+
+/// Record a lock state (called from the window procedure; atomics only).
+fn set_session_lock(locked: bool) {
+    SESSION_LOCKED.store(locked, Ordering::Release);
+    SESSION_CHANGED.store(true, Ordering::Release);
+}
+
+/// Consume a pending lock/unlock transition and return the new state, or
+/// `None` when nothing changed since the last call. The main loop applies
+/// the rule (design-m3 §3).
+pub fn take_session_lock() -> Option<bool> {
+    if SESSION_CHANGED.swap(false, Ordering::AcqRel) {
+        Some(SESSION_LOCKED.load(Ordering::Acquire))
+    } else {
+        None
+    }
 }
 
 pub fn find_existing() -> Option<HWND> {
@@ -160,6 +207,17 @@ unsafe extern "system" fn control_wndproc(
             DISPLAY_CHANGED.store(true, Ordering::Release);
             0
         }
+        // Session lock/unlock (M3 pause slice, design-m3 §3): flags only —
+        // the main loop evaluates the rule and calls into the backend.
+        // `wParam` is the change code, `lParam` the session id (Win32 doc).
+        WM_WTSSESSION_CHANGE => {
+            match wparam as u32 {
+                WTS_SESSION_LOCK => set_session_lock(true),
+                WTS_SESSION_UNLOCK => set_session_lock(false),
+                _ => {}
+            }
+            0
+        }
         // Never block shutdown or logoff.
         WM_QUERYENDSESSION => 1,
         WM_ENDSESSION => {
@@ -177,5 +235,33 @@ unsafe extern "system" fn control_wndproc(
             // SAFETY: default handling.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The lock statics are process-global, so this is the only test that
+    // touches them: it asserts the whole transition sequence in one place.
+    #[test]
+    fn session_lock_transitions_are_reported_once() {
+        assert_eq!(take_session_lock(), None);
+
+        set_session_lock(true);
+        assert_eq!(take_session_lock(), Some(true));
+        // Consumed: a second take sees nothing.
+        assert_eq!(take_session_lock(), None);
+
+        set_session_lock(false);
+        assert_eq!(take_session_lock(), Some(false));
+        assert_eq!(take_session_lock(), None);
+
+        // A lock and an unlock between two takes converge on the final
+        // state (the backend never saw the intermediate one either).
+        set_session_lock(true);
+        set_session_lock(false);
+        assert_eq!(take_session_lock(), Some(false));
+        assert_eq!(take_session_lock(), None);
     }
 }

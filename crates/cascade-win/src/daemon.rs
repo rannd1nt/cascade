@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use cascade_core::rule_engine::{PauseSettings, RuleEngine, SessionState};
 use cascade_core::{BackendResult, HostSurface, MediaBackend, MonitorId, PlaybackOptions};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -355,6 +356,41 @@ fn attach_backend(backend: &mut BackendGuard, host: &mut Host) {
     }
 }
 
+/// Apply one session lock/unlock transition through the rule engine
+/// (M3 slice, design-m3 §3). Pausing freezes the last frame — the desktop
+/// is never cleared (AGENTS §3.1).
+fn apply_session_lock(backend: &mut BackendGuard, locked: bool) {
+    if !backend.loaded {
+        return;
+    }
+    let state = SessionState {
+        session_locked: locked,
+        pause_settings: PauseSettings {
+            session_lock: true,
+            ..PauseSettings::default()
+        },
+        ..SessionState::default()
+    };
+    let desired = RuleEngine::evaluate(state);
+    let Some(engine) = backend.backend.as_mut() else {
+        return;
+    };
+    if desired.playing {
+        dlog!("session unlocked; resuming playback");
+        if let Err(err) = engine.play() {
+            derr!("resume: {err}");
+        }
+    } else {
+        dlog!(
+            "session locked; pausing playback ({})",
+            desired.pause_reason.map_or("?", |reason| reason.as_str())
+        );
+        if let Err(err) = engine.pause() {
+            derr!("pause: {err}");
+        }
+    }
+}
+
 /// Run the daemon until asked to stop. Always repaints the desktop before
 /// returning, including on the restore path.
 pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Result<(), DaemonError> {
@@ -385,6 +421,12 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
     // SAFETY: handler stays valid for the process lifetime; failure only means
     // there is no console attached (the autostart case).
     unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 1) };
+
+    // M3 slice: session lock pauses playback (design-m3 §3). A failure only
+    // disables pause-on-lock; the daemon must run either way.
+    if let Err(code) = control::register_session_notifications(control.hwnd()) {
+        derr!("session notifications unavailable (error {code}); pause-on-lock disabled");
+    }
 
     let snapshot = crate::wallpaper::snapshot();
     dlog!("cascade {} starting", env!("CARGO_PKG_VERSION"));
@@ -540,6 +582,10 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
             }
         }
 
+        if let Some(locked) = control::take_session_lock() {
+            apply_session_lock(&mut backend_guard, locked);
+        }
+
         if control::take_display_change() {
             dlog!("display change; re-reading monitors");
             monitors = monitor::enumerate();
@@ -591,6 +637,96 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cascade_core::BackendStats;
+
+    /// Records pause/play calls so `apply_session_lock` can be asserted
+    /// without a real engine (no Win32 in tests).
+    struct PauseMock {
+        pauses: std::sync::Arc<AtomicU32>,
+        plays: std::sync::Arc<AtomicU32>,
+    }
+
+    impl MediaBackend for PauseMock {
+        fn load(
+            &mut self,
+            _source: &std::path::Path,
+            _opts: &PlaybackOptions,
+        ) -> BackendResult<()> {
+            Ok(())
+        }
+        fn play(&mut self) -> BackendResult<()> {
+            self.plays.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn pause(&mut self) -> BackendResult<()> {
+            self.pauses.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn set_looping(&mut self, _on: bool) -> BackendResult<()> {
+            Ok(())
+        }
+        fn stats(&self) -> BackendStats {
+            BackendStats::default()
+        }
+        fn attach_surface(&mut self, _surface: HostSurface) -> BackendResult<()> {
+            Ok(())
+        }
+        fn detach_surface(&mut self) -> BackendResult<()> {
+            Ok(())
+        }
+        fn shutdown(self: Box<Self>) {}
+    }
+
+    fn mock_backend() -> (
+        PauseMock,
+        std::sync::Arc<AtomicU32>,
+        std::sync::Arc<AtomicU32>,
+    ) {
+        let pauses = std::sync::Arc::new(AtomicU32::new(0));
+        let plays = std::sync::Arc::new(AtomicU32::new(0));
+        let mock = PauseMock {
+            pauses: pauses.clone(),
+            plays: plays.clone(),
+        };
+        (mock, pauses, plays)
+    }
+
+    #[test]
+    fn session_lock_pauses_and_unlock_resumes() {
+        let (mock, pauses, plays) = mock_backend();
+        let mut backend = BackendGuard {
+            backend: Some(Box::new(mock)),
+            loaded: true,
+        };
+
+        apply_session_lock(&mut backend, true);
+        assert_eq!(pauses.load(Ordering::SeqCst), 1);
+        assert_eq!(plays.load(Ordering::SeqCst), 0);
+
+        apply_session_lock(&mut backend, false);
+        assert_eq!(plays.load(Ordering::SeqCst), 1);
+        assert_eq!(pauses.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn session_lock_without_video_is_a_no_op() {
+        // No backend box at all: must not panic.
+        let mut no_backend = BackendGuard {
+            backend: None,
+            loaded: true,
+        };
+        apply_session_lock(&mut no_backend, true);
+
+        // Backend present but no video loaded: rule must not reach it.
+        let (mock, pauses, plays) = mock_backend();
+        let mut not_loaded = BackendGuard {
+            backend: Some(Box::new(mock)),
+            loaded: false,
+        };
+        apply_session_lock(&mut not_loaded, true);
+        assert_eq!(pauses.load(Ordering::SeqCst), 0);
+        assert_eq!(plays.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn error_messages_tell_the_user_what_to_do() {
