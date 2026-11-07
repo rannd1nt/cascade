@@ -104,10 +104,13 @@ const MF_SOURCE_READER_FLAG_ERROR: u32 = 0x8;
 /// This is M2.5 slice 1: codec probe before load. It keeps `load()` from
 /// opening a file MF cannot decode, and gives the user a clear reason why.
 fn probe_h264_hw_decoder() -> BackendResult<()> {
-    // SAFETY: `MFTEnumEx` is a flat Win32 API; out-params are initialised
-    // locals. Each `IMFActivate` in the returned array is released below,
-    // and the array itself is freed with `CoTaskMemFree`.
-    let activate_array: *mut *mut Option<IMFActivate> = std::ptr::null_mut();
+    // SAFETY: `MFTEnumEx` is a flat Win32 API; the out-params are initialised
+    // locals passed by reference. Each `IMFActivate` in the returned array is
+    // released below, and the array itself is freed with `CoTaskMemFree`.
+    // The array out-param must be a *pointer to* a null variable, not a null
+    // pointer: passing null made `MFTEnumEx` fail with E_POINTER (0x80004003)
+    // on every call, so the probe rejected every file (fixed 2026-11-07).
+    let mut activate_array: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count: u32 = 0;
     let hr = unsafe {
         MFTEnumEx(
@@ -115,7 +118,7 @@ fn probe_h264_hw_decoder() -> BackendResult<()> {
             MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
             None,
             None,
-            activate_array,
+            &mut activate_array,
             &mut count,
         )
     };
@@ -130,21 +133,26 @@ fn probe_h264_hw_decoder() -> BackendResult<()> {
             "no hardware video decoder MFT found on this machine".to_string(),
         ));
     }
+    if activate_array.is_null() {
+        // Defensive: the API returns an array with a non-zero count. Refuse
+        // instead of dereferencing null below.
+        return Err(BackendError::Unsupported(
+            "MFTEnumEx reported decoders but returned no array".to_string(),
+        ));
+    }
     // Release every IMFActivate in the array.
     for i in 0..count as usize {
-        // SAFETY: `activate_array[i]` is a valid `*mut Option<IMFActivate>` for i < count.
-        let activate_ptr = unsafe { *activate_array.add(i) };
-        if !activate_ptr.is_null() {
-            // SAFETY: read the `Option<IMFActivate>` out of the pointer and drop it,
-            // which calls `Release` on the inner `IMFActivate` if present.
-            let option = unsafe { std::ptr::read(activate_ptr) };
-            drop(option);
-        }
+        // SAFETY: `activate_array` has `count` elements written by MFTEnumEx;
+        // `ptr::read` moves each interface pointer out exactly once (the raw
+        // array memory is freed below without dropping it again), so the
+        // local's drop calls `Release` on the inner `IMFActivate`.
+        drop(unsafe { std::ptr::read(activate_array.add(i)) });
     }
-    // Free the array allocated by MFTEnumEx.
+    // Free the array allocated by MFTEnumEx (null is a valid argument).
+    // SAFETY: the array came from MFTEnumEx's CoTaskMemAlloc.
     unsafe {
         windows::Win32::System::Com::CoTaskMemFree(Some(activate_array as *const _));
-    }
+    }perf
     Ok(())
 }
 
@@ -205,6 +213,9 @@ pub struct SourceReaderBackend {
     frames_presented: Arc<AtomicU64>,
     width: AtomicU32,
     height: AtomicU32,
+    /// True when `new()` initialized COM on this thread (AGENTS §4). Only
+    /// then does `Drop` call `CoUninitialize`.
+    com_ours: bool,
 }
 
 /// Command sent from the daemon thread to the playback thread.
@@ -217,10 +228,42 @@ enum PlaybackCmd {
 
 impl SourceReaderBackend {
     pub fn new() -> BackendResult<Self> {
+        // COM first, then MF — the same order as `MediaEngineBackend::new`:
+        // `MFTEnumEx` in `load()` creates COM objects and needs an apartment
+        // on the calling thread (AGENTS §4: apartment-initialized per
+        // thread). Without either prerequisite the probe can block forever.
+        // SAFETY: null reserved pointer is the documented value; `Drop` only
+        // uninitializes when this call is the one that initialized COM.
+        let hr = unsafe {
+            windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            )
+        };
+        let com_ours = if hr.is_ok() {
+            // S_OK and S_FALSE both mean "initialized"; S_FALSE still needs
+            // a balancing CoUninitialize.
+            true
+        } else if hr == windows::Win32::Foundation::RPC_E_CHANGED_MODE {
+            // Already initialized in another apartment: leave it alone.
+            false
+        } else {
+            return Err(BackendError::Mf(format!(
+                "CoInitializeEx failed: 0x{:08X}",
+                hr.0
+            )));
+        };
         // MF must be started with the exact `MF_VERSION`; a wrong version is
         // rejected with MF_E_INVALIDVERSION and every later MF call fails.
-        (unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) })
-            .map_err(|err| BackendError::Mf(format!("MFStartup: {}", err.message())))?;
+        // SAFETY: balances the MFShutdown in `Drop`.
+        let mf = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) };
+        if let Err(err) = mf {
+            if com_ours {
+                // SAFETY: balances the CoInitializeEx above on this thread.
+                unsafe { windows::Win32::System::Com::CoUninitialize() };
+            }
+            return Err(BackendError::Mf(format!("MFStartup: {}", err.message())));
+        }
         Ok(Self {
             source: None,
             opts: PlaybackOptions::default(),
@@ -234,6 +277,7 @@ impl SourceReaderBackend {
             frames_presented: Arc::new(AtomicU64::new(0)),
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
+            com_ours,
         })
     }
 
@@ -1062,8 +1106,15 @@ impl SourceReaderBackend {
 impl Drop for SourceReaderBackend {
     fn drop(&mut self) {
         self.stop_playback_thread();
-        // SAFETY: balances the MFStartup in `new`.
+        // SAFETY: balances the MFStartup in `new`. MF shuts down before COM
+        // so it can still use COM objects while tearing down.
         let _ = unsafe { MFShutdown() };
+        if self.com_ours {
+            // SAFETY: balances the CoInitializeEx `new` performed on the
+            // constructing thread; this backend is owned and dropped by the
+            // same thread that constructed it (the daemon's main thread).
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
     }
 }
 
@@ -2313,9 +2364,14 @@ mod tests {
 
     #[test]
     fn probe_h264_hw_decoder_returns_result() {
-        // On the target machine (Intel UHD, build 26200.9711) this returns Ok.
-        // On a machine without any hardware video decoder it returns Err —
-        // either is valid; the test just ensures the probe doesn't panic.
+        // The probe needs MF + COM started on the calling thread — the
+        // production order is `new()` then `load()`. Called bare on a virgin
+        // thread `MFTEnumEx` blocks indefinitely (observed 2026-11-07).
+        // With the precondition in place the target machine (Intel UHD,
+        // build 26200.9711) returns Ok and a machine without a hardware
+        // decoder returns Err — either is valid; the test ensures the probe
+        // neither panics nor hangs.
+        let _backend = SourceReaderBackend::new().expect("backend must construct");
         let _ = probe_h264_hw_decoder();
     }
 
