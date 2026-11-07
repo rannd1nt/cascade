@@ -144,19 +144,35 @@ fn parse_run_options(args: &[String]) -> Result<daemon::DaemonOptions, String> {
 
 /// Build the media backend.
 ///
-/// Default: Tier 2 SourceReader (IMFSourceReader + own DXGI presenter,
-/// `CASCADE_TIER2_E3B` path) first — measured ~0.9% CPU on the target
-/// machine, matching mpv. Media Engine (slice 2, `IMFMediaEngine` + EVR)
-/// is the fallback; colour background is the last resort (AGENTS §3.1).
+/// Default (no env): slice 2's Media Engine backend first. It is the
+/// lightest measured video configuration (120.9 MB private bytes, R1 in
+/// docs/rnd-tier2-step5-measurement.md Appendix G) and runs at ~1.2% CPU
+/// with hardware decode on the target machine. The plain SourceReader CPU
+/// path must not ship as the default: live-measured 2026-11-07 at
+/// 11.5-12.0% CPU (≈140% of one core), 0% GPU decode and 247 MB private
+/// bytes — the E3a gate decision, re-confirmed (Appendix D and G).
 ///
-/// A construction failure falls through to the next backend; a failure of
-/// both degrades to the colour background instead of refusing to start.
+/// Opt-in: any `CASCADE_TIER2*` env var selects the Tier 2 SourceReader
+/// first (RND experiments run through `deploy-tier2.ps1`, which sets
+/// them). `CASCADE_TIER2_E3B=1` additionally enables the E3b GPU path
+/// (measured 0.90-1.56% CPU, 172.8 MB private bytes) — it stays an
+/// experiment until it is re-measured as the default. A construction
+/// failure falls through to the next backend; a failure of both degrades
+/// to the colour background instead of refusing to start (AGENTS §3.1).
 fn build_backend(source: Option<&Path>) -> Option<Box<dyn MediaBackend>> {
     let _ = source?;
+    let tier2_opted_in =
+        std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("CASCADE_TIER2"));
 
     let source_reader = || match SourceReaderBackend::new() {
         Ok(backend) => {
-            cascade_win::dlog!("cascade: media backend: SourceReader (Tier 2 E3b)");
+            // Log the path that will actually run: without E3b the reader
+            // decodes and converts on the CPU (measured 11.5-12% CPU).
+            if std::env::var_os("CASCADE_TIER2_E3B").is_some() {
+                cascade_win::dlog!("cascade: media backend: SourceReader (Tier 2 E3b)");
+            } else {
+                cascade_win::dlog!("cascade: media backend: SourceReader (Tier 2 CPU path)");
+            }
             Some(Box::new(backend) as Box<dyn MediaBackend>)
         }
         Err(err) => {
@@ -175,7 +191,11 @@ fn build_backend(source: Option<&Path>) -> Option<Box<dyn MediaBackend>> {
         }
     };
 
-    source_reader().or_else(media_engine)
+    if tier2_opted_in {
+        source_reader().or_else(media_engine)
+    } else {
+        media_engine().or_else(source_reader)
+    }
 }
 
 fn parse_color(text: &str) -> Result<u32, String> {
