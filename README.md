@@ -75,7 +75,7 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
 
 ## Known limitations
 
-- **Antivirus false positives.** An unsigned `cascade.exe` that writes a Run-key
+- **Antivirus false positives.** An unsigned `Cascade.exe` that writes a Run-key
   autostart entry, starts with no console window of its own (GUI subsystem), and stays
   resident matches the behavioural
   signature of persistence malware — Microsoft Defender flagged it as

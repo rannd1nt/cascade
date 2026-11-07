@@ -1,0 +1,156 @@
+//! Embed `img/cascade.ico` and a VERSIONINFO resource into the binary.
+//!
+//! Hand-rolled on purpose — no `embed-resource` crate (license + reason
+//! would be required for a dev-only toolchain helper). The script drives
+//! `llvm-rc` to compile an `.rc` into a `.res` and passes that `.res`
+//! straight to the linker as a rustc link argument. Verified 2026-11-07:
+//! `rust-lld` (the `lld-link` cargo-xwin uses) accepts a `.res` file
+//! directly, so neither `llvm-cvtres` nor `lib.exe` is needed.
+//!
+//! Toolchain discovery, fail-loud: `CASCADE_LLVM_RC` env override, then
+//! `llvm-rc` on PATH, then the locally extracted Ubuntu package at
+//! `~/.local/llvm15` (no sudo; see docs/spike-m0.md §10 icon notes).
+//!
+//! Non-Windows targets skip embedding entirely, so `cargo check`/`clippy`
+//! of the workspace on the Linux host never needs the resource toolchain.
+
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CASCADE_LLVM_RC");
+
+    // Resource embedding only makes sense for Windows targets; a host
+    // (Linux) build compiles the same sources but cannot link `.res` input.
+    let target = env::var("TARGET").unwrap_or_default();
+    if !target.contains("windows") {
+        return;
+    }
+
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
+    );
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
+
+    // The icon lives at the repository root (`img/cascade.ico`), outside
+    // this crate. Canonicalize to an absolute path; llvm-rc runs on the
+    // host and only reads the bytes, the `.res` stores them verbatim.
+    let icon = manifest_dir.join("../../img/cascade.ico");
+    let icon = fs::canonicalize(&icon).unwrap_or_else(|error| {
+        panic!("icon not found at {}: {error}", icon.display());
+    });
+    println!("cargo:rerun-if-changed={}", icon.display());
+    // rc syntax wants forward slashes; also keeps POSIX paths working if
+    // this script ever runs on a Windows host.
+    let icon = icon.to_string_lossy().replace('\\', "/");
+
+    let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is set");
+    let numbers = numeric_version(&version);
+
+    let rc_path = out_dir.join("cascade.rc");
+    fs::write(&rc_path, render_rc(&icon, &numbers, &version)).unwrap_or_else(|error| {
+        panic!("failed to write {}: {error}", rc_path.display());
+    });
+
+    let res_path = out_dir.join("cascade.res");
+    let llvm_rc = find_llvm_rc();
+    let status = Command::new(&llvm_rc)
+        // `/no-preprocess` keeps llvm-rc from needing cpp; `/C 65001` reads
+        // the rc as UTF-8 (the file is ASCII today, belt and braces).
+        .arg("/no-preprocess")
+        .arg("/fo")
+        .arg(&res_path)
+        .args(["/C", "65001", "--"])
+        .arg(&rc_path)
+        .status()
+        .unwrap_or_else(|error| panic!("failed to run {}: {error}", llvm_rc.display()));
+    if !status.success() {
+        panic!("llvm-rc failed ({status}) compiling {}", rc_path.display());
+    }
+
+    // One link argument on the final binaries; rustc forwards it to the
+    // linker, which merges the `.res` into the PE resource directory.
+    println!("cargo:rustc-link-arg-bins={}", res_path.display());
+}
+
+/// Locate `llvm-rc`: env override, PATH, then `~/.local/llvm15`.
+fn find_llvm_rc() -> PathBuf {
+    if let Some(path) = env::var_os("CASCADE_LLVM_RC") {
+        return PathBuf::from(path);
+    }
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            let candidate = dir.join("llvm-rc");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let candidate = PathBuf::from(home).join(".local/llvm15/usr/lib/llvm-15/bin/llvm-rc");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "llvm-rc not found; the Windows build embeds the application icon and \
+         VERSIONINFO. Install LLVM (llvm-rc) or set CASCADE_LLVM_RC to its path."
+    );
+}
+
+/// `0.1.0-alpha.0` -> `[0, 1, 0]`; non-numeric parts become 0.
+fn numeric_version(version: &str) -> [u16; 3] {
+    let mut numbers = [0u16; 3];
+    for (slot, part) in numbers.iter_mut().zip(version.split('.')) {
+        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+        *slot = digits.parse().unwrap_or(0);
+    }
+    numbers
+}
+
+/// The complete `.rc`: icon (resource ID 1, what Explorer and the taskbar
+/// show) and VERSIONINFO (what `(Get-Item).VersionInfo` reports).
+fn render_rc(icon: &str, numbers: &[u16; 3], version: &str) -> String {
+    let [major, minor, patch] = *numbers;
+    format!(
+        r#"// Generated by build.rs — do not edit; edit build.rs instead.
+1 ICON "{icon}"
+
+1 VERSIONINFO
+ FILEVERSION {major},{minor},{patch},0
+ PRODUCTVERSION {major},{minor},{patch},0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904b0"
+  BEGIN
+   VALUE "FileDescription", "Cascade"
+   VALUE "FileVersion", "{version}"
+   VALUE "InternalName", "Cascade"
+   VALUE "LegalCopyright", "Copyright (C) Cascade contributors"
+   VALUE "OriginalFilename", "Cascade.exe"
+   VALUE "ProductName", "Cascade"
+   VALUE "ProductVersion", "{version}"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x409, 1200
+ END
+END
+"#,
+        icon = icon,
+        major = major,
+        minor = minor,
+        patch = patch,
+        version = version,
+    )
+}
