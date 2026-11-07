@@ -152,7 +152,7 @@ fn probe_h264_hw_decoder() -> BackendResult<()> {
     // SAFETY: the array came from MFTEnumEx's CoTaskMemAlloc.
     unsafe {
         windows::Win32::System::Com::CoTaskMemFree(Some(activate_array as *const _));
-    }perf
+    }
     Ok(())
 }
 
