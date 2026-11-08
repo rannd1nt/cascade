@@ -27,6 +27,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Pipes",
     "Win32_System_IO",
     "Win32_System_ProcessStatus",
+    # M4 S2b power collector (design-m4 §2.6): RegisterPowerSettingNotification
+    # + GetSystemPowerStatus (Power) and GUID_ACDC_POWER_SOURCE (SystemServices).
+    "Win32_System_Power",
+    "Win32_System_SystemServices",
     # CreateFileW / CreateNamedPipeW are cfg-gated on this feature in
     # windows-sys 0.61 (their signatures take SECURITY_ATTRIBUTES).
     "Win32_Security",

@@ -10,6 +10,7 @@ pub mod host;
 pub mod ipc;
 pub mod library;
 pub mod monitor;
+pub mod power;
 pub mod present;
 pub mod registry;
 pub mod repaint;

@@ -22,9 +22,10 @@ use windows_sys::Win32::System::RemoteDesktop::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, FindWindowW, LoadCursorW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, IDC_ARROW, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_ENDSESSION,
-    WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    RegisterClassExW, IDC_ARROW, PBT_POWERSETTINGCHANGE, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE,
+    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK,
+    WTS_SESSION_UNLOCK,
 };
 
 use crate::wide;
@@ -244,6 +245,17 @@ unsafe extern "system" fn control_wndproc(
                 _ => {}
             }
             0
+        }
+        // S2b power collector (design-m4 §2.6): record the raw AC/DC sample
+        // into atomics; the main loop feeds it to the hysteresis on its next
+        // wake. The window procedure never touches engine state — the same
+        // rule as the session-lock flags above. Returning 1 marks the
+        // notification as handled (Win32 doc for WM_POWERBROADCAST).
+        WM_POWERBROADCAST if wparam as u32 == PBT_POWERSETTINGCHANGE && lparam != 0 => {
+            // SAFETY: the OS attached the POWERBROADCAST_SETTING to this
+            // message and it stays valid for the duration of the call.
+            unsafe { crate::power::record_broadcast(lparam) };
+            1
         }
         // Never block shutdown or logoff.
         WM_QUERYENDSESSION => 1,

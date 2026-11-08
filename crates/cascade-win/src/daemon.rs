@@ -19,7 +19,7 @@ use cascade_core::ipc::{
     Response, Settings, VideoSize,
 };
 use cascade_core::library::{Library, LibraryItem, VideoMetadata};
-use cascade_core::rule_engine::{RuleEngine, SessionState};
+use cascade_core::rule_engine::{BatteryAction, RuleEngine, SessionState};
 use cascade_core::{BackendResult, HostSurface, MediaBackend, MonitorId, PlaybackOptions};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -41,6 +41,7 @@ use crate::ipc::{
 };
 use crate::library::LibraryStore;
 use crate::monitor::{self, MonitorInfo};
+use crate::power;
 use crate::registry;
 use crate::repaint;
 use crate::shell::{self, ShellError, ShellSurface};
@@ -83,6 +84,10 @@ impl Default for DaemonOptions {
 #[derive(Clone, Copy, Debug, Default)]
 struct Flags {
     user_paused: bool,
+    /// Confirmed power source from the S2b collector (design-m4 §2.6).
+    /// Runtime-only, and it stays `false` while the collector is gated
+    /// off (D8: `on_battery == off` means no read, no subscription).
+    on_battery: bool,
 }
 
 /// Builds a media backend on demand — the first `wallpaper.set` on a
@@ -552,9 +557,9 @@ fn session_state(settings: &Settings, flags: &Flags, session_locked: bool) -> Se
         power_profile: settings.power_profile,
         pause_settings: settings.pause,
         battery_action: settings.on_battery,
-        // No power collector exists before design-m4 S2b, and D8 keeps
-        // the default off: S2 never reads the power source at all.
-        on_battery: false,
+        // The collector's confirmed state (S2b); `false` while the gate is
+        // off, which is exactly what D8 promises: no read at the default.
+        on_battery: flags.on_battery,
         ..SessionState::default()
     }
 }
@@ -596,6 +601,136 @@ fn apply_playback(
         ),
         Err(err) => derr!("playback: {err}"),
     }
+}
+
+/// Everything one `power_step` may touch (design-m4 §2.6). Grouped into
+/// one value for the same reason as `StatusInputs`: nine loose parameters
+/// would sit well past clippy's limit.
+struct PowerStep<'a> {
+    /// Control window that receives `WM_POWERBROADCAST`.
+    hwnd: HWND,
+    settings: &'a Settings,
+    flags: &'a mut Flags,
+    backend: &'a mut BackendGuard,
+    host: &'a mut Host,
+    /// Read-only: only `state.video.is_some()` matters here — an unload
+    /// keeps the file reference (AGENTS §3.3) so a later respawn reloads it.
+    state: &'a DaemonState,
+    registration: &'a mut Option<isize>,
+    hysteresis: &'a mut power::Hysteresis,
+    collector_on: &'a mut bool,
+}
+
+/// One turn of the power collector (design-m4 §2.6, D8/D9), run on every
+/// main-loop wake — the watchdog timeout is its only tick, so there is no
+/// timer and no per-tick hardware read:
+///
+/// 1. **Gate** — subscribe only while `on_battery != off` (D8: at the
+///    default the daemon never reads the power source). One seed read on
+///    enable, unregister + reset on disable.
+/// 2. **Sample** — feed the raw broadcast through the 3 s [`power::Hysteresis`]
+///    into `flags.on_battery`, the value the pause oracle sees.
+/// 3. **Reconcile** — [`power::reconcile`] decides unload vs. respawn vs.
+///    nothing; a state change re-evaluates the rules (they are idempotent).
+///
+/// Returns `true` when the daemon must respawn to bring the video back:
+/// this process has already loaded once, and a second in-process load
+/// would retain another ~50 MB pipeline (§8.3), so the reload always runs
+/// in a fresh process.
+fn power_step(step: PowerStep<'_>) -> bool {
+    let PowerStep {
+        hwnd,
+        settings,
+        flags,
+        backend,
+        host,
+        state,
+        registration,
+        hysteresis,
+        collector_on,
+    } = step;
+    let action = settings.on_battery;
+    let mut changed = false;
+
+    // 1. The D8 gate.
+    let want = action != BatteryAction::Off;
+    if want && !*collector_on {
+        *collector_on = true;
+        power::log_gate(true, action);
+        if let Some(raw) = power::read_source() {
+            hysteresis.observe(raw, Instant::now());
+        }
+        match
+            // SAFETY: `hwnd` is our control window, alive on this thread
+            // for the whole loop; it is unregistered on the exit ladder.
+            unsafe { power::register(hwnd) }
+        {
+            Ok(handle) => *registration = Some(handle),
+            // Logged once; the next off→on toggle of the setting retries.
+            Err(code) => power::log_register_failure(code),
+        }
+    } else if !want && *collector_on {
+        *collector_on = false;
+        power::log_gate(false, action);
+        if let Some(handle) = registration.take() {
+            power::unregister(handle);
+        }
+        // Drop any broadcast recorded between the last wake and the
+        // unregister: it must not seed the next enable with a stale sample.
+        let _ = power::take_raw();
+        hysteresis.reset();
+        if flags.on_battery {
+            flags.on_battery = false;
+            changed = true;
+        }
+    }
+
+    // 2. Raw sample → hysteresis → confirmed state. A broadcast is only
+    //    consumed while subscribed; a stale one is dropped by the disable
+    //    path's `reset` above.
+    if *collector_on {
+        if let Some(raw) = power::take_raw() {
+            hysteresis.observe(raw, Instant::now());
+        }
+        let confirmed = hysteresis.tick(Instant::now());
+        if confirmed != flags.on_battery {
+            dlog!(
+                "power: source is now {}",
+                if confirmed { "battery" } else { "AC" }
+            );
+            flags.on_battery = confirmed;
+            changed = true;
+        }
+    }
+
+    // 3. Reconcile the engine with the confirmed state.
+    match power::reconcile(
+        flags.on_battery,
+        action,
+        backend.loaded,
+        state.video.is_some(),
+    ) {
+        power::Reconcile::Reload => return true,
+        power::Reconcile::Unload => {
+            // `on_battery=stop` on battery with a loaded engine (design-m4
+            // §2.6): the engine lets go of its playback window, the colour
+            // presenter takes the client area back — the desktop is never
+            // blank (AGENTS §3.1) and the file is never touched (§3.3).
+            // `state.video` is kept, so an AC return respawns with it.
+            if let Err(err) = backend.detach_surface() {
+                derr!("power: backend detach failed: {err}");
+            }
+            backend.loaded = false;
+            host.restore_presenter();
+            dlog!("power: on_battery=stop unloaded the video; the desktop keeps its colour");
+            return false;
+        }
+        power::Reconcile::Nothing => {}
+    }
+    if changed {
+        apply_playback(backend, settings, flags, control::session_locked());
+    }
+    false
 }
 
 fn exe_path() -> PathBuf {
@@ -682,6 +817,16 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
                 // costs durability, not the setting itself.
                 derr!("settings: {err}");
             }
+            // Settings are state (design-m4 §2.6): re-evaluate the oracle
+            // so a rule toggle (`on_battery`, `pause.*`) takes effect now,
+            // not at the next unrelated event. Idempotent like every other
+            // `apply_playback` call site.
+            apply_playback(
+                ctx.backend,
+                ctx.settings,
+                ctx.flags,
+                control::session_locked(),
+            );
             let mut payload = *ctx.settings;
             // Wire edge for this response (design-m4 D10): Run key, not file.
             payload.autostart = registry::autostart_state(&exe_path()).registered;
@@ -1357,6 +1502,13 @@ pub fn run(
     // Set when a `wallpaper.set` decided this process must re-exec; read
     // once after the exit ladder to pick the `run()` result (design-m2 §4).
     let mut respawn_after = false;
+    // S2b power collector (design-m4 §2.6): registration handle, the pure
+    // hysteresis state, the D8 gate, and a pending reload-respawn. All four
+    // are inert while `settings.on_battery == off` — no read, no subscribe.
+    let mut power_registration: Option<isize> = None;
+    let mut power_hysteresis = power::Hysteresis::default();
+    let mut collector_on = false;
+    let mut power_respawn = false;
     while !control::quit_requested() {
         // Commands from the pipe thread first (design-m4 §2.2): apply
         // every queued mutation, publish the resulting snapshot, and only
@@ -1411,21 +1563,51 @@ pub fn run(
                 }
             }
         }
-        if quit || respawn.is_some() {
+        if quit || respawn.is_some() || power_respawn {
             // The pipe thread flushes its write to the client, then acks;
             // only then does the exit ladder start (design-m4 §2.3 — a
             // respawn-triggering `wallpaper.set` shares that handshake,
             // design-m2 §4). A missing ack must not keep the daemon alive.
-            if let Err(err) = flush_rx.recv_timeout(QUIT_FLUSH_WAIT) {
-                derr!("ipc: flush ack missing ({err}); quitting anyway");
+            // A power respawn (S2b) has no client waiting, so it must not
+            // sit through the flush timeout either.
+            if quit || respawn.is_some() {
+                if let Err(err) = flush_rx.recv_timeout(QUIT_FLUSH_WAIT) {
+                    derr!("ipc: flush ack missing ({err}); quitting anyway");
+                }
             }
-            if respawn.is_some() {
+            if respawn.is_some() || (power_respawn && !quit) {
                 respawn_after = true;
             }
+            power_respawn = false;
             control::request_quit();
         }
         if control::quit_requested() {
             break;
+        }
+
+        // S2b: one collector turn per iteration (design-m4 §2.6) — gate,
+        // raw sample through the 3 s hysteresis, reconcile. Placed before
+        // the wait so a broadcast dispatched at the end of the previous
+        // iteration is consumed immediately and a `settings set` that just
+        // changed `on_battery` opens or closes the gate without an extra
+        // watchdog delay. It never blocks and never reads hardware unless
+        // the gate is open.
+        if power_step(PowerStep {
+            hwnd: control.hwnd(),
+            settings: &settings,
+            flags: &mut flags,
+            backend: &mut backend_guard,
+            host: &mut host,
+            state: &state,
+            registration: &mut power_registration,
+            hysteresis: &mut power_hysteresis,
+            collector_on: &mut collector_on,
+        }) {
+            // The video must come back but this process already loaded
+            // once: head straight for the quit block at the top — no
+            // wait, the child does the reload with flat memory (§8.3).
+            power_respawn = true;
+            continue;
         }
 
         // SAFETY: standard Win32 message pump on this thread.
@@ -1556,6 +1738,12 @@ pub fn run(
     // function. The desktop must be repainted and the state saved before
     // anything else, including logging.
     dlog!("stopping");
+    // S2b: drop the power subscription while the control window it points
+    // at is still alive (design-m4 §2.6). The OS would reclaim it on
+    // process exit anyway; doing it here keeps the respawn path symmetric.
+    if let Some(handle) = power_registration.take() {
+        power::unregister(handle);
+    }
     // design-m2 §3.3: the engine releases its playback window first, then
     // the host dies, then the repaint ladder runs.
     if let Some(backend) = backend_guard.take() {
@@ -1647,7 +1835,10 @@ mod tests {
             session_loads: 0,
         };
         let settings = Settings::default();
-        let mut flags = Flags { user_paused: true };
+        let mut flags = Flags {
+            user_paused: true,
+            ..Flags::default()
+        };
 
         apply_playback(&mut backend, &settings, &flags, false);
         assert_eq!(pauses.load(Ordering::SeqCst), 1);
@@ -1782,13 +1973,18 @@ mod tests {
         );
         assert!(
             !state.on_battery,
-            "no power collector exists before design-m4 S2b"
+            "D8 default: no collector ran, so the confirmed source is off"
         );
 
         flags.user_paused = true;
+        flags.on_battery = true;
         let state = session_state(&settings, &flags, true);
         assert!(state.user_paused, "runtime flag wins over defaults");
         assert!(state.session_locked);
+        assert!(
+            state.on_battery,
+            "the collector's confirmed source reaches the oracle (S2b)"
+        );
     }
 
     #[test]
