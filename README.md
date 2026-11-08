@@ -98,6 +98,17 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
   library (no relocate flow, by design).
 - The desktop-host API is undocumented and has changed before. Two strategies plus a
   watchdog exist for that reason.
+- **In Windows PowerShell 5.1, interactive output can be overwritten by the next
+  prompt.** `cascade.exe` must be a GUI-subsystem binary — a console build flashes a
+  Terminal window and steals focus on every autostart (measured, `docs/spike-m0.md`
+  "M1-F corrections") — and PowerShell 5.1 launches GUI-subsystem apps *without
+  waiting*: the `PS C:\...>` prompt returns first, and PSReadLine repaints its prompt
+  lines over `cascade`'s output on the next Enter or Ctrl+C. This is a PowerShell
+  behaviour (PowerShell/PowerShell#25875, PowerShell/PSReadLine#366), not something
+  the app can fix. Workarounds: `cascade status | Out-Host` (a pipeline forces
+  PowerShell to wait) or `cmd /c cascade status`. After `cascade install` a generated
+  `cascade.cmd` shim makes plain `cascade ...` calls synchronous; the measurements are
+  in `docs/design-m4.md` §6.4.
 
 ## Build (from WSL, no Windows toolchain required)
 
