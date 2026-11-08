@@ -20,6 +20,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
     "Win32_Storage_FileSystem",
+    # M4 IPC (design-m4 §2): named-pipe server/client + process counters
+    # for the `status` payload (`ipc.md` §4).
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_ProcessStatus",
+    # CreateFileW / CreateNamedPipeW are cfg-gated on this feature in
+    # windows-sys 0.61 (their signatures take SECURITY_ATTRIBUTES).
+    "Win32_Security",
 ] }
 # `windows-sys` no longer ships the D3D11/DXGI (nor Media Foundation) bindings,
 # and the renderer needs COM interfaces with vtable dispatch. The two crates

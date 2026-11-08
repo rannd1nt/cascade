@@ -17,3 +17,5 @@ path = "src/main.rs"
 cascade-core = { workspace = true }
 cascade-win = { workspace = true }
 cascade-media = { workspace = true }
+# `cascade status --json` prints the daemon's payload as-is (design-m4 §3).
+serde_json = { workspace = true }

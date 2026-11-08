@@ -100,6 +100,12 @@ pub fn take_session_lock() -> Option<bool> {
     }
 }
 
+/// Current lock state without consuming the transition — what the IPC
+/// `status` snapshot reports (M4 S1).
+pub fn session_locked() -> bool {
+    SESSION_LOCKED.load(Ordering::Acquire)
+}
+
 pub fn find_existing() -> Option<HWND> {
     let class = wide::to_wide(CONTROL_CLASS);
     // SAFETY: class name is NUL-terminated; null title matches any title.

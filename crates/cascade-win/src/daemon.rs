@@ -11,6 +11,7 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use cascade_core::rule_engine::{PauseSettings, RuleEngine, SessionState};
@@ -29,6 +30,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::control::{self, ControlWindow};
 use crate::host::{self, Host, HostOptions};
+use crate::ipc::{PipeServer, StatusSnapshot};
 use crate::monitor::{self, MonitorInfo};
 use crate::repaint;
 use crate::shell::{self, ShellError, ShellSurface};
@@ -69,6 +71,7 @@ impl Default for DaemonOptions {
 pub enum DaemonError {
     AlreadyRunning(usize),
     Control(u32),
+    Pipe(u32),
     Shell(ShellError),
     Host(host::HostError),
     NoMonitors,
@@ -82,6 +85,10 @@ impl std::fmt::Display for DaemonError {
                 "Cascade is already running (control window 0x{hwnd:x}); use `cascade restore` or `cascade stop`"
             ),
             Self::Control(code) => write!(f, "could not create the daemon window (error {code})"),
+            Self::Pipe(code) => write!(
+                f,
+                r"could not open the control pipe (error {code}); if Cascade was just closed, wait a second and retry; if it persists, run `cascade doctor`"
+            ),
             Self::Shell(err) => write!(f, "{err}"),
             Self::Host(err) => write!(f, "{err}"),
             Self::NoMonitors => write!(f, "no monitors were reported by the system"),
@@ -226,6 +233,52 @@ fn reattach(monitors: &[MonitorInfo], opts: &DaemonOptions) -> Option<(ShellSurf
         std::thread::sleep(Duration::from_millis(250));
     }
     None
+}
+
+/// Build the render-loop half of a `status` snapshot from current state.
+/// Memory and autostart are read on demand by the pipe thread instead
+/// (`design-m4` §2.2), so this stays cheap enough for the 2 s watchdog.
+fn current_snapshot(host: &Host, monitors: &[MonitorInfo], opts: &DaemonOptions) -> StatusSnapshot {
+    let locked = control::session_locked();
+    let mode = if locked {
+        "paused"
+    } else if host.is_healthy() {
+        "attached"
+    } else {
+        "degraded"
+    };
+    let mut paused_reasons = Vec::new();
+    if locked {
+        paused_reasons.push("session_lock".to_string());
+    }
+    StatusSnapshot {
+        mode: mode.to_string(),
+        paused_reasons,
+        monitors: monitors.to_vec(),
+        host_strategy: host.surface().mode.label().to_string(),
+        repaint_level: opts.repaint_level,
+    }
+}
+
+/// Publish the snapshot to the pipe thread only when it changed, so the
+/// channel carries no traffic while the desktop is idle.
+fn refresh_status(
+    tx: &mpsc::Sender<Arc<StatusSnapshot>>,
+    published: &mut Option<Arc<StatusSnapshot>>,
+    host: &Host,
+    monitors: &[MonitorInfo],
+    opts: &DaemonOptions,
+) {
+    let next = Arc::new(current_snapshot(host, monitors, opts));
+    if published.as_ref().is_some_and(|prev| **prev == *next) {
+        return;
+    }
+    if tx.send(Arc::clone(&next)).is_err() {
+        // The pipe thread is gone; keep the desktop running and stop trying.
+        derr!("ipc: snapshot channel closed; status will stop updating");
+        return;
+    }
+    *published = Some(next);
 }
 
 /// One watchdog tick. Returns `true` when the desktop is healthy afterwards.
@@ -407,6 +460,20 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
         loaded: false,
     };
 
+    // The pipe is the primary single-instance lock (`ipc.md` §1): the first
+    // daemon creates it with `FILE_FLAG_FIRST_PIPE_INSTANCE`, a second one
+    // fails here. The control window check stays as the fallback for an
+    // older daemon that has no pipe yet. On any failure `pipe` drops and
+    // closes the handle, so nothing is left behind.
+    let pipe = match PipeServer::create() {
+        Ok(pipe) => pipe,
+        Err(code) => {
+            if let Some(existing) = control::find_existing() {
+                return Err(DaemonError::AlreadyRunning(existing as usize));
+            }
+            return Err(DaemonError::Pipe(code));
+        }
+    };
     if let Some(existing) = control::find_existing() {
         return Err(DaemonError::AlreadyRunning(existing as usize));
     }
@@ -515,6 +582,23 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
     }
     dlog!("  Ctrl+C in this console, or `cascade stop`, restores the wallpaper and quits");
 
+    // The render loop publishes state to the pipe thread through an
+    // immutable snapshot channel; the thread answers `status` without ever
+    // touching this loop (design-m4 §2.2). Send the first snapshot before
+    // spawning so an early `status` never sees the `boot` fallback.
+    let (status_tx, status_rx) = mpsc::channel::<Arc<StatusSnapshot>>();
+    let first = Arc::new(current_snapshot(&host, &monitors, &opts));
+    if status_tx.send(Arc::clone(&first)).is_err() {
+        derr!("ipc: snapshot channel rejected the first send; status stays at boot");
+    }
+    let mut published = Some(first);
+    if let Err(code) = pipe.serve(status_rx) {
+        // The desktop must stay up regardless: log and continue without a
+        // control channel (the control-window fallback still detects a
+        // second daemon).
+        derr!("ipc: could not start the pipe thread (error {code}); no `cascade status`");
+    }
+
     let mut msg = MSG::default();
     while !control::quit_requested() {
         // SAFETY: standard Win32 message pump on this thread.
@@ -536,6 +620,7 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
                 &snapshot,
                 &mut backend_guard,
             );
+            refresh_status(&status_tx, &mut published, &host, &monitors, &opts);
             continue;
         }
         if wait != WAIT_OBJECT_0 {
@@ -607,6 +692,10 @@ pub fn run(opts: DaemonOptions, backend: Option<Box<dyn MediaBackend>>) -> Resul
                 }
             }
         }
+
+        // Every message-driven state change (restore, lock, display) is
+        // published here; the watchdog branch publishes its own.
+        refresh_status(&status_tx, &mut published, &host, &monitors, &opts);
     }
 
     // Critical work first, prints after: a console close (CTRL_CLOSE) can

@@ -48,7 +48,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Some("doctor") => cmd_doctor(),
         Some("stop") => cmd_signal(control::WM_CASCADE_STOP, "stop"),
         Some("restore") => cmd_signal(control::WM_CASCADE_RESTORE, "restore"),
-        Some("status") => cmd_status(),
+        Some("status") => cmd_status(&args[1..]),
         Some("autostart") => cmd_autostart(&args[1..]),
         Some("version") | Some("--version") | Some("-V") => {
             println!("cascade {VERSION}");
@@ -233,18 +233,92 @@ fn cmd_signal(message: u32, label: &str) -> Result<ExitCode, String> {
     }
 }
 
-fn cmd_status() -> Result<ExitCode, String> {
-    match control::find_existing() {
-        Some(hwnd) => {
-            println!("engine: running");
-            println!("control window: 0x{:x}", hwnd as usize);
-            println!("mode: attached (detailed status arrives with the IPC layer)");
+/// `cascade status [--json]` — one request over the control pipe
+/// (`ipc.md` §7). Exit code 1 when the engine is not reachable, so scripts
+/// can branch on it.
+fn cmd_status(args: &[String]) -> Result<ExitCode, String> {
+    let json = status_options(args)?;
+    match ipc_client_status() {
+        Ok(status) => {
+            if json {
+                // `to_string_pretty` cannot fail on a Value built here.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status)
+                        .map_err(|err| format!("could not format status: {err}"))?
+                );
+            } else {
+                print_status_summary(&status);
+            }
+            Ok(ExitCode::SUCCESS)
         }
-        None => {
-            println!("engine: not running");
+        Err(message) => Err(message),
+    }
+}
+
+/// Request the `status` payload and decode it into the shared type.
+fn ipc_client_status() -> Result<cascade_core::ipc::Status, String> {
+    let data = cascade_win::ipc::request("status", cascade_core::ipc::no_data())
+        .map_err(|err| err.to_string())?;
+    serde_json::from_value(data).map_err(|err| format!("engine sent an unreadable status: {err}"))
+}
+
+/// Parse `status` flags. Kept pure for unit testing.
+fn status_options(args: &[String]) -> Result<bool, String> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            other => return Err(format!("unknown option for status: {other}")),
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(json)
+}
+
+fn print_status_summary(status: &cascade_core::ipc::Status) {
+    println!("engine: {}", status.engine);
+    println!("mode: {}", status.mode);
+    if !status.paused_reasons.is_empty() {
+        println!("paused because: {}", status.paused_reasons.join(", "));
+    }
+    for monitor in &status.monitors {
+        let rect = monitor.rect;
+        let primary = if monitor.primary { " (primary)" } else { "" };
+        let source = monitor
+            .source
+            .as_ref()
+            .map(|source| format!(" — {}", source.title))
+            .unwrap_or_default();
+        println!(
+            "  {} {w}x{h} at {x},{y}{primary}{source}",
+            monitor.id,
+            w = rect.w,
+            h = rect.h,
+            x = rect.x,
+            y = rect.y,
+        );
+    }
+    println!(
+        "host: {} (repaint level {})",
+        status.host.strategy, status.host.repaint_level
+    );
+    println!(
+        "memory: {} MB working set, {} MB private",
+        status.memory.working_set_mb, status.memory.private_mb
+    );
+    println!(
+        "autostart: {}{}",
+        if status.autostart.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if status.autostart.windows_disabled {
+            " (disabled in Windows Settings)"
+        } else {
+            ""
+        }
+    );
 }
 
 fn cmd_autostart(args: &[String]) -> Result<ExitCode, String> {
@@ -295,7 +369,8 @@ fn print_help() {
     println!("  cascade [run] [--color RRGGBB] [--repaint 1-4] [--host auto|workerw|layered]");
     println!("           [--video <path>]   play this file behind the desktop icons");
     println!("  cascade doctor");
-    println!("  cascade stop | restore | status");
+    println!("  cascade stop | restore");
+    println!("  cascade status [--json]");
     println!("  cascade autostart on|off|status");
     println!("  cascade ui");
     println!();
@@ -341,6 +416,16 @@ mod tests {
     fn run_options_without_video_have_no_source() {
         let options = parse_run_options(&args(&["--color", "187A86"])).expect("valid options");
         assert!(options.video.is_none());
+    }
+
+    #[test]
+    fn status_options_parse_json_flag() {
+        assert!(!status_options(&[]).expect("no flags"));
+        assert!(status_options(&args(&["--json"])).expect("--json"));
+        assert!(
+            status_options(&args(&["--yaml"])).is_err(),
+            "unknown flags must be rejected, not ignored"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
 use crate::wide;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MonitorInfo {
     /// `HMONITOR` as an integer so the struct stays `Send`.
     pub handle: isize,

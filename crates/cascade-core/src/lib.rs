@@ -6,6 +6,7 @@ use std::path::Path;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+pub mod ipc;
 pub mod rule_engine;
 
 /// Unique identifier for a monitor, e.g. `\\.\DISPLAY1`.
@@ -19,7 +20,7 @@ impl MonitorId {
 }
 
 /// Rectangle in virtual-desktop coordinates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,

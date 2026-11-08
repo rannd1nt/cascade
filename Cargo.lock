@@ -9,12 +9,15 @@ dependencies = [
  "cascade-core",
  "cascade-media",
  "cascade-win",
+ "serde_json",
 ]
 
 [[package]]
 name = "cascade-core"
 version = "0.1.0-alpha.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
