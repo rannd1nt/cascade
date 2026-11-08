@@ -20,6 +20,9 @@ cascade-media = { path = "crates/cascade-media" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# config.toml (architecture §10): settings persistence. MIT OR Apache-2.0,
+# pure Rust (winnow parser) so it cross-compiles under cargo-xwin.
+toml = "0.8"
 windows = "0.62"
 # Direct dependency only for the `#[implement]` macro, which emits
 # `::windows_core::` paths; same version windows already pulls in.

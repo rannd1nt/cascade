@@ -36,6 +36,11 @@ pub struct DaemonState {
     /// `state.json` written before slice 2 still loads (`serde(default)`).
     #[serde(default)]
     pub video: Option<String>,
+    /// Monitor the last `wallpaper.set` targeted (`\\.\DISPLAYn`); `None`
+    /// means "first window" (design-m4 §5.4). Additive like `video` — a
+    /// `state.json` written before M4 S2 still loads.
+    #[serde(default)]
+    pub monitor: Option<String>,
 }
 
 impl DaemonState {
@@ -45,6 +50,7 @@ impl DaemonState {
         repaint_level: u32,
         host_mode: String,
         video: Option<String>,
+        monitor: Option<String>,
     ) -> Self {
         Self {
             version: STATE_VERSION,
@@ -55,6 +61,7 @@ impl DaemonState {
             repaint_level,
             host_mode,
             video,
+            monitor,
         }
     }
 
@@ -157,7 +164,7 @@ mod tests {
     }
 
     fn running() -> DaemonState {
-        DaemonState::running_now(42, "187A86".to_string(), 2, "auto".to_string(), None)
+        DaemonState::running_now(42, "187A86".to_string(), 2, "auto".to_string(), None, None)
     }
 
     #[test]
@@ -170,6 +177,7 @@ mod tests {
         assert_eq!(state.repaint_level, 2);
         assert_eq!(state.host_mode, "auto");
         assert!(state.video.is_none());
+        assert!(state.monitor.is_none());
         assert!(state.updated_unix > 0);
     }
 
@@ -186,6 +194,7 @@ mod tests {
         .expect("write");
         let loaded = store.load().expect("legacy state must load");
         assert!(loaded.video.is_none());
+        assert!(loaded.monitor.is_none(), "monitor is additive too");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -203,8 +212,14 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let (store, dir) = temp_store("roundtrip");
-        let state =
-            DaemonState::running_now(7, "00FF00".to_string(), 4, "layered".to_string(), None);
+        let state = DaemonState::running_now(
+            7,
+            "00FF00".to_string(),
+            4,
+            "layered".to_string(),
+            None,
+            Some(r"\\.\DISPLAY1".to_string()),
+        );
         store.save(&state).expect("save should succeed");
         let loaded = store.load().expect("load should succeed");
         assert!(loaded.running);
@@ -212,6 +227,7 @@ mod tests {
         assert_eq!(loaded.color, "00FF00");
         assert_eq!(loaded.repaint_level, 4);
         assert_eq!(loaded.host_mode, "layered");
+        assert_eq!(loaded.monitor.as_deref(), Some(r"\\.\DISPLAY1"));
         assert_eq!(loaded.version, STATE_VERSION);
         let _ = fs::remove_dir_all(dir);
     }

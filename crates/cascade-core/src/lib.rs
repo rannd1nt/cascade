@@ -47,6 +47,10 @@ pub enum PauseReason {
     SessionLocked,
     Screensaver,
     RemoteSession,
+    /// Running on battery with `on_battery` set to `pause`/`stop` (D9):
+    /// reported honestly instead of masquerading as `display_off` or
+    /// `user_paused`.
+    OnBattery,
     UserPaused,
     Degraded,
 }
@@ -60,6 +64,7 @@ impl PauseReason {
             Self::SessionLocked => "session_locked",
             Self::Screensaver => "screensaver",
             Self::RemoteSession => "remote_session",
+            Self::OnBattery => "on_battery",
             Self::UserPaused => "user_paused",
             Self::Degraded => "degraded",
         }
@@ -203,6 +208,7 @@ mod tests {
         assert_eq!(PauseReason::SessionLocked.as_str(), "session_locked");
         assert_eq!(PauseReason::Screensaver.as_str(), "screensaver");
         assert_eq!(PauseReason::RemoteSession.as_str(), "remote_session");
+        assert_eq!(PauseReason::OnBattery.as_str(), "on_battery");
         assert_eq!(PauseReason::UserPaused.as_str(), "user_paused");
         assert_eq!(PauseReason::Degraded.as_str(), "degraded");
     }

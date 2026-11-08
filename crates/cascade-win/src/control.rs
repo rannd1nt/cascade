@@ -35,6 +35,13 @@ pub const CONTROL_TITLE: &str = "Cascade";
 /// Ask a running daemon to detach, repaint, and reattach without quitting.
 pub const WM_CASCADE_RESTORE: u32 = WM_APP + 1;
 
+/// Wake the main loop because the pipe thread queued a command
+/// (design-m4 §2.2). The window procedure does nothing else with it — the
+/// command travels through the channel; this message only makes
+/// `MsgWaitForMultipleObjectsEx` return instead of waiting for the next
+/// watchdog tick.
+pub const WM_APP_PIPE: u32 = WM_APP + 2;
+
 /// Ask a running daemon to stop gracefully (repaint, then exit).
 pub const WM_CASCADE_STOP: u32 = WM_CLOSE;
 
@@ -47,9 +54,23 @@ pub fn take_restore_request() -> bool {
     RESTORE_REQUESTED.swap(false, Ordering::AcqRel)
 }
 
+/// Queue a restore from inside the daemon itself (the pipe thread hands
+/// `wallpaper.restore` to the main loop through the command channel; the
+/// loop sets this flag so the existing restore path runs).
+pub fn request_restore() {
+    RESTORE_REQUESTED.store(true, Ordering::Release);
+}
+
 /// True once a stop has been requested; stays true until the process exits.
 pub fn quit_requested() -> bool {
     QUIT_REQUESTED.load(Ordering::Acquire)
+}
+
+/// Request the graceful stop from inside the daemon (the pipe thread's
+/// `quit` command). The main loop runs the normal exit ladder — never
+/// `process::exit` (AGENTS §13).
+pub fn request_quit() {
+    QUIT_REQUESTED.store(true, Ordering::Release);
 }
 
 /// Consume a pending display/resolution change (monitors may have moved).
@@ -237,6 +258,10 @@ unsafe extern "system" fn control_wndproc(
             RESTORE_REQUESTED.store(true, Ordering::Release);
             0
         }
+        // Wake-only message from the pipe thread (design-m4 §2.2): the
+        // command itself rides the channel; returning 0 just unblocks the
+        // main loop's wait so it can drain the channel now.
+        WM_APP_PIPE => 0,
         _ => {
             // SAFETY: default handling.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -269,5 +294,14 @@ mod tests {
         set_session_lock(false);
         assert_eq!(take_session_lock(), Some(false));
         assert_eq!(take_session_lock(), None);
+    }
+
+    #[test]
+    fn pipe_wake_message_does_not_collide() {
+        // Design-m4 §2.2: the wake-up must be a distinct app message.
+        assert_ne!(WM_APP_PIPE, WM_CASCADE_RESTORE);
+        assert_ne!(WM_APP_PIPE, WM_CASCADE_STOP);
+        // Const values must be asserted in a const block (clippy).
+        const { assert!(WM_APP_PIPE >= WM_APP, "must stay in the app range") };
     }
 }

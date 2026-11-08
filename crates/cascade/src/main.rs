@@ -11,9 +11,14 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use cascade_core::ipc::{
+    no_data, AutostartStatus, EnabledData, MonitorData, PausePatch, SetData, Settings,
+    SettingsPatch,
+};
+use cascade_core::rule_engine::{BatteryAction, PowerProfile};
 use cascade_core::MediaBackend;
 use cascade_media::{MediaEngineBackend, SourceReaderBackend};
-use cascade_win::{console, control, daemon, doctor, dpi, host, registry, state};
+use cascade_win::{console, control, daemon, doctor, dpi, host, ipc, registry, state};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -47,8 +52,14 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Some("--autostart") => cmd_run(&args[1..]),
         Some("doctor") => cmd_doctor(),
         Some("stop") => cmd_signal(control::WM_CASCADE_STOP, "stop"),
-        Some("restore") => cmd_signal(control::WM_CASCADE_RESTORE, "restore"),
+        Some("restore") => cmd_restore(),
         Some("status") => cmd_status(&args[1..]),
+        Some("pause") => cmd_playback(true, &args[1..]),
+        Some("resume") => cmd_playback(false, &args[1..]),
+        Some("set") => cmd_set(&args[1..]),
+        Some("clear") => cmd_clear(&args[1..]),
+        Some("quit") => cmd_quit(&args[1..]),
+        Some("settings") => cmd_settings(&args[1..]),
         Some("autostart") => cmd_autostart(&args[1..]),
         Some("version") | Some("--version") | Some("-V") => {
             println!("cascade {VERSION}");
@@ -83,7 +94,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             .map(PathBuf::from)
     });
     let backend = build_backend(source.as_deref());
-    match daemon::run(options, backend) {
+    // `cascade-win` may not depend on `cascade-media` (AGENTS §4): the
+    // daemon builds later backends (a first `wallpaper.set` on a videoless
+    // start) through this factory instead.
+    let factory: daemon::BackendFactory = Box::new(|path: &Path| build_backend(Some(path)));
+    match daemon::run(options, backend, factory) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(err) => {
             // Best effort: a console close may already have invalidated the
@@ -362,6 +377,324 @@ fn cmd_autostart(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+// --- Control commands (M4 S2, ipc.md §3) ------------------------------------
+
+/// `cascade restore` — repaint through the pipe, with the window message as
+/// the fallback for a daemon that predates `wallpaper.restore`.
+fn cmd_restore() -> Result<ExitCode, String> {
+    match ipc::request("wallpaper.restore", no_data()) {
+        Ok(_) => {
+            println!("restore: requested");
+            Ok(ExitCode::SUCCESS)
+        }
+        // The daemon is not running at all: say so instead of pretending.
+        Err(ipc::ClientError::NotRunning) => Err("Cascade is not running".to_string()),
+        // Busy, timeout, an older daemon without the command: the window
+        // post has always worked, so fall back to it.
+        Err(_) => cmd_signal(control::WM_CASCADE_RESTORE, "restore"),
+    }
+}
+
+/// `cascade pause` / `cascade resume` — the user pause toggle (design-m4
+/// §2.6): runtime-only, never written to `config.toml`.
+fn cmd_playback(paused: bool, args: &[String]) -> Result<ExitCode, String> {
+    let label = if paused { "pause" } else { "resume" };
+    if !args.is_empty() {
+        return Err(format!("{label} takes no arguments"));
+    }
+    let cmd = if paused {
+        "playback.pause"
+    } else {
+        "playback.resume"
+    };
+    ipc::request(cmd, no_data()).map_err(|err| err.to_string())?;
+    println!("{label}d");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// What `set` accepted: exactly one file plus an optional monitor target.
+/// Pure syntax — file existence is the daemon's job (`file_missing`,
+/// checked before any playback surgery).
+#[derive(Debug)]
+struct SetOptions {
+    path: PathBuf,
+    monitor: Option<String>,
+}
+
+fn parse_set_options(args: &[String]) -> Result<SetOptions, String> {
+    let mut file: Option<PathBuf> = None;
+    let mut monitor: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--monitor" => {
+                if monitor.is_some() {
+                    return Err("--monitor given twice".to_string());
+                }
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--monitor needs a monitor id like \\\\.\\DISPLAY1".to_string()
+                })?;
+                monitor = Some(value.clone());
+                index += 2;
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option for set: {other}"));
+            }
+            other => {
+                if file.is_some() {
+                    return Err(format!(
+                        "set takes one video file, got a second argument: {other}"
+                    ));
+                }
+                file = Some(PathBuf::from(other));
+                index += 1;
+            }
+        }
+    }
+    let path = file.ok_or_else(|| {
+        "set needs a path to a video file: `cascade set <path> [--monitor <id>]`".to_string()
+    })?;
+    Ok(SetOptions { path, monitor })
+}
+
+/// `cascade set <path> [--monitor <id>]` — play a file directly (design-m4
+/// S2; library ids arrive with slice S3). The path is made absolute here:
+/// the daemon's working directory is not the CLI's.
+fn cmd_set(args: &[String]) -> Result<ExitCode, String> {
+    let options = parse_set_options(args)?;
+    let path = std::path::absolute(&options.path)
+        .map_err(|err| format!("cannot resolve {}: {err}", options.path.display()))?;
+    let data = SetData {
+        path: Some(path.display().to_string()),
+        id: None,
+        monitor: options.monitor,
+    };
+    let payload =
+        serde_json::to_value(data).map_err(|err| format!("could not build request: {err}"))?;
+    ipc::request("wallpaper.set", payload).map_err(|err| err.to_string())?;
+    println!("playing: {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Parse an optional `--monitor <id>` flag and nothing else (`clear`).
+fn parse_monitor_option(args: &[String]) -> Result<Option<String>, String> {
+    let mut monitor: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--monitor" => {
+                if monitor.is_some() {
+                    return Err("--monitor given twice".to_string());
+                }
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--monitor needs a monitor id like \\\\.\\DISPLAY1".to_string()
+                })?;
+                monitor = Some(value.clone());
+                index += 2;
+            }
+            other => return Err(format!("unknown option for clear: {other}")),
+        }
+    }
+    Ok(monitor)
+}
+
+/// `cascade clear [--monitor <id>]` — back to the colour background. User
+/// files are never touched (AGENTS §3.3).
+fn cmd_clear(args: &[String]) -> Result<ExitCode, String> {
+    let monitor = parse_monitor_option(args)?;
+    let payload = serde_json::to_value(MonitorData { monitor })
+        .map_err(|err| format!("could not build request: {err}"))?;
+    ipc::request("wallpaper.clear", payload).map_err(|err| err.to_string())?;
+    println!("cleared; the desktop keeps its colour background");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cascade quit` — graceful exit over the pipe only (design-m4 §2.3): the
+/// response is flushed before the exit ladder starts. `cascade stop` stays
+/// the window-based escape hatch.
+fn cmd_quit(args: &[String]) -> Result<ExitCode, String> {
+    if !args.is_empty() {
+        return Err("quit takes no arguments".to_string());
+    }
+    match ipc::request("quit", no_data()) {
+        Ok(_) => {
+            println!("stopping");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(ipc::ClientError::NotRunning) => Err("Cascade is not running".to_string()),
+        Err(ipc::ClientError::Busy) => {
+            Err("the engine is busy — retry, or use `cascade stop`".to_string())
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// `cascade settings get|set` (`ipc.md` §5).
+fn cmd_settings(args: &[String]) -> Result<ExitCode, String> {
+    match args.first().map(String::as_str) {
+        Some("get") => settings_get(&args[1..]),
+        Some("set") => settings_set(&args[1..]),
+        Some(other) => Err(format!("settings expects get|set, got {other}")),
+        None => Err("settings expects get or set — see `cascade help`".to_string()),
+    }
+}
+
+fn settings_get(args: &[String]) -> Result<ExitCode, String> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            other => return Err(format!("unknown option for settings get: {other}")),
+        }
+    }
+    let data = ipc::request("settings.get", no_data()).map_err(|err| err.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data)
+                .map_err(|err| format!("could not format settings: {err}"))?
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let settings: Settings = serde_json::from_value(data)
+        .map_err(|err| format!("engine sent unreadable settings: {err}"))?;
+    print_settings(&settings);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_settings(settings: &Settings) {
+    println!("power_profile: {}", settings.power_profile.as_str());
+    println!("on_battery: {}", settings.on_battery.as_str());
+    println!("pause.fullscreen: {}", settings.pause.fullscreen);
+    println!("pause.maximized: {}", settings.pause.maximized);
+    println!("pause.display_off: {}", settings.pause.display_off);
+    println!("pause.session_lock: {}", settings.pause.session_lock);
+    println!("pause.screensaver: {}", settings.pause.screensaver);
+    println!("pause.remote_session: {}", settings.pause.remote_session);
+    println!(
+        "restore_wallpaper_on_exit: {}",
+        settings.restore_wallpaper_on_exit
+    );
+    println!("tray: {}", settings.tray);
+    println!(
+        "autostart: {}",
+        if settings.autostart { "on" } else { "off" }
+    );
+}
+
+/// `cascade settings set <key> <value>` — exactly two arguments, a strictly
+/// validated key (`design-m4` §3: unknown key → error, never ignored).
+fn settings_set(args: &[String]) -> Result<ExitCode, String> {
+    if args.len() != 2 {
+        return Err(
+            "settings set needs <key> <value> — see `cascade help` for the keys".to_string(),
+        );
+    }
+    let key = args[0].as_str();
+    let value = args[1].as_str();
+
+    // `autostart` is not file backed (design-m4 D10): the Run key is the
+    // oracle, so it travels as its own command instead of a settings patch.
+    if key == "autostart" {
+        let enabled = parse_bool(value)?;
+        let payload = serde_json::to_value(EnabledData { enabled })
+            .map_err(|err| format!("could not build request: {err}"))?;
+        let data = ipc::request("autostart.set", payload).map_err(|err| err.to_string())?;
+        let status: AutostartStatus = serde_json::from_value(data)
+            .map_err(|err| format!("engine sent an unreadable autostart status: {err}"))?;
+        println!("autostart = {}", if status.enabled { "on" } else { "off" });
+        if status.windows_disabled {
+            println!("  warning: disabled in Settings > Apps > Startup");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let (patch, canonical) = build_patch(key, value)?;
+    let payload =
+        serde_json::to_value(patch).map_err(|err| format!("could not build request: {err}"))?;
+    let data = ipc::request("settings.set", payload).map_err(|err| err.to_string())?;
+    let settings: Settings = serde_json::from_value(data)
+        .map_err(|err| format!("engine sent unreadable settings: {err}"))?;
+    println!("{key} = {canonical}");
+    // A contradictory-but-allowed combination applies and warns (D9).
+    if let Some(warning) = settings.conflict_warning() {
+        println!("  warning: {warning}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Validate one `settings set <key> <value>` pair and build the patch. The
+/// second element is the canonical spelling echoed back to the user.
+fn build_patch(key: &str, value: &str) -> Result<(SettingsPatch, String), String> {
+    let mut patch = SettingsPatch::default();
+    let canonical = match key {
+        "power_profile" => {
+            let profile = PowerProfile::parse(value).ok_or_else(|| {
+                format!("power_profile expects off|balanced|battery|quality, got {value}")
+            })?;
+            patch.power_profile = Some(profile);
+            profile.as_str().to_string()
+        }
+        "on_battery" => {
+            let action = BatteryAction::parse(value).ok_or_else(|| {
+                format!("on_battery expects off|pause|stop|continue, got {value}")
+            })?;
+            patch.on_battery = Some(action);
+            action.as_str().to_string()
+        }
+        "restore_wallpaper_on_exit" | "tray" => {
+            let flag = parse_bool(value)?;
+            if key == "restore_wallpaper_on_exit" {
+                patch.restore_wallpaper_on_exit = Some(flag);
+            } else {
+                patch.tray = Some(flag);
+            }
+            flag.to_string()
+        }
+        other => {
+            let pause_key = other
+                .strip_prefix("pause.")
+                .ok_or_else(|| unknown_setting_key(other))?;
+            let flag = parse_bool(value)?;
+            let mut pause = PausePatch::default();
+            match pause_key {
+                "fullscreen" => pause.fullscreen = Some(flag),
+                "maximized" => pause.maximized = Some(flag),
+                "display_off" => pause.display_off = Some(flag),
+                "session_lock" => pause.session_lock = Some(flag),
+                "screensaver" => pause.screensaver = Some(flag),
+                "remote_session" => pause.remote_session = Some(flag),
+                _ => return Err(unknown_setting_key(other)),
+            }
+            patch.pause = Some(pause);
+            flag.to_string()
+        }
+    };
+    Ok((patch, canonical))
+}
+
+/// The error every unknown `settings set` key produces — it lists what *is`
+/// valid so the user never has to open the docs (`design-m4` §3).
+fn unknown_setting_key(key: &str) -> String {
+    format!(
+        "unknown setting key '{key}' (valid: power_profile, on_battery, \
+         pause.fullscreen, pause.maximized, pause.display_off, pause.session_lock, \
+         pause.screensaver, pause.remote_session, restore_wallpaper_on_exit, tray, autostart)"
+    )
+}
+
+/// `true`/`false`, case-insensitive — the only boolean spelling the CLI
+/// accepts.
+fn parse_bool(value: &str) -> Result<bool, String> {
+    if value.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(format!("expected true or false, got {value}"))
+    }
+}
+
 fn print_help() {
     println!("cascade {VERSION}");
     println!();
@@ -369,8 +702,17 @@ fn print_help() {
     println!("  cascade [run] [--color RRGGBB] [--repaint 1-4] [--host auto|workerw|layered]");
     println!("           [--video <path>]   play this file behind the desktop icons");
     println!("  cascade doctor");
-    println!("  cascade stop | restore");
+    println!("  cascade stop | restore | quit");
     println!("  cascade status [--json]");
+    println!("  cascade pause | resume");
+    println!("  cascade set <path> [--monitor <id>]   play a file (library ids: M4 S3)");
+    println!("  cascade clear [--monitor <id>]        back to the colour background");
+    println!("  cascade settings get [--json]");
+    println!("  cascade settings set <key> <value>    keys: power_profile, on_battery,");
+    println!("                                        pause.fullscreen, pause.maximized,");
+    println!("                                        pause.display_off, pause.session_lock,");
+    println!("                                        pause.screensaver, pause.remote_session,");
+    println!("                                        restore_wallpaper_on_exit, tray, autostart");
     println!("  cascade autostart on|off|status");
     println!("  cascade ui");
     println!();
@@ -457,5 +799,101 @@ mod tests {
         assert!(parse_color("GGGGGG").is_err());
         assert!(parse_color("1000000").is_err()); // 7 digits > 0xFFFFFF
         assert!(parse_color("187A86FF").is_err()); // 8 digits > 0xFFFFFF
+    }
+
+    #[test]
+    fn set_options_parse_file_and_monitor() {
+        let options = parse_set_options(&args(&[
+            r"C:\videos\my clip.mp4",
+            "--monitor",
+            r"\\.\DISPLAY1",
+        ]))
+        .expect("file and monitor");
+        assert_eq!(options.path, Path::new(r"C:\videos\my clip.mp4"));
+        assert_eq!(options.monitor.as_deref(), Some(r"\\.\DISPLAY1"));
+
+        // The monitor is optional; the file never is.
+        let options = parse_set_options(&args(&["clip.mp4"])).expect("file only");
+        assert_eq!(options.path, Path::new("clip.mp4"));
+        assert!(options.monitor.is_none());
+    }
+
+    #[test]
+    fn set_options_reject_bad_input() {
+        // No file.
+        assert!(parse_set_options(&[]).is_err());
+        assert!(parse_set_options(&args(&["--monitor", r"\\.\DISPLAY1"])).is_err());
+        // Two files.
+        let err = parse_set_options(&args(&["a.mp4", "b.mp4"])).expect_err("one file only");
+        assert!(err.contains("one video file"), "unexpected: {err}");
+        // Unknown flag.
+        assert!(parse_set_options(&args(&["a.mp4", "--force"])).is_err());
+        // `--monitor` without a value, and given twice.
+        assert!(parse_set_options(&args(&["a.mp4", "--monitor"])).is_err());
+        assert!(parse_set_options(&args(&[
+            "a.mp4",
+            "--monitor",
+            r"\\.\DISPLAY1",
+            "--monitor",
+            r"\\.\DISPLAY2"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn clear_options_parse_monitor_flag() {
+        assert!(parse_monitor_option(&[]).expect("no flags").is_none());
+        assert_eq!(
+            parse_monitor_option(&args(&["--monitor", r"\\.\DISPLAY2"]))
+                .expect("monitor")
+                .as_deref(),
+            Some(r"\\.\DISPLAY2")
+        );
+        // Anything else is an error, not silently ignored.
+        assert!(parse_monitor_option(&args(&["DISPLAY2"])).is_err());
+        assert!(parse_monitor_option(&args(&["--monitor"])).is_err());
+        assert!(parse_monitor_option(&args(&["--monitor", "A", "--monitor", "B"])).is_err());
+    }
+
+    #[test]
+    fn settings_patch_keys_are_validated_strictly() {
+        // Known keys parse and canonicalise.
+        let (patch, canonical) = build_patch("power_profile", "battery").expect("valid");
+        assert_eq!(patch.power_profile, Some(PowerProfile::Battery));
+        assert_eq!(canonical, "battery");
+
+        let (patch, canonical) = build_patch("pause.session_lock", "FALSE").expect("valid");
+        assert_eq!(patch.pause.expect("pause patch").session_lock, Some(false));
+        assert_eq!(canonical, "false");
+
+        let (patch, canonical) = build_patch("on_battery", "pause").expect("valid");
+        assert_eq!(patch.on_battery, Some(BatteryAction::Pause));
+        assert_eq!(canonical, "pause");
+
+        // Unknown keys fail with the list of valid ones — never ignored.
+        for key in ["video", "pause.nope", "battery"] {
+            let err = build_patch(key, "true").expect_err("must reject");
+            assert!(
+                err.contains("power_profile") && err.contains("pause.session_lock"),
+                "error must list valid keys: {err}"
+            );
+        }
+        // Bad values fail too.
+        assert!(build_patch("power_profile", "turbo").is_err());
+        assert!(build_patch("on_battery", "sometimes").is_err());
+        assert!(build_patch("tray", "yes").is_err());
+        assert!(build_patch("pause.fullscreen", "on").is_err());
+        // `autostart` is a valid key overall but not a settings patch —
+        // `settings_set` intercepts it before `build_patch`.
+        assert!(build_patch("autostart", "true").is_err());
+    }
+
+    #[test]
+    fn bool_values_are_true_or_false_only() {
+        assert!(parse_bool("true").expect("lower"));
+        assert!(parse_bool("TRUE").expect("upper"));
+        assert!(!parse_bool("False").expect("mixed"));
+        assert!(parse_bool("1").is_err());
+        assert!(parse_bool("on").is_err());
     }
 }

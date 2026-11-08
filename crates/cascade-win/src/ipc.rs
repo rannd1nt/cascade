@@ -3,21 +3,26 @@
 //!
 //! The **server** runs on its own thread started by `daemon::run`: it owns
 //! the pipe handle and every `ReadFile`/`WriteFile` on it. The render loop
-//! never waits on pipe I/O — it feeds the thread an immutable
-//! [`StatusSnapshot`] through a channel whenever state changes, and the
-//! thread answers read-only commands (`ping`, `status`) from that snapshot
-//! without touching the main loop (design-m4 §2.2).
+//! never waits on pipe I/O. Read-only commands (`ping`, `status`,
+//! `settings.get`, `autostart.*`) are answered on this thread from an
+//! immutable snapshot channel fed by the main loop; mutating commands
+//! (`playback.*`, `wallpaper.*`, `settings.set`, `quit`) are handed to the
+//! main loop through a command channel, woken with `WM_APP_PIPE`, and the
+//! thread blocks on the response for at most 2 s before answering `busy`
+//! (design-m4 §2.2).
 //!
 //! The **client** is the CLI path (`cascade status`): connect with a bounded
 //! retry, one JSON line out, one JSON line in, close (`ipc.md` §7).
 
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cascade_core::ipc::{
-    self, encode_line, no_data, DecodeError, Ping, Response, Status, MAX_LINE_BYTES, PIPE_PREFIX,
+    self, encode_line, no_data, AutostartStatus, DecodeError, EnabledData, MonitorData, Ping,
+    Response, SetData, Settings, SettingsPatch, Status, MAX_LINE_BYTES, PIPE_PREFIX,
 };
 use cascade_core::PROTOCOL_VERSION;
 use windows_sys::Win32::Foundation::{
@@ -35,6 +40,7 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
 
+use crate::control::{self, WM_APP_PIPE};
 use crate::derr;
 use crate::monitor::{self, MonitorInfo};
 use crate::registry;
@@ -54,6 +60,13 @@ const CONNECT_PAUSE: Duration = Duration::from_millis(250);
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(2);
 const PEEK_POLL: Duration = Duration::from_millis(25);
 
+/// Server-side bounds (design-m4 §2.2): how long the pipe thread waits for
+/// the main loop to answer a forwarded command, and how long the main loop
+/// waits for the `quit` flush ack before quitting anyway (the ack itself
+/// is sent by the pipe thread, so this constant is shared with `daemon`).
+const SUBMIT_DEADLINE: Duration = Duration::from_secs(2);
+pub const QUIT_FLUSH_WAIT: Duration = Duration::from_secs(1);
+
 /// `\\.\pipe\cascade-ctl-{session_id}` (`ipc.md` §1). Machine-global
 /// namespace → branded prefix (design-m4 §2.5).
 pub fn server_name() -> String {
@@ -65,8 +78,9 @@ pub fn server_name() -> String {
 }
 
 /// What the main loop publishes to the pipe thread: the parts of `status`
-/// only the render loop owns (`ipc.md` §4). Memory and autostart are read
-/// on demand by the pipe thread; they are not part of this snapshot.
+/// only the render loop owns (`ipc.md` §4), plus the settings the daemon
+/// persists (design-m4 D10). Memory and autostart are read on demand by
+/// the pipe thread; they are not part of this snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusSnapshot {
     /// `paused` | `attached` | `degraded` (design-m4 §2.2).
@@ -75,6 +89,9 @@ pub struct StatusSnapshot {
     pub monitors: Vec<MonitorInfo>,
     pub host_strategy: String,
     pub repaint_level: u32,
+    /// File-backed settings; the `autostart` field inside is the
+    /// placeholder — the wire edge fills it from the registry.
+    pub settings: Settings,
 }
 
 impl StatusSnapshot {
@@ -87,8 +104,72 @@ impl StatusSnapshot {
             monitors: monitor::enumerate(),
             host_strategy: String::new(),
             repaint_level: 0,
+            settings: Settings::default(),
         }
     }
+}
+
+/// Main loop → pipe thread: a fresh snapshot, or the response to a
+/// forwarded command (design-m4 §2.2). Both travel one channel so the
+/// thread can absorb snapshot updates while it waits for a response.
+pub enum ServerMsg {
+    Snapshot(Arc<StatusSnapshot>),
+    Response(Response),
+}
+
+/// Mutating commands the pipe thread hands to the main loop. Each carries
+/// its request id so the response can be matched — and stale responses
+/// from a submit that timed out dropped — on the shared channel.
+pub enum Command {
+    Pause {
+        id: u64,
+    },
+    Resume {
+        id: u64,
+    },
+    SetWallpaper {
+        id: u64,
+        path: String,
+        monitor: Option<String>,
+    },
+    ClearWallpaper {
+        id: u64,
+        monitor: Option<String>,
+    },
+    Restore {
+        id: u64,
+    },
+    SettingsSet {
+        id: u64,
+        patch: SettingsPatch,
+    },
+    Quit {
+        id: u64,
+    },
+}
+
+impl Command {
+    /// The request id this command answers.
+    pub fn id(&self) -> u64 {
+        match self {
+            Self::Pause { id }
+            | Self::Resume { id }
+            | Self::SetWallpaper { id, .. }
+            | Self::ClearWallpaper { id, .. }
+            | Self::Restore { id }
+            | Self::SettingsSet { id, .. }
+            | Self::Quit { id } => *id,
+        }
+    }
+}
+
+/// The channel half the server thread owns (design-m4 §2.2): it receives
+/// snapshots and responses, forwards commands, and acks a flushed `quit`.
+/// The main loop keeps the mirrored senders/receivers.
+pub struct PipeChannels {
+    pub messages: Receiver<ServerMsg>,
+    pub commands: Sender<Command>,
+    pub quit_flushed: Sender<()>,
 }
 
 /// The server half: created on the main thread (it *is* the single-instance
@@ -132,7 +213,7 @@ impl PipeServer {
     /// dies with the process (design-m4 §2.3, S1 note). Returns the spawn
     /// result so the caller can log a failure and keep running without a
     /// control channel — the desktop must stay up regardless.
-    pub fn serve(self, snapshots: Receiver<Arc<StatusSnapshot>>) -> Result<(), u32> {
+    pub fn serve(self, channels: PipeChannels) -> Result<(), u32> {
         // HANDLE is a raw pointer and therefore not `Send`; the value is
         // carried as an integer and cast back inside the thread — the only
         // code that ever dereferences it.
@@ -142,7 +223,7 @@ impl PipeServer {
         let started = Instant::now();
         match std::thread::Builder::new()
             .name("cascade-ipc".to_string())
-            .spawn(move || serve_loop(handle_addr as HANDLE, snapshots, started))
+            .spawn(move || serve_loop(handle_addr as HANDLE, channels, started))
         {
             Ok(_) => Ok(()),
             Err(err) => {
@@ -162,9 +243,13 @@ impl Drop for PipeServer {
     }
 }
 
-fn serve_loop(handle: HANDLE, snapshots: Receiver<Arc<StatusSnapshot>>, started: Instant) {
+fn serve_loop(handle: HANDLE, channels: PipeChannels, started: Instant) {
     let mut latest: Option<Arc<StatusSnapshot>> = None;
     loop {
+        // Keep the queue bounded while no client is connected: the newest
+        // snapshot wins, stale responses are dropped.
+        drain(&channels, &mut latest);
+
         // SAFETY: null OVERLAPPED = synchronous accept on our own handle.
         let ok = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
         // SAFETY: reads the thread's last-error value.
@@ -181,8 +266,8 @@ fn serve_loop(handle: HANDLE, snapshots: Receiver<Arc<StatusSnapshot>>, started:
         }
 
         // Serve this connection until the client disconnects, then accept
-        // the next one. Requests never reach the render loop (§2.2).
-        serve_connection(handle, &snapshots, &mut latest, started);
+        // the next one.
+        serve_connection(handle, &channels, &mut latest, started);
 
         // SAFETY: we own the connected instance; disconnect resets it for
         // the next accept.
@@ -192,7 +277,7 @@ fn serve_loop(handle: HANDLE, snapshots: Receiver<Arc<StatusSnapshot>>, started:
 
 fn serve_connection(
     handle: HANDLE,
-    snapshots: &Receiver<Arc<StatusSnapshot>>,
+    channels: &PipeChannels,
     latest: &mut Option<Arc<StatusSnapshot>>,
     started: Instant,
 ) {
@@ -220,7 +305,7 @@ fn serve_connection(
         while let Some(pos) = pending.iter().position(|&byte| byte == b'\n') {
             let line = String::from_utf8_lossy(&pending[..pos]).into_owned();
             pending.drain(..=pos);
-            if !dispatch_line(handle, &line, snapshots, latest, started) {
+            if !dispatch_line(handle, &line, channels, latest, started) {
                 return; // connection closed on a write failure
             }
         }
@@ -246,7 +331,7 @@ fn serve_connection(
 fn dispatch_line(
     handle: HANDLE,
     line: &str,
-    snapshots: &Receiver<Arc<StatusSnapshot>>,
+    channels: &PipeChannels,
     latest: &mut Option<Arc<StatusSnapshot>>,
     started: Instant,
 ) -> bool {
@@ -268,19 +353,13 @@ fn dispatch_line(
                 version: PROTOCOL_VERSION,
                 uptime_ms: started.elapsed().as_millis() as u64,
             })
-            .unwrap_or(no_data()),
+            .unwrap_or_else(|_| no_data()),
         ),
         "status" => {
             // Drain snapshot updates queued while we were idle or busy.
-            while let Ok(next) = snapshots.try_recv() {
-                *latest = Some(next);
-            }
-            let snapshot = match latest {
-                Some(snapshot) => Arc::clone(snapshot),
-                None => Arc::new(StatusSnapshot::boot()),
-            };
-            let status = build_status(&snapshot);
-            match serde_json::to_value(&status) {
+            drain(channels, latest);
+            let snapshot = snapshot_or_boot(latest);
+            match serde_json::to_value(build_status(&snapshot)) {
                 Ok(value) => Response::ok(request.id, value),
                 Err(err) => Response::err(
                     request.id,
@@ -289,20 +368,264 @@ fn dispatch_line(
                 ),
             }
         }
+        "settings.get" => {
+            drain(channels, latest);
+            let mut settings = snapshot_or_boot(latest).settings;
+            // Wire edge (design-m4 D10): the Run key, never the file.
+            settings.autostart = registry::autostart_state(&exe_path()).registered;
+            match serde_json::to_value(settings) {
+                Ok(value) => Response::ok(request.id, value),
+                Err(err) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::Internal,
+                    format!("could not build settings: {err}"),
+                ),
+            }
+        }
+        "autostart.get" => match serde_json::to_value(autostart_status()) {
+            Ok(value) => Response::ok(request.id, value),
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::Internal,
+                format!("could not build autostart status: {err}"),
+            ),
+        },
+        "autostart.set" => match serde_json::from_value::<EnabledData>(request.data.clone()) {
+            Ok(data) => {
+                // Registry work is cheap and the Run key is the oracle
+                // (design-m4 D10): handled right here, no main loop.
+                let result = if data.enabled {
+                    registry::autostart_enable(&exe_path())
+                } else {
+                    registry::autostart_disable()
+                };
+                match result {
+                    Ok(()) => match serde_json::to_value(autostart_status()) {
+                        Ok(value) => Response::ok(request.id, value),
+                        Err(err) => Response::err(
+                            request.id,
+                            ipc::ErrorCode::Internal,
+                            format!("could not build autostart status: {err}"),
+                        ),
+                    },
+                    Err(code) => Response::err(
+                        request.id,
+                        ipc::ErrorCode::Internal,
+                        format!("could not update the Run key (Win32 error {code}); check Settings > Apps > Startup"),
+                    ),
+                }
+            }
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::BadRequest,
+                format!("autostart.set needs {{\"enabled\":true}} or {{\"enabled\":false}}: {err}"),
+            ),
+        },
+        "playback.pause" => forward(
+            channels,
+            latest,
+            Command::Pause { id: request.id },
+        ),
+        "playback.resume" => forward(
+            channels,
+            latest,
+            Command::Resume { id: request.id },
+        ),
+        "wallpaper.set" => match serde_json::from_value::<SetData>(request.data.clone()) {
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::BadRequest,
+                format!("wallpaper.set needs a JSON object: {err}"),
+            ),
+            Ok(data) => match (&data.path, &data.id) {
+                (Some(_), Some(_)) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::BadRequest,
+                    "wallpaper.set takes either path or id, not both",
+                ),
+                (None, None) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::BadRequest,
+                    "wallpaper.set needs {\"path\":\"C:\\\\videos\\\\clip.mp4\"} (library ids arrive with the library, slice S3)",
+                ),
+                (None, Some(id)) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::NotFound,
+                    format!("no library item with id '{id}' — the library arrives in slice S3"),
+                ),
+                (Some(path), None) => forward(
+                    channels,
+                    latest,
+                    Command::SetWallpaper {
+                        id: request.id,
+                        path: path.clone(),
+                        monitor: data.monitor.clone(),
+                    },
+                ),
+            },
+        },
+        "wallpaper.clear" => {
+            match serde_json::from_value::<MonitorData>(request.data.clone()) {
+                Err(err) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::BadRequest,
+                    format!("wallpaper.clear needs a JSON object: {err}"),
+                ),
+                Ok(data) => forward(
+                    channels,
+                    latest,
+                    Command::ClearWallpaper {
+                        id: request.id,
+                        monitor: data.monitor,
+                    },
+                ),
+            }
+        }
+        "wallpaper.restore" => forward(channels, latest, Command::Restore { id: request.id }),
+        "settings.set" => {
+            match serde_json::from_value::<SettingsPatch>(request.data.clone()) {
+                Ok(patch) => forward(
+                    channels,
+                    latest,
+                    Command::SettingsSet {
+                        id: request.id,
+                        patch,
+                    },
+                ),
+                Err(err) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::BadRequest,
+                    format!("unreadable settings patch: {err}"),
+                ),
+            }
+        }
+        // `quit` needs the flush-ack handshake, which owns the connection
+        // lifetime — handled here instead of through `forward`.
+        "quit" => return quit_flow(handle, channels, latest, request.id),
         other => Response::err(
             request.id,
             ipc::ErrorCode::UnknownCommand,
-            format!("unknown command '{other}' (supported: ping, status)"),
+            format!(
+                "unknown command '{other}' (supported: ping, status, settings.get, settings.set, \
+                 autostart.get, autostart.set, playback.pause, playback.resume, wallpaper.set, \
+                 wallpaper.clear, wallpaper.restore, quit)"
+            ),
         ),
     };
     write_response(handle, &response)
 }
 
+/// Hand a mutating command to the main loop and wait for its response
+/// (design-m4 §2.2: 2 s cap, then `busy`). Returns the response to write.
+fn forward(
+    channels: &PipeChannels,
+    latest: &mut Option<Arc<StatusSnapshot>>,
+    command: Command,
+) -> Response {
+    let id = command.id();
+    match submit(channels, latest, command) {
+        Some(response) => response,
+        None => Response::err(
+            id,
+            ipc::ErrorCode::Busy,
+            "the engine did not accept the request within 2 s — retry in a moment",
+        ),
+    }
+}
+
+/// Send one command to the main loop and block until it answers. Snapshot
+/// messages that arrive while waiting update `latest`; responses to
+/// earlier submits that timed out are stale and dropped.
+fn submit(
+    channels: &PipeChannels,
+    latest: &mut Option<Arc<StatusSnapshot>>,
+    command: Command,
+) -> Option<Response> {
+    let id = command.id();
+    channels.commands.send(command).ok()?;
+    // Wake the main loop so it drains the channel now instead of on the
+    // next watchdog tick (design-m4 §2.2).
+    if let Some(hwnd) = control::find_existing() {
+        control::post(hwnd, WM_APP_PIPE);
+    }
+    let deadline = Instant::now() + SUBMIT_DEADLINE;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match channels.messages.recv_timeout(remaining) {
+            Ok(ServerMsg::Snapshot(snapshot)) => *latest = Some(snapshot),
+            Ok(ServerMsg::Response(response)) if response.id == id => return Some(response),
+            // A stale answer from an earlier submit: drop it.
+            Ok(ServerMsg::Response(_)) => {}
+            // The main loop side is gone (process exit): report busy.
+            Err(_) => return None,
+        }
+    }
+}
+
+/// `quit`: submit, write the response, then ack — the main loop starts the
+/// exit ladder only after the client has its answer, so the daemon can
+/// never tear the pipe down mid-write (design-m4 §2.3). A failed submit
+/// answers `busy` without the ack: the main loop never saw the command.
+fn quit_flow(
+    handle: HANDLE,
+    channels: &PipeChannels,
+    latest: &mut Option<Arc<StatusSnapshot>>,
+    id: u64,
+) -> bool {
+    let response = match submit(channels, latest, Command::Quit { id }) {
+        Some(response) => response,
+        None => Response::err(
+            id,
+            ipc::ErrorCode::Busy,
+            "the engine did not accept quit within 2 s — retry, or use `cascade stop`",
+        ),
+    };
+    let written = write_response(handle, &response);
+    if response.ok {
+        // The main loop waits for this before running the exit ladder.
+        let _ = channels.quit_flushed.send(());
+    }
+    written
+}
+
+/// Consume everything queued for this thread: snapshots update `latest`
+/// (newest wins), stale responses are dropped.
+fn drain(channels: &PipeChannels, latest: &mut Option<Arc<StatusSnapshot>>) {
+    while let Ok(message) = channels.messages.try_recv() {
+        match message {
+            ServerMsg::Snapshot(snapshot) => *latest = Some(snapshot),
+            ServerMsg::Response(_) => {}
+        }
+    }
+}
+
+fn snapshot_or_boot(latest: &Option<Arc<StatusSnapshot>>) -> Arc<StatusSnapshot> {
+    match latest {
+        Some(snapshot) => Arc::clone(snapshot),
+        None => Arc::new(StatusSnapshot::boot()),
+    }
+}
+
+fn exe_path() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::new())
+}
+
+/// The Run-key view of autostart (`ipc.md` §3): shared by `status`,
+/// `settings.get`, and `autostart.*` so all three always agree.
+fn autostart_status() -> AutostartStatus {
+    let state = registry::autostart_state(&exe_path());
+    AutostartStatus {
+        enabled: state.registered,
+        windows_disabled: state.windows_disabled,
+    }
+}
+
 /// Assemble `status`: snapshot (render-loop state) + counters this thread
 /// may read on its own (`ipc.md` §4: the daemon fills `memory` itself).
 fn build_status(snapshot: &StatusSnapshot) -> Status {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::new());
-    let autostart = registry::autostart_state(&exe);
     Status {
         engine: "running".to_string(),
         mode: snapshot.mode.clone(),
@@ -326,10 +649,7 @@ fn build_status(snapshot: &StatusSnapshot) -> Status {
             strategy: snapshot.host_strategy.clone(),
             repaint_level: snapshot.repaint_level,
         },
-        autostart: cascade_core::ipc::AutostartStatus {
-            enabled: autostart.registered,
-            windows_disabled: autostart.windows_disabled,
-        },
+        autostart: autostart_status(),
     }
 }
 
@@ -434,6 +754,18 @@ impl std::fmt::Display for ClientError {
     }
 }
 
+/// Request id: unique per request **and** per process. The pipe thread
+/// matches responses by id and drops stale ones, so two CLI invocations
+/// must never collide on the same number (design-m4 §2.2).
+fn next_request_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let slot = NEXT.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: `GetCurrentProcessId` needs no arguments.
+    let pid = unsafe { GetCurrentProcessId() } as u64;
+    // High 32 bits identify the process, low 32 the request inside it.
+    (pid << 32) | (slot & 0xFFFF_FFFF)
+}
+
 /// Send one command and return its `data` payload (`ipc.md` §7: bounded
 /// connect retries, one line each way).
 pub fn request(cmd: &str, data: serde_json::Value) -> Result<serde_json::Value, ClientError> {
@@ -442,7 +774,7 @@ pub fn request(cmd: &str, data: serde_json::Value) -> Result<serde_json::Value, 
 
     let envelope = ipc::Request {
         v: PROTOCOL_VERSION,
-        id: 1, // unique per connection; one request per connection here
+        id: next_request_id(),
         cmd: cmd.to_string(),
         data,
     };
@@ -458,6 +790,7 @@ pub fn request(cmd: &str, data: serde_json::Value) -> Result<serde_json::Value, 
 
     let result = read_response_line(handle).and_then(|response| match response.v {
         v if v != PROTOCOL_VERSION => Err(ClientError::VersionMismatch),
+        _ if response.id != envelope.id => Err(ClientError::Io(0)),
         _ if response.ok => Ok(response.data.unwrap_or_else(no_data)),
         _ => Err(match response.error {
             Some(err) => ClientError::Wire(err),
@@ -627,14 +960,87 @@ mod tests {
     #[test]
     fn snapshot_boot_mode_is_documented() {
         // Not calling enumerate() here (GDI in a unit test): only the mode
-        // string is asserted, which is the wire-visible part.
+        // string and the settings placeholder are asserted, which are the
+        // wire-visible parts.
         let snapshot = StatusSnapshot {
             mode: "boot".to_string(),
             paused_reasons: Vec::new(),
             monitors: Vec::new(),
             host_strategy: String::new(),
             repaint_level: 0,
+            settings: Settings::default(),
         };
         assert_eq!(snapshot.mode, "boot");
+        assert!(
+            !snapshot.settings.autostart,
+            "autostart is filled from the registry at the wire edge"
+        );
+    }
+
+    #[test]
+    fn command_ids_are_their_request_ids() {
+        // The pipe thread matches responses by id and drops stale ones.
+        assert_eq!(Command::Pause { id: 7 }.id(), 7);
+        assert_eq!(Command::Resume { id: 8 }.id(), 8);
+        assert_eq!(
+            Command::SetWallpaper {
+                id: 9,
+                path: "a.mp4".to_string(),
+                monitor: None
+            }
+            .id(),
+            9
+        );
+        assert_eq!(
+            Command::ClearWallpaper {
+                id: 10,
+                monitor: Some(r"\\.\DISPLAY1".to_string())
+            }
+            .id(),
+            10
+        );
+        assert_eq!(Command::Restore { id: 11 }.id(), 11);
+        assert_eq!(
+            Command::SettingsSet {
+                id: 12,
+                patch: SettingsPatch::default()
+            }
+            .id(),
+            12
+        );
+        assert_eq!(Command::Quit { id: 13 }.id(), 13);
+    }
+
+    #[test]
+    fn request_ids_are_unique_per_process() {
+        // Two CLI invocations in different processes must never collide:
+        // the high bits carry the pid.
+        let first = next_request_id();
+        let second = next_request_id();
+        assert_ne!(first, second, "ids must not repeat in one process");
+        assert_eq!(first >> 32, second >> 32, "both ids belong to this process");
+        assert_ne!(first >> 32, 0, "pid bits are populated");
+    }
+
+    #[test]
+    fn stale_responses_are_dropped_by_drain() {
+        // A response left behind by a submit that timed out must not be
+        // mistaken for anything later.
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel::<ServerMsg>();
+        let channels = PipeChannels {
+            messages: msg_rx,
+            commands: std::sync::mpsc::channel().0,
+            quit_flushed: std::sync::mpsc::channel().0,
+        };
+        msg_tx
+            .send(ServerMsg::Response(Response::ok(99, no_data())))
+            .expect("send");
+        let mut latest: Option<Arc<StatusSnapshot>> = None;
+        drain(&channels, &mut latest);
+        assert!(
+            latest.is_none(),
+            "a response alone must not be mistaken for a snapshot"
+        );
+        assert!(channels.messages.try_recv().is_err(), "channel is drained");
     }
 }

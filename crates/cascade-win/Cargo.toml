@@ -8,6 +8,8 @@ license.workspace = true
 cascade-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# config.toml persistence (design-m4 D10, architecture §10).
+toml = { workspace = true }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

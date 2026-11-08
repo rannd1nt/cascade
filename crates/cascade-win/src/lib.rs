@@ -1,5 +1,6 @@
 //! Public API for `cascade-win`.
 
+pub mod config;
 pub mod console;
 pub mod control;
 pub mod daemon;

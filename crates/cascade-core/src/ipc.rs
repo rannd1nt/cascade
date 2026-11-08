@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::rule_engine::{BatteryAction, PauseSettings, PowerProfile};
 use crate::PROTOCOL_VERSION;
 
 /// Hard cap per line in bytes (`ipc.md` §2: 1 MiB, larger → `too_large`).
@@ -204,6 +205,39 @@ pub struct Ping {
     pub uptime_ms: u64,
 }
 
+// --- Command data shapes (ipc.md §3) -----------------------------------------
+
+/// `autostart.get` / `autostart.set` request data. `autostart.get` ignores
+/// it; `autostart.set` requires it (`{"enabled":true}`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnabledData {
+    pub enabled: bool,
+}
+
+/// `wallpaper.set` request data: exactly one of `path` (play this file
+/// directly — S2) or `id` (library item — S3), plus an optional target
+/// monitor. The server rejects `path` + `id` together and a payload with
+/// neither (`bad_request`); an `id` alone answers `not_found` until the
+/// library lands (design-m4 S3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
+}
+
+/// `wallpaper.clear` request data: an optional monitor. The engine is
+/// single-surface in M4 (design-m2 §5), so the value is validated but the
+/// one surface is cleared regardless.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
+}
+
 // --- Status shape (ipc.md §4) ------------------------------------------------
 
 /// Per-monitor row of [`Status`]. Fields that only exist once the library
@@ -273,6 +307,149 @@ pub struct Status {
     pub memory: MemoryStatus,
     pub host: HostStatus,
     pub autostart: AutostartStatus,
+}
+
+// --- Settings shape (ipc.md §5) ---------------------------------------------
+
+/// Full `settings.get` / `settings.set` response payload (`ipc.md §5`).
+///
+/// `autostart` is reported here for wire completeness but is **not** file
+/// backed: the Run key is the single oracle (design-m4 D10) and the daemon
+/// fills this field from the registry at the wire edge. `settings.set` does
+/// not carry it — that is `autostart.set`'s job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// D8 default `off`: no profile, no power reads.
+    pub power_profile: PowerProfile,
+    pub pause: PauseSettings,
+    /// D8 default `off`: the power collector stays dark until opted in.
+    pub on_battery: BatteryAction,
+    /// Stored from S2; the exit ladder always restores the desktop anyway
+    /// (AGENTS §3.1 outranks the flag — no runtime consumer yet).
+    pub restore_wallpaper_on_exit: bool,
+    /// Stored from S2; consumed by the M5 tray.
+    pub tray: bool,
+    /// Filled from the Run key at the wire edge; never persisted to
+    /// `config.toml` (design-m4 D10).
+    pub autostart: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            power_profile: PowerProfile::Off,
+            pause: PauseSettings::default(),
+            on_battery: BatteryAction::Off,
+            restore_wallpaper_on_exit: true,
+            tray: true,
+            autostart: false,
+        }
+    }
+}
+
+/// Partial `[pause]` overrides inside a `settings.set` payload.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PausePatch {
+    pub fullscreen: Option<bool>,
+    pub maximized: Option<bool>,
+    pub display_off: Option<bool>,
+    pub session_lock: Option<bool>,
+    pub screensaver: Option<bool>,
+    pub remote_session: Option<bool>,
+}
+
+/// Partial `settings.set` payload (`ipc.md §3`): only the present keys
+/// change. Unknown keys are dropped by serde — the forward-compatibility
+/// rule — so the CLI validates keys strictly before sending
+/// (design-m4 §3: unknown flag → error, not ignored).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SettingsPatch {
+    pub power_profile: Option<PowerProfile>,
+    pub pause: Option<PausePatch>,
+    pub on_battery: Option<BatteryAction>,
+    pub restore_wallpaper_on_exit: Option<bool>,
+    pub tray: Option<bool>,
+}
+
+impl Settings {
+    /// The D9 **preset**: while `on_battery` is still the `off` default
+    /// ("not set"), a profile suggests its default action. Explicit user
+    /// values always win, so this never overwrites a non-`off` choice.
+    pub fn apply_profile_preset(&mut self) {
+        if self.on_battery != BatteryAction::Off {
+            return;
+        }
+        match self.power_profile {
+            PowerProfile::Battery => self.on_battery = BatteryAction::Pause,
+            PowerProfile::Quality => self.on_battery = BatteryAction::Continue,
+            PowerProfile::Off | PowerProfile::Balanced => {}
+        }
+    }
+
+    /// Apply a partial update, then let `power_profile` act as the D9
+    /// preset (design-m4 §2.6): it fills `on_battery` only while that value
+    /// is still `off` and this patch did not touch it.
+    pub fn apply_patch(&mut self, patch: SettingsPatch) {
+        if let Some(profile) = patch.power_profile {
+            self.power_profile = profile;
+        }
+        if let Some(pause) = patch.pause {
+            if let Some(value) = pause.fullscreen {
+                self.pause.fullscreen = value;
+            }
+            if let Some(value) = pause.maximized {
+                self.pause.maximized = value;
+            }
+            if let Some(value) = pause.display_off {
+                self.pause.display_off = value;
+            }
+            if let Some(value) = pause.session_lock {
+                self.pause.session_lock = value;
+            }
+            if let Some(value) = pause.screensaver {
+                self.pause.screensaver = value;
+            }
+            if let Some(value) = pause.remote_session {
+                self.pause.remote_session = value;
+            }
+        }
+        if let Some(action) = patch.on_battery {
+            self.on_battery = action;
+        }
+        if let Some(value) = patch.restore_wallpaper_on_exit {
+            self.restore_wallpaper_on_exit = value;
+        }
+        if let Some(value) = patch.tray {
+            self.tray = value;
+        }
+
+        // Preset fill (design-m4 §2.6): only when this patch changed the
+        // profile and did not touch `on_battery` itself.
+        if patch.power_profile.is_some() && patch.on_battery.is_none() {
+            self.apply_profile_preset();
+        }
+    }
+
+    /// A contradictory-but-allowed combination (design-m4 §2.6): the
+    /// precedence table already makes it deterministic, so `settings set`
+    /// applies the value and the caller prints this warning instead of
+    /// blocking. `None` means no conflict.
+    pub fn conflict_warning(&self) -> Option<String> {
+        match (self.on_battery, self.power_profile) {
+            (BatteryAction::Continue, PowerProfile::Battery) => Some(
+                "on_battery=continue contradicts power_profile=battery: on battery the video will keep playing"
+                    .to_string(),
+            ),
+            (BatteryAction::Pause | BatteryAction::Stop, PowerProfile::Quality) => Some(format!(
+                "on_battery={} contradicts power_profile=quality: quality promises no power pausing, but the video will still pause on battery",
+                self.on_battery.as_str()
+            )),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -432,5 +609,194 @@ mod tests {
     fn pipe_prefix_is_the_branded_global_namespace() {
         // Design-m4 §2.5: pipe names are machine-global → brand required.
         assert_eq!(PIPE_PREFIX, r"\\.\pipe\cascade-ctl-");
+    }
+
+    #[test]
+    fn settings_defaults_match_d8_and_the_documented_shape() {
+        let settings = Settings::default();
+        assert_eq!(settings.power_profile, PowerProfile::Off, "D8");
+        assert_eq!(settings.on_battery, BatteryAction::Off, "D8");
+        assert!(settings.restore_wallpaper_on_exit);
+        assert!(settings.tray);
+        assert!(
+            !settings.autostart,
+            "filled from the registry at the wire edge"
+        );
+        // ipc.md §5 documented pause defaults.
+        assert!(settings.pause.fullscreen);
+        assert!(!settings.pause.maximized);
+        assert!(settings.pause.session_lock);
+    }
+
+    #[test]
+    fn settings_serializes_with_the_documented_keys() {
+        let line = encode_line(&Settings::default()).expect("encode");
+        for key in [
+            r#""power_profile":"off""#,
+            r#""fullscreen":true"#,
+            r#""maximized":false"#,
+            r#""display_off":true"#,
+            r#""session_lock":true"#,
+            r#""screensaver":true"#,
+            r#""remote_session":true"#,
+            r#""on_battery":"off""#,
+            r#""restore_wallpaper_on_exit":true"#,
+            r#""tray":true"#,
+            r#""autostart":false"#,
+        ] {
+            assert!(line.contains(key), "missing {key} in {line}");
+        }
+        let back: Settings = serde_json::from_str(&line).expect("decode");
+        assert_eq!(back, Settings::default(), "Settings roundtrips");
+    }
+
+    #[test]
+    fn settings_patch_is_partial_and_ignores_unknown_keys() {
+        // Only present keys change; absent ones stay untouched.
+        let mut settings = Settings::default();
+        let patch: SettingsPatch =
+            serde_json::from_str(r#"{"pause":{"maximized":true},"tray":false}"#).expect("patch");
+        settings.apply_patch(patch);
+        assert!(settings.pause.maximized);
+        assert!(!settings.tray);
+        assert!(settings.pause.fullscreen, "untouched keys keep their value");
+        assert_eq!(settings.on_battery, BatteryAction::Off);
+
+        // Forward compatibility: unknown keys drop on the floor (ipc.md §2).
+        let patch: SettingsPatch =
+            serde_json::from_str(r#"{"future_knob":7,"restore_wallpaper_on_exit":false}"#)
+                .expect("patch");
+        settings.apply_patch(patch);
+        assert!(!settings.restore_wallpaper_on_exit);
+    }
+
+    #[test]
+    fn power_profile_preset_fills_unset_battery_action() {
+        // D9: the profile is a preset that only fills `on_battery` while it
+        // is still off.
+        let mut settings = Settings::default();
+        settings.apply_patch(SettingsPatch {
+            power_profile: Some(PowerProfile::Battery),
+            ..SettingsPatch::default()
+        });
+        assert_eq!(
+            settings.on_battery,
+            BatteryAction::Pause,
+            "preset filled it"
+        );
+
+        // An explicit value in the same patch beats the preset.
+        let mut settings = Settings::default();
+        settings.apply_patch(SettingsPatch {
+            power_profile: Some(PowerProfile::Battery),
+            on_battery: Some(BatteryAction::Continue),
+            ..SettingsPatch::default()
+        });
+        assert_eq!(settings.on_battery, BatteryAction::Continue);
+
+        // A value set earlier is never overwritten by a later preset.
+        let mut settings = Settings::default();
+        settings.apply_patch(SettingsPatch {
+            on_battery: Some(BatteryAction::Continue),
+            ..SettingsPatch::default()
+        });
+        settings.apply_patch(SettingsPatch {
+            power_profile: Some(PowerProfile::Battery),
+            ..SettingsPatch::default()
+        });
+        assert_eq!(
+            settings.on_battery,
+            BatteryAction::Continue,
+            "explicit wins"
+        );
+
+        // Quality suggests continue; balanced/off have no opinion.
+        let mut settings = Settings::default();
+        settings.apply_patch(SettingsPatch {
+            power_profile: Some(PowerProfile::Quality),
+            ..SettingsPatch::default()
+        });
+        assert_eq!(settings.on_battery, BatteryAction::Continue);
+        let mut settings = Settings::default();
+        settings.apply_patch(SettingsPatch {
+            power_profile: Some(PowerProfile::Balanced),
+            ..SettingsPatch::default()
+        });
+        assert_eq!(
+            settings.on_battery,
+            BatteryAction::Off,
+            "balanced has no opinion"
+        );
+    }
+
+    #[test]
+    fn command_data_shapes_decode_with_defaults() {
+        // `wallpaper.set` with a direct path (S2) — id/monitor optional.
+        let set: SetData =
+            serde_json::from_str(r#"{"path":"C:\\videos\\clip.mp4"}"#).expect("set data");
+        assert_eq!(set.path.as_deref(), Some(r"C:\videos\clip.mp4"));
+        assert!(set.id.is_none());
+        assert!(set.monitor.is_none());
+        // The combination rules are the server's job; decoding stays dumb.
+        let both: SetData =
+            serde_json::from_str(r#"{"path":"a.mp4","id":"ab12"}"#).expect("both fields");
+        assert!(both.path.is_some() && both.id.is_some());
+
+        // `wallpaper.clear` with no monitor clears everything.
+        let clear: MonitorData = serde_json::from_str("{}").expect("clear data");
+        assert!(clear.monitor.is_none());
+
+        // `autostart.set` requires its one field.
+        let enabled: EnabledData = serde_json::from_str(r#"{"enabled":true}"#).expect("enabled");
+        assert!(enabled.enabled);
+        assert!(serde_json::from_str::<EnabledData>("{}").is_err());
+
+        // Roundtrip with the skip rules: absent options stay absent.
+        let line = encode_line(&SetData {
+            path: Some("a.mp4".to_string()),
+            id: None,
+            monitor: Some(r"\\.\DISPLAY1".to_string()),
+        })
+        .expect("encode");
+        assert!(!line.contains("\"id\""), "absent option omitted: {line}");
+        let back: SetData = serde_json::from_str(&line).expect("decode");
+        assert_eq!(back.monitor.as_deref(), Some(r"\\.\DISPLAY1"));
+    }
+
+    #[test]
+    fn conflict_warning_flags_contradictory_combinations() {
+        // §2.6 C1/C2: warn, but the precedence table keeps it deterministic.
+        let mut settings = Settings::default();
+        settings.apply_patch(SettingsPatch {
+            power_profile: Some(PowerProfile::Battery),
+            on_battery: Some(BatteryAction::Continue),
+            ..SettingsPatch::default()
+        });
+        let warning = settings
+            .conflict_warning()
+            .expect("continue vs battery warns");
+        assert!(warning.contains("on_battery=continue"), "{warning}");
+
+        let mut settings = Settings::default();
+        settings.apply_patch(SettingsPatch {
+            power_profile: Some(PowerProfile::Quality),
+            on_battery: Some(BatteryAction::Pause),
+            ..SettingsPatch::default()
+        });
+        let warning = settings.conflict_warning().expect("pause vs quality warns");
+        assert!(warning.contains("power_profile=quality"), "{warning}");
+
+        // Consistent and default combinations stay quiet.
+        assert_eq!(Settings::default().conflict_warning(), None);
+        let mut settings = Settings::default();
+        settings.apply_patch(SettingsPatch {
+            power_profile: Some(PowerProfile::Battery),
+            ..SettingsPatch::default()
+        });
+        assert_eq!(
+            settings.conflict_warning(),
+            None,
+            "the preset produces a consistent pair"
+        );
     }
 }
