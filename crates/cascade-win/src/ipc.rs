@@ -21,8 +21,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cascade_core::ipc::{
-    self, encode_line, no_data, AutostartStatus, DecodeError, EnabledData, MonitorData, Ping,
-    Response, SetData, Settings, SettingsPatch, Status, MAX_LINE_BYTES, PIPE_PREFIX,
+    self, encode_line, no_data, AutostartStatus, DecodeError, EnabledData, LibraryAddData,
+    LibraryRemoveData, MonitorData, Ping, Response, SetData, Settings, SettingsPatch, Status,
+    MAX_LINE_BYTES, PIPE_PREFIX,
 };
 use cascade_core::PROTOCOL_VERSION;
 use windows_sys::Win32::Foundation::{
@@ -143,6 +144,31 @@ pub enum Command {
         id: u64,
         patch: SettingsPatch,
     },
+    /// `library.list` — answer with the current items (post-prune).
+    LibraryList {
+        id: u64,
+    },
+    /// `library.add` — canonicalise, probe, dedupe, persist (design-m4 §4).
+    LibraryAdd {
+        id: u64,
+        paths: Vec<String>,
+    },
+    /// `library.remove` — edit the list only (AGENTS §3.3).
+    LibraryRemove {
+        id: u64,
+        item_id: String,
+    },
+    /// `library.prune` — drop entries whose file is gone.
+    LibraryPrune {
+        id: u64,
+    },
+    /// `wallpaper.set` with a library id: resolve it to the stored path,
+    /// then run the same validated path flow as `SetWallpaper`.
+    SetWallpaperById {
+        id: u64,
+        item_id: String,
+        monitor: Option<String>,
+    },
     Quit {
         id: u64,
     },
@@ -158,6 +184,11 @@ impl Command {
             | Self::ClearWallpaper { id, .. }
             | Self::Restore { id }
             | Self::SettingsSet { id, .. }
+            | Self::LibraryList { id }
+            | Self::LibraryAdd { id, .. }
+            | Self::LibraryRemove { id, .. }
+            | Self::LibraryPrune { id }
+            | Self::SetWallpaperById { id, .. }
             | Self::Quit { id } => *id,
         }
     }
@@ -448,10 +479,14 @@ fn dispatch_line(
                     ipc::ErrorCode::BadRequest,
                     "wallpaper.set needs {\"path\":\"C:\\\\videos\\\\clip.mp4\"} (library ids arrive with the library, slice S3)",
                 ),
-                (None, Some(id)) => Response::err(
-                    request.id,
-                    ipc::ErrorCode::NotFound,
-                    format!("no library item with id '{id}' — the library arrives in slice S3"),
+                (None, Some(item_id)) => forward(
+                    channels,
+                    latest,
+                    Command::SetWallpaperById {
+                        id: request.id,
+                        item_id: item_id.clone(),
+                        monitor: data.monitor.clone(),
+                    },
                 ),
                 (Some(path), None) => forward(
                     channels,
@@ -482,6 +517,50 @@ fn dispatch_line(
             }
         }
         "wallpaper.restore" => forward(channels, latest, Command::Restore { id: request.id }),
+        "library.list" => forward(channels, latest, Command::LibraryList { id: request.id }),
+        "library.add" => match serde_json::from_value::<LibraryAddData>(request.data.clone()) {
+            Ok(data) if data.paths.is_empty() => Response::err(
+                request.id,
+                ipc::ErrorCode::BadRequest,
+                "library.add needs at least one path: {\"paths\":[\"C:\\\\videos\\\\clip.mp4\"]}",
+            ),
+            Ok(data) => forward(
+                channels,
+                latest,
+                Command::LibraryAdd {
+                    id: request.id,
+                    paths: data.paths,
+                },
+            ),
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::BadRequest,
+                format!("library.add needs {{\"paths\":[...]}}: {err}"),
+            ),
+        },
+        "library.remove" => {
+            match serde_json::from_value::<LibraryRemoveData>(request.data.clone()) {
+                Ok(data) if data.id.is_empty() => Response::err(
+                    request.id,
+                    ipc::ErrorCode::BadRequest,
+                    "library.remove needs {\"id\":\"a3f2\"}",
+                ),
+                Ok(data) => forward(
+                    channels,
+                    latest,
+                    Command::LibraryRemove {
+                        id: request.id,
+                        item_id: data.id,
+                    },
+                ),
+                Err(err) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::BadRequest,
+                    format!("library.remove needs {{\"id\":\"a3f2\"}}: {err}"),
+                ),
+            }
+        }
+        "library.prune" => forward(channels, latest, Command::LibraryPrune { id: request.id }),
         "settings.set" => {
             match serde_json::from_value::<SettingsPatch>(request.data.clone()) {
                 Ok(patch) => forward(
@@ -508,7 +587,8 @@ fn dispatch_line(
             format!(
                 "unknown command '{other}' (supported: ping, status, settings.get, settings.set, \
                  autostart.get, autostart.set, playback.pause, playback.resume, wallpaper.set, \
-                 wallpaper.clear, wallpaper.restore, quit)"
+                 wallpaper.clear, wallpaper.restore, library.list, library.add, library.remove, \
+                 library.prune, quit)"
             ),
         ),
     };

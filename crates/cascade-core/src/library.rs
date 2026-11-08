@@ -1,0 +1,351 @@
+//! Library model (design-m4 §4): a list of **paths only**.
+//!
+//! Nothing here reads, copies, moves, or modifies user media (AGENTS §3.3) —
+//! the model is pure data plus list algebra so every rule (dedupe, id
+//! stability, prune) is unit-testable without Win32 or a file system. The
+//! daemon owns persistence (`cascade-win/src/library.rs`) and probing
+//! (`cascade-media::probe`).
+
+use serde::{Deserialize, Serialize};
+
+/// One library entry (`architecture.md` §8, extended with the assessment
+/// fields from design-m4 §5.3). The file at `path` is referenced, never
+/// copied; metadata is a snapshot taken at `added_at` time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LibraryItem {
+    /// 4 hex characters, unique in the file, stable for this entry
+    /// (design-m4 §4) — re-adding the path keeps the id.
+    pub id: String,
+    /// Canonical path without the `\\?\` verbatim prefix.
+    pub path: String,
+    /// File stem, shown in the GUI grid and `library list`.
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_bps: Option<u64>,
+    /// Fourcc-style codec name (`H264`, `HEVC`, `AV1`, …).
+    pub codec: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// Unix seconds when the entry was first added.
+    pub added_at: u64,
+}
+
+/// Metadata a probe reads off one file (design-m4 §4 entry fields,
+/// without the identity the daemon assigns). Produced by
+/// `cascade_media::probe` and stored verbatim on [`LibraryItem`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VideoMetadata {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_bps: Option<u64>,
+    /// Fourcc-style codec name (`H264`, `HEVC`, `AV1`, …).
+    pub codec: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+}
+
+impl LibraryItem {
+    /// Assemble an entry from what the daemon knows: the id it generated,
+    /// the canonical path, the probe's metadata, and the clock.
+    pub fn new(id: String, path: String, meta: VideoMetadata, added_at: u64) -> Self {
+        let title = title_for(&path);
+        Self {
+            id,
+            path,
+            title,
+            width: meta.width,
+            height: meta.height,
+            fps: meta.fps,
+            duration_ms: meta.duration_ms,
+            bitrate_bps: meta.bitrate_bps,
+            codec: meta.codec,
+            profile: meta.profile,
+            level: meta.level,
+            added_at,
+        }
+    }
+}
+
+/// The library as a whole — the wire payload is `{"items":[...]}`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Library {
+    #[serde(default)]
+    pub items: Vec<LibraryItem>,
+}
+
+/// What one `library.add` did with a path: a brand-new entry, or a
+/// metadata refresh of the entry that already had this path.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AddOutcome {
+    Added(LibraryItem),
+    Updated(LibraryItem),
+}
+
+impl Library {
+    pub fn find(&self, id: &str) -> Option<&LibraryItem> {
+        self.items.iter().find(|item| item.id == id)
+    }
+
+    pub fn find_by_path(&self, path: &str) -> Option<&LibraryItem> {
+        let key = dedupe_key(path);
+        self.items.iter().find(|item| dedupe_key(&item.path) == key)
+    }
+
+    /// Insert a new entry, or refresh the existing one with the same
+    /// canonical path (design-m4 §4 dedupe): the id and `added_at` of the
+    /// existing entry survive, the metadata is replaced.
+    pub fn add(&mut self, item: LibraryItem) -> AddOutcome {
+        let key = dedupe_key(&item.path);
+        if let Some(existing) = self
+            .items
+            .iter_mut()
+            .find(|entry| dedupe_key(&entry.path) == key)
+        {
+            let mut updated = item;
+            updated.id = existing.id.clone();
+            updated.added_at = existing.added_at;
+            *existing = updated;
+            return AddOutcome::Updated(existing.clone());
+        }
+        self.items.push(item.clone());
+        AddOutcome::Added(item)
+    }
+
+    /// "Remove from library" — edits the list only (AGENTS §3.3).
+    pub fn remove(&mut self, id: &str) -> Option<LibraryItem> {
+        let index = self.items.iter().position(|item| item.id == id)?;
+        Some(self.items.remove(index))
+    }
+
+    /// Drop every entry whose path no longer exists (design-m4 §4).
+    /// Returns how many were removed. The `exists` closure keeps this
+    /// pure — tests pass a set, the daemon passes `Path::is_file`.
+    pub fn prune(&mut self, exists: impl Fn(&str) -> bool) -> usize {
+        let before = self.items.len();
+        self.items.retain(|item| exists(&item.path));
+        before - self.items.len()
+    }
+
+    /// A fresh 4-hex id not used by any current entry. `seed` makes the
+    /// sequence deterministic in tests; the daemon seeds it from the clock.
+    pub fn generate_id(&self, seed: u64) -> String {
+        let mut state = seed | 1; // never collapse to a fixed sequence
+        loop {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let candidate = format!("{:04x}", ((state >> 32) as u32) & 0xFFFF);
+            if self.find(&candidate).is_none() {
+                return candidate;
+            }
+        }
+    }
+}
+
+/// The dedupe/lookup key for a path: verbatim prefixes stripped, separators
+/// unified, lower-cased (Windows paths are case-insensitive). Pure so the
+/// dedupe rule is testable without touching the file system.
+pub fn dedupe_key(path: &str) -> String {
+    let stripped = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| path.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| path.to_string());
+    stripped.replace('/', "\\").to_lowercase()
+}
+
+/// Strip the `\\?\` prefix from a canonical path for storage and display.
+pub fn display_path(canonical: &str) -> String {
+    canonical
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| canonical.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| canonical.to_string())
+}
+
+/// Title for a path: the file stem (`Furina Midnight Maedow.mp4` →
+/// `Furina Midnight Maedow`). Falls back to the whole file name when the
+/// stem is empty (a file named `.hidden`).
+pub fn title_for(path: &str) -> String {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    std::path::Path::new(&name)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(path: &str, id: &str) -> LibraryItem {
+        LibraryItem {
+            id: id.to_string(),
+            path: path.to_string(),
+            title: title_for(path),
+            width: 1920,
+            height: 1080,
+            fps: Some(29.97),
+            duration_ms: Some(60_000),
+            bitrate_bps: Some(8_000_000),
+            codec: "H264".to_string(),
+            profile: Some("100".to_string()),
+            level: Some("41".to_string()),
+            added_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn add_appends_and_find_returns_it() {
+        let mut library = Library::default();
+        let outcome = library.add(item(r"C:\videos\a.mp4", "a1b2"));
+        assert!(matches!(outcome, AddOutcome::Added(_)));
+        assert_eq!(library.items.len(), 1);
+        assert_eq!(library.find("a1b2").unwrap().title, "a");
+        assert!(library.find("ffff").is_none());
+    }
+
+    #[test]
+    fn re_adding_the_same_path_updates_metadata_and_keeps_the_id() {
+        let mut library = Library::default();
+        library.add(item(r"C:\videos\a.mp4", "a1b2"));
+
+        // Same file, different case and separator: still the same entry.
+        let mut changed = item(r"c:/videos/A.MP4", "ffff");
+        changed.width = 3840;
+        changed.added_at = 1_800_000_000;
+        let outcome = library.add(changed);
+
+        assert!(matches!(outcome, AddOutcome::Updated(_)));
+        assert_eq!(library.items.len(), 1, "dedupe by canonical path");
+        let stored = library.find("a1b2").expect("the original id survives");
+        assert_eq!(stored.width, 3840, "metadata refreshed");
+        assert_eq!(stored.added_at, 1_700_000_000, "added_at is stable");
+    }
+
+    #[test]
+    fn remove_edits_the_list_only() {
+        let mut library = Library::default();
+        library.add(item(r"C:\videos\a.mp4", "a1b2"));
+        library.add(item(r"C:\videos\b.mp4", "c3d4"));
+
+        let removed = library.remove("a1b2").expect("removed");
+        assert_eq!(removed.path, r"C:\videos\a.mp4");
+        assert_eq!(library.items.len(), 1);
+        assert!(library.remove("a1b2").is_none(), "removing twice fails");
+        assert!(library.remove("nope").is_none());
+    }
+
+    #[test]
+    fn prune_drops_only_missing_paths_and_counts_them() {
+        let mut library = Library::default();
+        library.add(item(r"C:\videos\present.mp4", "aa11"));
+        library.add(item(r"C:\videos\gone.mp4", "bb22"));
+        library.add(item(r"C:\videos\also-gone.mp4", "cc33"));
+
+        let present = [r"C:\videos\present.mp4"];
+        let removed = library.prune(|path| present.contains(&path));
+        assert_eq!(removed, 2);
+        assert_eq!(library.items.len(), 1);
+        assert!(library.find("aa11").is_some());
+    }
+
+    #[test]
+    fn generate_id_is_four_hex_and_unique_within_the_file() {
+        let mut library = Library::default();
+        library.add(item(r"C:\videos\a.mp4", "0000"));
+        library.add(item(r"C:\videos\b.mp4", "0001"));
+
+        let first = library.generate_id(0xDEAD_BEEF);
+        assert_eq!(first.len(), 4);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(library.find(&first).is_none(), "never collides");
+
+        // Deterministic for a given seed, and a salted retry escapes a
+        // seed whose first candidate is already taken.
+        assert_eq!(library.generate_id(0xDEAD_BEEF), first);
+        assert_ne!(library.generate_id(0xDEAD_BEEF + 1), "zzzz");
+    }
+
+    #[test]
+    fn dedupe_key_strips_verbatim_prefixes_and_folds_case() {
+        assert_eq!(
+            dedupe_key(r"\\?\C:\Videos\Clip.MP4"),
+            dedupe_key(r"c:\videos\clip.mp4")
+        );
+        assert_eq!(
+            dedupe_key(r"\\?\UNC\server\share\a.mp4"),
+            dedupe_key(r"\\server\share\A.MP4")
+        );
+        assert_ne!(dedupe_key(r"C:\a.mp4"), dedupe_key(r"C:\b.mp4"));
+        assert_eq!(display_path(r"\\?\C:\Videos\a.mp4"), r"C:\Videos\a.mp4");
+        assert_eq!(display_path(r"\\?\UNC\s\sh\a.mp4"), r"\\s\sh\a.mp4");
+        assert_eq!(display_path(r"C:\a.mp4"), r"C:\a.mp4");
+    }
+
+    #[test]
+    fn title_for_uses_the_file_stem() {
+        assert_eq!(
+            title_for(r"C:\Videos\Furina Midnight Maedow.mp4"),
+            "Furina Midnight Maedow"
+        );
+        assert_eq!(title_for(r"C:\Videos\.hidden"), ".hidden");
+        assert_eq!(title_for("no-extension"), "no-extension");
+    }
+
+    #[test]
+    fn item_json_shape_is_the_documented_one() {
+        // ipc.md §3: the `items` array carries exactly these keys; a
+        // change here is a wire change.
+        let text = serde_json::to_string(&item(r"C:\videos\a.mp4", "a1b2")).expect("serialize");
+        for key in [
+            r#""id""#,
+            r#""path""#,
+            r#""title""#,
+            r#""width""#,
+            r#""height""#,
+            r#""fps""#,
+            r#""duration_ms""#,
+            r#""bitrate_bps""#,
+            r#""codec""#,
+            r#""profile""#,
+            r#""level""#,
+            r#""added_at""#,
+        ] {
+            assert!(text.contains(key), "missing {key} in {text}");
+        }
+        // A file without optional attributes decodes (serde defaults).
+        let minimal = r#"{"id":"aa11","path":"C:\\a.mp4","title":"a",
+            "width":1,"height":1,"codec":"H264","added_at":0}"#;
+        let decoded: LibraryItem =
+            serde_json::from_str(minimal).expect("optional fields are optional");
+        assert!(decoded.fps.is_none());
+        assert!(decoded.duration_ms.is_none());
+        // The whole library document round-trips.
+        let library = Library {
+            items: vec![decoded],
+        };
+        let back: Library =
+            serde_json::from_str(&serde_json::to_string(&library).expect("json")).expect("decode");
+        assert_eq!(back, library);
+    }
+}

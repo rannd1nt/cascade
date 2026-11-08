@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod dpi;
 pub mod host;
 pub mod ipc;
+pub mod library;
 pub mod monitor;
 pub mod present;
 pub mod registry;

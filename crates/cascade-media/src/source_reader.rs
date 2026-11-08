@@ -82,8 +82,9 @@ use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::VT_I8;
 
 // Stream index constants not exposed by windows 0.62 as named items.
-const MF_SOURCE_READER_ALL_STREAMS: u32 = 0xFFFFFFFF;
-const MF_SOURCE_READER_FIRST_VIDEO_STREAM: u32 = 0xFFFFFFFC;
+// `pub(crate)`: the library probe (`probe.rs`) opens its own reader.
+pub(crate) const MF_SOURCE_READER_ALL_STREAMS: u32 = 0xFFFFFFFF;
+pub(crate) const MF_SOURCE_READER_FIRST_VIDEO_STREAM: u32 = 0xFFFFFFFC;
 
 // Stream flags returned by ReadSample, not exposed as named items.
 const MF_SOURCE_READER_FLAG_END_OF_STREAM: u32 = 0x2;
@@ -2250,7 +2251,7 @@ unsafe fn convert_nv12_to_bgr8(
 }
 
 /// `Path` → `file:///` URL for `MFCreateSourceReaderFromURL`.
-fn file_url(path: &Path) -> String {
+pub(crate) fn file_url(path: &Path) -> String {
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut raw = absolute.to_string_lossy().replace('\\', "/");
     if let Some(rest) = raw.strip_prefix("//?/UNC/") {

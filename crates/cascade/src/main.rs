@@ -12,9 +12,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use cascade_core::ipc::{
-    no_data, AutostartStatus, EnabledData, MonitorData, PausePatch, SetData, Settings,
+    no_data, AutostartStatus, EnabledData, LibraryAddData, LibraryAddResult, LibraryItemsData,
+    LibraryPruneResult, LibraryRemoveData, MonitorData, PausePatch, SetData, Settings,
     SettingsPatch,
 };
+use cascade_core::library::{dedupe_key, LibraryItem};
 use cascade_core::rule_engine::{BatteryAction, PowerProfile};
 use cascade_core::MediaBackend;
 use cascade_media::{MediaEngineBackend, SourceReaderBackend};
@@ -60,6 +62,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Some("clear") => cmd_clear(&args[1..]),
         Some("quit") => cmd_quit(&args[1..]),
         Some("settings") => cmd_settings(&args[1..]),
+        Some("library") => cmd_library(&args[1..]),
         Some("autostart") => cmd_autostart(&args[1..]),
         Some("version") | Some("--version") | Some("-V") => {
             println!("cascade {VERSION}");
@@ -98,7 +101,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     // daemon builds later backends (a first `wallpaper.set` on a videoless
     // start) through this factory instead.
     let factory: daemon::BackendFactory = Box::new(|path: &Path| build_backend(Some(path)));
-    match daemon::run(options, backend, factory) {
+    // The library probe travels the same way (design-m4 §4): win may not
+    // depend on media, so the binary injects it.
+    let probe: daemon::ProbeFn = Box::new(cascade_media::probe);
+    match daemon::run(options, backend, factory, probe) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(err) => {
             // Best effort: a console close may already have invalidated the
@@ -417,12 +423,15 @@ fn cmd_playback(paused: bool, args: &[String]) -> Result<ExitCode, String> {
 /// checked before any playback surgery).
 #[derive(Debug)]
 struct SetOptions {
-    path: PathBuf,
+    /// Exactly one of `path` / `id` reaches the wire (`ipc.md` §3).
+    path: Option<PathBuf>,
+    id: Option<String>,
     monitor: Option<String>,
 }
 
 fn parse_set_options(args: &[String]) -> Result<SetOptions, String> {
     let mut file: Option<PathBuf> = None;
+    let mut item_id: Option<String> = None;
     let mut monitor: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
@@ -435,6 +444,19 @@ fn parse_set_options(args: &[String]) -> Result<SetOptions, String> {
                     "--monitor needs a monitor id like \\\\.\\DISPLAY1".to_string()
                 })?;
                 monitor = Some(value.clone());
+                index += 2;
+            }
+            "--id" => {
+                if item_id.is_some() {
+                    return Err("--id given twice".to_string());
+                }
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--id needs a library id like a3f2".to_string())?;
+                if !is_item_id(value) {
+                    return Err(format!("'{value}' is not a library id (4 hex characters)"));
+                }
+                item_id = Some(value.clone());
                 index += 2;
             }
             other if other.starts_with("--") => {
@@ -451,28 +473,50 @@ fn parse_set_options(args: &[String]) -> Result<SetOptions, String> {
             }
         }
     }
-    let path = file.ok_or_else(|| {
-        "set needs a path to a video file: `cascade set <path> [--monitor <id>]`".to_string()
-    })?;
-    Ok(SetOptions { path, monitor })
+    match (file, item_id) {
+        (None, None) => Err(
+            "set needs a path or a library id: `cascade set <path> [--id <a3f2>] [--monitor <id>]`"
+                .to_string(),
+        ),
+        (Some(_), Some(_)) => {
+            Err("set takes exactly one of a path or --id (a library item), not both".to_string())
+        }
+        (path, id) => Ok(SetOptions { path, id, monitor }),
+    }
 }
 
-/// `cascade set <path> [--monitor <id>]` — play a file directly (design-m4
-/// S2; library ids arrive with slice S3). The path is made absolute here:
-/// the daemon's working directory is not the CLI's.
+/// `cascade set <path> | --id <a3f2> [--monitor <id>]` — play a file
+/// directly or a library item (design-m4 S2 path, S3 id). The path is made
+/// absolute here: the daemon's working directory is not the CLI's.
 fn cmd_set(args: &[String]) -> Result<ExitCode, String> {
     let options = parse_set_options(args)?;
-    let path = std::path::absolute(&options.path)
-        .map_err(|err| format!("cannot resolve {}: {err}", options.path.display()))?;
-    let data = SetData {
-        path: Some(path.display().to_string()),
-        id: None,
-        monitor: options.monitor,
+    // Exactly one of path / id goes out (`ipc.md` §3).
+    let (data, label) = if let Some(item_id) = options.id {
+        (
+            SetData {
+                path: None,
+                id: Some(item_id.clone()),
+                monitor: options.monitor,
+            },
+            format!("playing library item {item_id}"),
+        )
+    } else {
+        let path = options.path.expect("parser guarantees one of the two");
+        let absolute = std::path::absolute(&path)
+            .map_err(|err| format!("cannot resolve {}: {err}", path.display()))?;
+        (
+            SetData {
+                path: Some(absolute.display().to_string()),
+                id: None,
+                monitor: options.monitor,
+            },
+            format!("playing: {}", absolute.display()),
+        )
     };
     let payload =
         serde_json::to_value(data).map_err(|err| format!("could not build request: {err}"))?;
     ipc::request("wallpaper.set", payload).map_err(|err| err.to_string())?;
-    println!("playing: {}", path.display());
+    println!("{label}");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -695,6 +739,170 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     }
 }
 
+// --- Library commands (M4 S3, ipc.md §3 / design-m4 §4) ---------------------
+
+/// `cascade library list|add|remove|prune` — every subcommand needs a
+/// daemon (single writer: the main loop, `ipc.md` §3).
+fn cmd_library(args: &[String]) -> Result<ExitCode, String> {
+    match args.first().map(String::as_str) {
+        Some("list") => library_list(&args[1..]),
+        Some("add") => library_add(&args[1..]),
+        Some("remove") => library_remove(&args[1..]),
+        Some("prune") => library_prune(&args[1..]),
+        Some(other) => Err(format!(
+            "library expects list|add|remove|prune, got {other}"
+        )),
+        None => Err("library expects list|add|remove|prune — see `cascade help`".to_string()),
+    }
+}
+
+fn library_list(args: &[String]) -> Result<ExitCode, String> {
+    if !args.is_empty() {
+        return Err("list takes no arguments".to_string());
+    }
+    let data = ipc::request("library.list", no_data()).map_err(|err| err.to_string())?;
+    let items: LibraryItemsData = serde_json::from_value(data)
+        .map_err(|err| format!("engine sent an unreadable library: {err}"))?;
+    if items.items.is_empty() {
+        println!("library is empty — add files with `cascade library add <path>`");
+        return Ok(ExitCode::SUCCESS);
+    }
+    for item in &items.items {
+        println!(
+            "{}  {}  {}x{}  {}  {}  {}  {}",
+            item.id,
+            item.title,
+            item.width,
+            item.height,
+            item.fps
+                .map(|fps| format!("{fps:.2} fps"))
+                .unwrap_or_else(|| "-".to_string()),
+            item.duration_ms
+                .map(format_duration)
+                .unwrap_or_else(|| "-".to_string()),
+            item.codec,
+            item.path
+        );
+    }
+    println!("{} item(s)", items.items.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cascade library add <path>...` — reference, never copy (AGENTS §3.3).
+/// Paths are absolutised here: the daemon's cwd is not the CLI's.
+fn library_add(args: &[String]) -> Result<ExitCode, String> {
+    if args.is_empty() {
+        return Err(
+            "add needs at least one video file: `cascade library add <path>...`".to_string(),
+        );
+    }
+    let mut paths = Vec::with_capacity(args.len());
+    for arg in args {
+        let absolute =
+            std::path::absolute(arg).map_err(|err| format!("cannot resolve {arg}: {err}"))?;
+        paths.push(absolute.display().to_string());
+    }
+    let payload = serde_json::to_value(LibraryAddData { paths })
+        .map_err(|err| format!("could not build request: {err}"))?;
+    let data = ipc::request("library.add", payload).map_err(|err| err.to_string())?;
+    let result: LibraryAddResult = serde_json::from_value(data)
+        .map_err(|err| format!("engine sent an unreadable add result: {err}"))?;
+    for item in &result.added {
+        println!("added: {} ({})", item.title, item.path);
+    }
+    if !result.rejected.is_empty() {
+        let details = result
+            .rejected
+            .iter()
+            .map(|entry| format!("  {} — {}", entry.path, entry.reason))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!(
+            "{} added, {} rejected:\n{details}",
+            result.added.len(),
+            result.rejected.len()
+        ));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cascade library remove <id|path>` — edits the list only; the file on
+/// disk is never touched (AGENTS §3.3).
+fn library_remove(args: &[String]) -> Result<ExitCode, String> {
+    if args.len() != 1 {
+        return Err("remove needs one id or path: `cascade library remove <id|path>`".to_string());
+    }
+    let token = args[0].as_str();
+    // The list doubles as the path→id index and the confirmation source.
+    let data = ipc::request("library.list", no_data()).map_err(|err| err.to_string())?;
+    let items: LibraryItemsData = serde_json::from_value(data)
+        .map_err(|err| format!("engine sent an unreadable library: {err}"))?;
+    let item = if is_item_id(token) {
+        items
+            .items
+            .iter()
+            .find(|item| item.id.eq_ignore_ascii_case(token))
+    } else {
+        let absolute =
+            std::path::absolute(token).map_err(|err| format!("cannot resolve {token}: {err}"))?;
+        find_item_by_path(&items.items, &absolute.display().to_string())
+    }
+    .ok_or_else(|| format!("no library item matches '{token}' — run `cascade library list`"))?;
+    let payload = serde_json::to_value(LibraryRemoveData {
+        id: item.id.clone(),
+    })
+    .map_err(|err| format!("could not build request: {err}"))?;
+    ipc::request("library.remove", payload).map_err(|err| err.to_string())?;
+    println!(
+        "removed: {} ({}) — the file itself is untouched",
+        item.title, item.path
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cascade library prune` — same drop rule as the start-time prune.
+fn library_prune(args: &[String]) -> Result<ExitCode, String> {
+    if !args.is_empty() {
+        return Err("prune takes no arguments".to_string());
+    }
+    let data = ipc::request("library.prune", no_data()).map_err(|err| err.to_string())?;
+    let result: LibraryPruneResult = serde_json::from_value(data)
+        .map_err(|err| format!("engine sent an unreadable prune result: {err}"))?;
+    if result.removed == 0 {
+        println!("nothing to prune — every library file exists");
+    } else {
+        println!(
+            "pruned {} entr{} whose files no longer exist",
+            result.removed,
+            if result.removed == 1 { "y" } else { "ies" }
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A library id: exactly 4 hex characters (design-m4 §4).
+fn is_item_id(token: &str) -> bool {
+    token.len() == 4 && token.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Resolve a path argument against a fetched list with the same
+/// case/separator rule the daemon dedupes with.
+fn find_item_by_path<'a>(items: &'a [LibraryItem], path: &str) -> Option<&'a LibraryItem> {
+    let key = dedupe_key(path);
+    items.iter().find(|item| dedupe_key(&item.path) == key)
+}
+
+/// `125_000` → `2:05`; over an hour → `1:02:03`.
+fn format_duration(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (hours, minutes, seconds) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 fn print_help() {
     println!("cascade {VERSION}");
     println!();
@@ -705,7 +913,7 @@ fn print_help() {
     println!("  cascade stop | restore | quit");
     println!("  cascade status [--json]");
     println!("  cascade pause | resume");
-    println!("  cascade set <path> [--monitor <id>]   play a file (library ids: M4 S3)");
+    println!("  cascade set <path> | --id <a3f2> [--monitor <id>]  play a file or library item");
     println!("  cascade clear [--monitor <id>]        back to the colour background");
     println!("  cascade settings get [--json]");
     println!("  cascade settings set <key> <value>    keys: power_profile, on_battery,");
@@ -713,6 +921,10 @@ fn print_help() {
     println!("                                        pause.display_off, pause.session_lock,");
     println!("                                        pause.screensaver, pause.remote_session,");
     println!("                                        restore_wallpaper_on_exit, tray, autostart");
+    println!("  cascade library list");
+    println!("  cascade library add <path>...         files are referenced, never copied");
+    println!("  cascade library remove <id|path>      remove from library (file untouched)");
+    println!("  cascade library prune                 drop entries whose files are gone");
     println!("  cascade autostart on|off|status");
     println!("  cascade ui");
     println!();
@@ -809,13 +1021,28 @@ mod tests {
             r"\\.\DISPLAY1",
         ]))
         .expect("file and monitor");
-        assert_eq!(options.path, Path::new(r"C:\videos\my clip.mp4"));
+        assert_eq!(
+            options.path.as_deref(),
+            Some(Path::new(r"C:\videos\my clip.mp4"))
+        );
+        assert!(options.id.is_none());
         assert_eq!(options.monitor.as_deref(), Some(r"\\.\DISPLAY1"));
 
         // The monitor is optional; the file never is.
         let options = parse_set_options(&args(&["clip.mp4"])).expect("file only");
-        assert_eq!(options.path, Path::new("clip.mp4"));
+        assert_eq!(options.path.as_deref(), Some(Path::new("clip.mp4")));
         assert!(options.monitor.is_none());
+
+        // A library id replaces the file (S3).
+        let options = parse_set_options(&args(&["--id", "a3f2"])).expect("id only");
+        assert!(options.path.is_none());
+        assert_eq!(options.id.as_deref(), Some("a3f2"));
+        let err = parse_set_options(&args(&["--id", "zzzz"])).expect_err("hex only");
+        assert!(err.contains("not a library id"), "unexpected: {err}");
+        // Exactly one of path / id — never both, never neither.
+        assert!(parse_set_options(&args(&["a.mp4", "--id", "a3f2"])).is_err());
+        assert!(parse_set_options(&args(&["--id"])).is_err());
+        assert!(parse_set_options(&args(&["--id", "a3f2", "--id", "b1c1"])).is_err());
     }
 
     #[test]
@@ -895,5 +1122,61 @@ mod tests {
         assert!(!parse_bool("False").expect("mixed"));
         assert!(parse_bool("1").is_err());
         assert!(parse_bool("on").is_err());
+    }
+
+    #[test]
+    fn library_subcommands_are_validated() {
+        // No/unknown subcommand fails before any pipe request is made.
+        let err = cmd_library(&[]).expect_err("needs a subcommand");
+        assert!(err.contains("list|add|remove|prune"), "unexpected: {err}");
+        let err = cmd_library(&args(&["frobnicate"])).expect_err("unknown");
+        assert!(err.contains("frobnicate"), "unexpected: {err}");
+        // Argument arity is checked before touching the daemon too.
+        assert!(cmd_library(&args(&["list", "extra"])).is_err());
+        assert!(cmd_library(&args(&["prune", "extra"])).is_err());
+        assert!(cmd_library(&args(&["remove"])).is_err());
+        assert!(cmd_library(&args(&["remove", "a", "b"])).is_err());
+        assert!(cmd_library(&args(&["add"])).is_err());
+    }
+
+    #[test]
+    fn item_ids_are_exactly_four_hex_characters() {
+        assert!(is_item_id("a3f2"));
+        assert!(is_item_id("00ff"));
+        assert!(is_item_id("A3F2"), "case-insensitive on the wire");
+        assert!(!is_item_id("a3f"), "three chars");
+        assert!(!is_item_id("a3f22"), "five chars");
+        assert!(!is_item_id("zzzz"), "hex only");
+        assert!(!is_item_id(""), "never empty");
+    }
+
+    #[test]
+    fn duration_formats_readably() {
+        assert_eq!(format_duration(0), "0:00");
+        assert_eq!(format_duration(5_000), "0:05");
+        assert_eq!(format_duration(125_000), "2:05");
+        assert_eq!(format_duration(3_723_000), "1:02:03");
+    }
+
+    #[test]
+    fn find_item_by_path_uses_the_daemon_dedupe_rule() {
+        let items = vec![LibraryItem::new(
+            "a1b2".to_string(),
+            r"C:\Videos\Clip.MP4".to_string(),
+            cascade_core::library::VideoMetadata {
+                width: 1,
+                height: 1,
+                fps: None,
+                duration_ms: None,
+                bitrate_bps: None,
+                codec: "H264".to_string(),
+                profile: None,
+                level: None,
+            },
+            0,
+        )];
+        let found = find_item_by_path(&items, r"c:\videos\clip.mp4").expect("case-insensitive");
+        assert_eq!(found.id, "a1b2");
+        assert!(find_item_by_path(&items, r"C:\Videos\other.mp4").is_none());
     }
 }

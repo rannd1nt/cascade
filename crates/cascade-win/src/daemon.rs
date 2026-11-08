@@ -14,7 +14,11 @@ use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use cascade_core::ipc::{no_data, Response, Settings};
+use cascade_core::ipc::{
+    no_data, LibraryAddResult, LibraryItemsData, LibraryPruneResult, RejectedPath, Response,
+    Settings,
+};
+use cascade_core::library::{Library, LibraryItem, VideoMetadata};
 use cascade_core::rule_engine::{RuleEngine, SessionState};
 use cascade_core::{BackendResult, HostSurface, MediaBackend, MonitorId, PlaybackOptions};
 use windows_sys::core::BOOL;
@@ -33,6 +37,7 @@ use crate::config;
 use crate::control::{self, ControlWindow};
 use crate::host::{self, Host, HostOptions};
 use crate::ipc::{Command, PipeChannels, PipeServer, ServerMsg, StatusSnapshot, QUIT_FLUSH_WAIT};
+use crate::library::LibraryStore;
 use crate::monitor::{self, MonitorInfo};
 use crate::registry;
 use crate::repaint;
@@ -84,6 +89,10 @@ struct Flags {
 /// factory in. The path lets the binary choose per source later; `None`
 /// means no backend is available and the desktop keeps its colour.
 pub type BackendFactory = Box<dyn Fn(&Path) -> Option<Box<dyn MediaBackend>> + Send>;
+/// Metadata probe injected by the binary (design-m4 §4), the same way the
+/// backend factory is: `cascade-win` may not depend on `cascade-media`
+/// (AGENTS §4), and the library entry type lives in `cascade-core`.
+pub type ProbeFn = Box<dyn Fn(&Path) -> Result<VideoMetadata, String> + Send>;
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -526,6 +535,11 @@ struct Loop<'a> {
     state: &'a mut DaemonState,
     store: &'a Store,
     factory: &'a BackendFactory,
+    /// In-memory library (design-m4 §4): the main loop is its single
+    /// writer, so the pipe thread never sees it.
+    library: &'a mut Library,
+    lib_store: &'a LibraryStore,
+    probe: &'a ProbeFn,
 }
 
 /// Result of one drain: responses to write after the snapshot refresh,
@@ -599,7 +613,149 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
             pending.responses.push(Response::ok(id, no_data()));
             pending.quit = true;
         }
+        Command::LibraryList { id } => {
+            let data = LibraryItemsData {
+                items: ctx.library.items.clone(),
+            };
+            match serde_json::to_value(data) {
+                Ok(value) => pending.responses.push(Response::ok(id, value)),
+                Err(err) => pending.responses.push(Response::err(
+                    id,
+                    cascade_core::ipc::ErrorCode::Internal,
+                    format!("could not build the library list: {err}"),
+                )),
+            }
+        }
+        Command::LibraryAdd { id, paths } => {
+            let result = library_add(ctx, paths);
+            persist_library(ctx);
+            match serde_json::to_value(result) {
+                Ok(value) => pending.responses.push(Response::ok(id, value)),
+                Err(err) => pending.responses.push(Response::err(
+                    id,
+                    cascade_core::ipc::ErrorCode::Internal,
+                    format!("could not build the add result: {err}"),
+                )),
+            }
+        }
+        Command::LibraryRemove { id, item_id } => match ctx.library.remove(&item_id) {
+            Some(_) => {
+                persist_library(ctx);
+                pending.responses.push(Response::ok(id, no_data()));
+            }
+            None => pending.responses.push(Response::err(
+                id,
+                cascade_core::ipc::ErrorCode::NotFound,
+                format!("no library item with id '{item_id}' — run `cascade library list`"),
+            )),
+        },
+        Command::LibraryPrune { id } => {
+            let removed = ctx.library.prune(|path| Path::new(path).is_file());
+            if removed > 0 {
+                dlog!("library: pruned {removed} entries with missing files");
+                persist_library(ctx);
+            }
+            match serde_json::to_value(LibraryPruneResult {
+                removed: removed as u32,
+            }) {
+                Ok(value) => pending.responses.push(Response::ok(id, value)),
+                Err(err) => pending.responses.push(Response::err(
+                    id,
+                    cascade_core::ipc::ErrorCode::Internal,
+                    format!("could not build the prune result: {err}"),
+                )),
+            }
+        }
+        Command::SetWallpaperById {
+            id,
+            item_id,
+            monitor,
+        } => {
+            // Resolve first, then reuse the validated path flow — the
+            // monitor/file checks in `set_wallpaper` still run.
+            match ctx.library.find(&item_id).map(|item| item.path.clone()) {
+                Some(path) => set_wallpaper(ctx, id, path, monitor, pending),
+                None => pending.responses.push(Response::err(
+                    id,
+                    cascade_core::ipc::ErrorCode::NotFound,
+                    format!("no library item with id '{item_id}' — run `cascade library list`"),
+                )),
+            }
+        }
     }
+}
+
+/// `library.add` (design-m4 §4): canonicalise each path, check it is a
+/// file, probe its metadata, dedupe by canonical path. Rejections are
+/// per-path — one bad file never fails the batch, and nothing is ever
+/// copied or modified (AGENTS §3.3).
+fn library_add(ctx: &mut Loop, paths: Vec<String>) -> LibraryAddResult {
+    let mut result = LibraryAddResult {
+        added: Vec::new(),
+        rejected: Vec::new(),
+    };
+    let seed = clock_seed();
+    for (index, raw) in paths.into_iter().enumerate() {
+        // Canonicalise for storage and dedupe; a failure here almost
+        // always means the file does not exist (or is unreachable).
+        let canonical = match std::fs::canonicalize(&raw) {
+            Ok(path) => path,
+            Err(err) => {
+                result.rejected.push(RejectedPath {
+                    path: raw,
+                    reason: format!("file not found: {err}"),
+                });
+                continue;
+            }
+        };
+        if !canonical.is_file() {
+            result.rejected.push(RejectedPath {
+                path: raw,
+                reason: "not a file".to_string(),
+            });
+            continue;
+        }
+        let display = cascade_core::library::display_path(&canonical.to_string_lossy());
+        let meta = match (ctx.probe)(Path::new(&canonical)) {
+            Ok(meta) => meta,
+            Err(reason) => {
+                result.rejected.push(RejectedPath {
+                    path: display,
+                    reason,
+                });
+                continue;
+            }
+        };
+        let id = ctx.library.generate_id(seed.wrapping_add(index as u64));
+        let item = LibraryItem::new(id, display, meta, clock_seed());
+        // `Added` and `Updated` (a re-add refreshes metadata) both land in
+        // `added` — the existing entry is what the caller gets back.
+        let item = match ctx.library.add(item) {
+            cascade_core::library::AddOutcome::Added(item)
+            | cascade_core::library::AddOutcome::Updated(item) => item,
+        };
+        result.added.push(item);
+    }
+    result
+}
+
+/// Persist after any successful mutation; a read-only profile dir costs
+/// durability, never the running daemon (same rule as `config::save`).
+fn persist_library(ctx: &Loop) {
+    if let Err(err) = ctx.lib_store.save(ctx.library) {
+        derr!("library: {err}");
+    }
+}
+
+/// Seed for id generation and `added_at`: wall-clock nanoseconds folded
+/// with the process id so two daemons (in different sessions) do not
+/// march in lockstep.
+fn clock_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ (u64::from(std::process::id()) << 32)
 }
 
 /// `wallpaper.set` (design-m4 S2). Order matters: validate the monitor,
@@ -759,6 +915,7 @@ pub fn run(
     opts: DaemonOptions,
     backend: Option<Box<dyn MediaBackend>>,
     factory: BackendFactory,
+    probe: ProbeFn,
 ) -> Result<(), DaemonError> {
     // Declared first, therefore dropped last on every exit path (`Ok`, an
     // early `Err`, and panic unwinding): only then is `EXIT_DONE` signalled,
@@ -795,6 +952,24 @@ pub fn run(
 
     let store = Store::open();
     let previous = store.load();
+    // The library (design-m4 §4): loaded once, pruned on start so a file
+    // deleted while the daemon was down disappears from the list.
+    let lib_store = LibraryStore::open();
+    let mut library = lib_store.load();
+    let pruned = library.prune(|path| Path::new(path).is_file());
+    if pruned > 0 {
+        dlog!("library: pruned {pruned} entries with missing files at start");
+        if let Err(err) = lib_store.save(&library) {
+            derr!("library: {err}");
+        }
+    }
+    if let Some(path) = lib_store.path() {
+        dlog!(
+            "  library: {} items, {}",
+            library.items.len(),
+            path.display()
+        );
+    }
     // Persisted settings (design-m4 D10): a missing or corrupt
     // `config.toml` decodes to the documented defaults and never blocks.
     let mut settings = config::load();
@@ -966,6 +1141,9 @@ pub fn run(
                 state: &mut state,
                 store: &store,
                 factory: &factory,
+                library: &mut library,
+                lib_store: &lib_store,
+                probe: &probe,
             };
             let mut pending = Pending::default();
             while let Ok(command) = cmd_rx.try_recv() {

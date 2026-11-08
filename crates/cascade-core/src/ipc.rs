@@ -238,6 +238,51 @@ pub struct MonitorData {
     pub monitor: Option<String>,
 }
 
+// --- Library shapes (ipc.md §3, design-m4 §4) --------------------------------
+
+/// `library.add` request data: one or more file paths. The server
+/// canonicalises, checks existence, probes metadata, and dedupes — the
+/// client never sends metadata (single writer: the daemon main loop).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryAddData {
+    pub paths: Vec<String>,
+}
+
+/// `library.remove` request data: the 4-hex entry id (`ipc.md` §3). The
+/// CLI resolves a path argument to an id via `library.list` first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryRemoveData {
+    pub id: String,
+}
+
+/// `library.list` response: the full list, after any start-time prune.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LibraryItemsData {
+    pub items: Vec<crate::library::LibraryItem>,
+}
+
+/// A path `library.add` refused, with a reason the user can act on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedPath {
+    pub path: String,
+    pub reason: String,
+}
+
+/// `library.add` response: what got in and what did not (a rejected path
+/// never leaves the desktop or the file system touched — nothing is copied).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LibraryAddResult {
+    pub added: Vec<crate::library::LibraryItem>,
+    pub rejected: Vec<RejectedPath>,
+}
+
+/// `library.prune` response: how many entries were dropped because their
+/// file no longer exists (design-m4 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryPruneResult {
+    pub removed: u32,
+}
+
 // --- Status shape (ipc.md §4) ------------------------------------------------
 
 /// Per-monitor row of [`Status`]. Fields that only exist once the library
@@ -761,6 +806,41 @@ mod tests {
         assert!(!line.contains("\"id\""), "absent option omitted: {line}");
         let back: SetData = serde_json::from_str(&line).expect("decode");
         assert_eq!(back.monitor.as_deref(), Some(r"\\.\DISPLAY1"));
+    }
+
+    #[test]
+    fn library_data_shapes_decode() {
+        // `library.add` carries paths only — metadata is the daemon's job.
+        let add: LibraryAddData =
+            serde_json::from_str(r#"{"paths":["C:\\a.mp4","C:\\b.mp4"]}"#).expect("add data");
+        assert_eq!(add.paths.len(), 2);
+        assert!(serde_json::from_str::<LibraryAddData>("{}").is_err());
+
+        // `library.remove` needs an id.
+        let remove: LibraryRemoveData = serde_json::from_str(r#"{"id":"a3f2"}"#).expect("remove");
+        assert_eq!(remove.id, "a3f2");
+        assert!(serde_json::from_str::<LibraryRemoveData>("{}").is_err());
+
+        // Responses round-trip with the documented keys.
+        let result = LibraryAddResult {
+            added: Vec::new(),
+            rejected: vec![RejectedPath {
+                path: "C:\\gone.mp4".to_string(),
+                reason: "file not found".to_string(),
+            }],
+        };
+        let line = encode_line(&result).expect("encode");
+        assert!(
+            line.contains("\"added\"") && line.contains("\"rejected\""),
+            "{line}"
+        );
+        assert!(line.contains("file not found"), "{line}");
+
+        let items: LibraryItemsData = serde_json::from_str(r#"{"items":[]}"#).expect("list data");
+        assert!(items.items.is_empty());
+
+        let pruned: LibraryPruneResult = serde_json::from_str(r#"{"removed":3}"#).expect("prune");
+        assert_eq!(pruned.removed, 3);
     }
 
     #[test]
