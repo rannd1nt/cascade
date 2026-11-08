@@ -365,6 +365,23 @@ fn print_status_summary(status: &cascade_core::ipc::Status) {
             x = rect.x,
             y = rect.y,
         );
+        // Playback counters exist only on the monitor the engine is
+        // attached to (M4 S3b); unknown values are omitted on the wire and
+        // therefore here too — never printed as a fake zero.
+        let stats = [
+            monitor
+                .hwdec
+                .map(|on| format!("hwdec: {}", if on { "yes" } else { "no" })),
+            monitor.fps.map(|fps| format!("fps: {fps:.2}")),
+            monitor.dropped.map(|dropped| format!("dropped: {dropped}")),
+            monitor
+                .video
+                .map(|video| format!("video: {}x{}", video.w, video.h)),
+        ];
+        let present: Vec<String> = stats.into_iter().flatten().collect();
+        if !present.is_empty() {
+            println!("      {}", present.join(", "));
+        }
     }
     println!(
         "host: {} (repaint level {})",

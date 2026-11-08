@@ -15,8 +15,8 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use cascade_core::ipc::{
-    no_data, LibraryAddResult, LibraryItemsData, LibraryPruneResult, RejectedPath, Response,
-    Settings,
+    no_data, LibraryAddResult, LibraryItemsData, LibraryPruneResult, LibraryRef, RejectedPath,
+    Response, Settings, VideoSize,
 };
 use cascade_core::library::{Library, LibraryItem, VideoMetadata};
 use cascade_core::rule_engine::{RuleEngine, SessionState};
@@ -36,7 +36,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::config;
 use crate::control::{self, ControlWindow};
 use crate::host::{self, Host, HostOptions};
-use crate::ipc::{Command, PipeChannels, PipeServer, ServerMsg, StatusSnapshot, QUIT_FLUSH_WAIT};
+use crate::ipc::{
+    Command, PipeChannels, PipeServer, PlaybackStatus, ServerMsg, StatusSnapshot, QUIT_FLUSH_WAIT,
+};
 use crate::library::LibraryStore;
 use crate::monitor::{self, MonitorInfo};
 use crate::registry;
@@ -262,23 +264,86 @@ fn reattach(monitors: &[MonitorInfo], opts: &DaemonOptions) -> Option<(ShellSurf
     None
 }
 
+/// The `monitors[]` playback row for the monitor the engine is drawing on
+/// (`ipc.md` §4, M4 S3b).
+///
+/// `None` unless a video is loaded **and** currently attached: a detached
+/// backend has no host window to name, and a colour-only desktop has no
+/// stats to report. The source is matched against the library with
+/// `find_by_path` (canonical, case-insensitive), so a path that was never
+/// added simply carries no `source`.
+fn playback_status(
+    backend: &BackendGuard,
+    host: &Host,
+    state: &DaemonState,
+    library: &Library,
+) -> Option<PlaybackStatus> {
+    if !backend.loaded {
+        return None;
+    }
+    let hwnd = backend.attached_hwnd?;
+    let engine = backend.backend.as_ref()?;
+    let monitor = host
+        .windows()
+        .iter()
+        .find(|window| window.hwnd as isize == hwnd)?
+        .monitor
+        .id
+        .clone();
+    let stats = engine.stats();
+    let source = state
+        .video
+        .as_deref()
+        .and_then(|path| library.find_by_path(path))
+        .map(|item| LibraryRef {
+            id: item.id.clone(),
+            title: item.title.clone(),
+        });
+    Some(PlaybackStatus {
+        monitor,
+        source,
+        hwdec: stats.hardware_decode,
+        // A backend reporting 0 fps or a 0×0 size is saying "unknown";
+        // the field is omitted instead of showing a fake zero.
+        fps: (stats.fps > 0.0).then_some(stats.fps),
+        dropped: Some(stats.dropped_frames),
+        video: (stats.video_size != (0, 0)).then_some(VideoSize {
+            w: stats.video_size.0,
+            h: stats.video_size.1,
+        }),
+    })
+}
+
+/// Everything `refresh_status` reads off the render loop. Grouped into one
+/// value because the playback row (M4 S3b) added the backend, the
+/// persisted state, and the library — ten loose parameters would sit well
+/// past clippy's limit and read worse than this name does.
+struct StatusInputs<'a> {
+    host: &'a Host,
+    monitors: &'a [MonitorInfo],
+    opts: &'a DaemonOptions,
+    settings: &'a Settings,
+    flags: &'a Flags,
+    backend: &'a BackendGuard,
+    state: &'a DaemonState,
+    library: &'a Library,
+}
+
 /// Build the render-loop half of a `status` snapshot from current state.
 /// Mode and reasons come from the one pause oracle (design-m4 §2.6);
 /// memory and autostart are read on demand by the pipe thread instead
 /// (`design-m4` §2.2), so this stays cheap enough for the 2 s watchdog.
-fn current_snapshot(
-    host: &Host,
-    monitors: &[MonitorInfo],
-    opts: &DaemonOptions,
-    settings: &Settings,
-    flags: &Flags,
-) -> StatusSnapshot {
-    let desired = RuleEngine::evaluate(session_state(settings, flags, control::session_locked()));
+fn current_snapshot(inputs: &StatusInputs) -> StatusSnapshot {
+    let desired = RuleEngine::evaluate(session_state(
+        inputs.settings,
+        inputs.flags,
+        control::session_locked(),
+    ));
     // `!playing` outranks host health: a paused engine on an unhealthy
     // host is still "paused" — the watchdog reports health separately.
     let mode = if !desired.playing {
         "paused"
-    } else if host.is_healthy() {
+    } else if inputs.host.is_healthy() {
         "attached"
     } else {
         "degraded"
@@ -294,25 +359,25 @@ fn current_snapshot(
     StatusSnapshot {
         mode: mode.to_string(),
         paused_reasons,
-        monitors: monitors.to_vec(),
-        host_strategy: host.surface().mode.label().to_string(),
-        repaint_level: opts.repaint_level,
-        settings: *settings,
+        monitors: inputs.monitors.to_vec(),
+        playback: playback_status(inputs.backend, inputs.host, inputs.state, inputs.library),
+        host_strategy: inputs.host.surface().mode.label().to_string(),
+        repaint_level: inputs.opts.repaint_level,
+        settings: *inputs.settings,
     }
 }
 
 /// Publish the snapshot to the pipe thread only when it changed, so the
-/// channel carries no traffic while the desktop is idle.
+/// channel carries no traffic while the desktop is idle. While a video
+/// plays the live counters (`fps`, `dropped`) can differ on every tick —
+/// that costs at most one small message per watchdog tick (1–2 s), which
+/// is the price of `status` being current.
 fn refresh_status(
     tx: &mpsc::Sender<ServerMsg>,
     published: &mut Option<Arc<StatusSnapshot>>,
-    host: &Host,
-    monitors: &[MonitorInfo],
-    opts: &DaemonOptions,
-    settings: &Settings,
-    flags: &Flags,
+    inputs: &StatusInputs<'_>,
 ) {
-    let next = Arc::new(current_snapshot(host, monitors, opts, settings, flags));
+    let next = Arc::new(current_snapshot(inputs));
     if published.as_ref().is_some_and(|prev| **prev == *next) {
         return;
     }
@@ -1260,7 +1325,16 @@ pub fn run(
     let (msg_tx, msg_rx) = mpsc::channel::<ServerMsg>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
     let (flush_tx, flush_rx) = mpsc::channel::<()>();
-    let first = Arc::new(current_snapshot(&host, &monitors, &opts, &settings, &flags));
+    let first = Arc::new(current_snapshot(&StatusInputs {
+        host: &host,
+        monitors: &monitors,
+        opts: &opts,
+        settings: &settings,
+        flags: &flags,
+        backend: &backend_guard,
+        state: &state,
+        library: &library,
+    }));
     if msg_tx
         .send(ServerMsg::Snapshot(Arc::clone(&first)))
         .is_err()
@@ -1320,11 +1394,16 @@ pub fn run(
             refresh_status(
                 &msg_tx,
                 &mut published,
-                &host,
-                &monitors,
-                &opts,
-                &settings,
-                &flags,
+                &StatusInputs {
+                    host: &host,
+                    monitors: &monitors,
+                    opts: &opts,
+                    settings: &settings,
+                    flags: &flags,
+                    backend: &backend_guard,
+                    state: &state,
+                    library: &library,
+                },
             );
             for response in responses {
                 if msg_tx.send(ServerMsg::Response(response)).is_err() {
@@ -1372,11 +1451,16 @@ pub fn run(
             refresh_status(
                 &msg_tx,
                 &mut published,
-                &host,
-                &monitors,
-                &opts,
-                &settings,
-                &flags,
+                &StatusInputs {
+                    host: &host,
+                    monitors: &monitors,
+                    opts: &opts,
+                    settings: &settings,
+                    flags: &flags,
+                    backend: &backend_guard,
+                    state: &state,
+                    library: &library,
+                },
             );
             continue;
         }
@@ -1453,11 +1537,16 @@ pub fn run(
         refresh_status(
             &msg_tx,
             &mut published,
-            &host,
-            &monitors,
-            &opts,
-            &settings,
-            &flags,
+            &StatusInputs {
+                host: &host,
+                monitors: &monitors,
+                opts: &opts,
+                settings: &settings,
+                flags: &flags,
+                backend: &backend_guard,
+                state: &state,
+                library: &library,
+            },
         );
     }
 

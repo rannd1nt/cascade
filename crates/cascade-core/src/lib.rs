@@ -130,9 +130,16 @@ impl Default for PlaybackOptions {
 
 /// Backend counters. Surfaced to `status` in M4; M2 measures externally
 /// with GPU/CPU counters instead (`design-m2.md` §5).
+///
+/// `hardware_decode` is optional because "cannot observe" and "observed
+/// software decode" are different claims: the Media Engine reports neither,
+/// so it answers `None` until the M4 S4 MFT probe exists and `status` omits
+/// `hwdec` rather than asserting a `false` that would be wrong (M2 measured
+/// the GPU VideoDecode engine busy on this very build).
 #[derive(Clone, Debug, Default)]
 pub struct BackendStats {
-    pub hardware_decode: bool,
+    /// `None` = the backend cannot tell (omit the field on the wire).
+    pub hardware_decode: Option<bool>,
     pub decoded_frames: u64,
     pub dropped_frames: u64,
     pub video_size: (u32, u32),

@@ -1161,7 +1161,9 @@ impl MediaBackend for SourceReaderBackend {
 
     fn stats(&self) -> BackendStats {
         BackendStats {
-            hardware_decode: self.hw_decoder_available,
+            // `load` refuses to run without a successful probe, so a
+            // loaded backend always answers `Some(true)` here.
+            hardware_decode: Some(self.hw_decoder_available),
             decoded_frames: self.frames_read.load(Ordering::Acquire),
             dropped_frames: 0,
             video_size: (
@@ -2383,6 +2385,8 @@ mod tests {
         let backend = SourceReaderBackend::new().expect("backend must construct");
         let stats = backend.stats();
         assert_eq!(stats.fps, 0.0);
-        assert!(!stats.hardware_decode); // probe not called yet
+        // No load yet, so no probe has run: the answer is a known `false`,
+        // not `None` — `load` is what probes and would have failed otherwise.
+        assert_eq!(stats.hardware_decode, Some(false));
     }
 }

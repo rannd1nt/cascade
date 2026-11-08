@@ -7,6 +7,7 @@
 //! then. Variants A and B share this code — the difference is whether
 //! `cascade-win` releases its swap chain first (design-m2 §4).
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -20,8 +21,8 @@ use windows::Win32::Media::MediaFoundation::{
     IMFMediaEngineEx, IMFMediaEngineNotify, IMFMediaEngineNotify_Impl, MFCreateAttributes,
     MFShutdown, MFStartup, MFSTARTUP_FULL, MF_MEDIA_ENGINE_CALLBACK, MF_MEDIA_ENGINE_PLAYBACK_HWND,
     MF_MEDIA_ENGINE_READY_HAVE_CURRENT_DATA, MF_MEDIA_ENGINE_STATISTIC,
-    MF_MEDIA_ENGINE_STATISTIC_FRAMES_DROPPED, MF_MEDIA_ENGINE_STATISTIC_FRAMES_PER_SECOND,
-    MF_MEDIA_ENGINE_STATISTIC_FRAMES_RENDERED, MF_VERSION,
+    MF_MEDIA_ENGINE_STATISTIC_FRAMES_DROPPED, MF_MEDIA_ENGINE_STATISTIC_FRAMES_RENDERED,
+    MF_VERSION,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -117,6 +118,12 @@ pub struct MediaEngineBackend {
     opts: PlaybackOptions,
     /// Desired play state; applied whenever an engine exists.
     want_playing: bool,
+    /// Last `FRAMES_RENDERED` sample behind the measured `fps` (M4 S3b):
+    /// frames over the wall time between two `stats()` calls, which the
+    /// render loop makes on its 1–2 s watchdog tick. `Cell` because
+    /// `stats(&self)` takes `&self`; the backend lives on the daemon's
+    /// main thread only (design-m2 §3.1), so no synchronisation is needed.
+    fps_sample: Cell<Option<(u64, Instant)>>,
     // Declaration order = drop order: the engine shuts down in `Drop` first,
     // then `_mf` runs MFShutdown, then `_com` runs CoUninitialize
     // (design-m2 §3.3).
@@ -136,6 +143,7 @@ impl MediaEngineBackend {
             source: None,
             opts: PlaybackOptions::default(),
             want_playing: true,
+            fps_sample: Cell::new(None),
             _mf: mf,
             _com: com,
         })
@@ -201,6 +209,16 @@ impl MediaEngineBackend {
             unsafe { engine.Play() }.map_err(|err| at("Play", err))?;
         }
         Ok(())
+    }
+
+    /// Frames rendered per second over the interval since the previous
+    /// `stats()` call (M4 S3b). The arithmetic lives in [`fps_rate`]; this
+    /// half only owns the sample cell (`stats(&self)` takes `&self`).
+    fn measured_fps(&self, frames: u64) -> f32 {
+        let now = Instant::now();
+        let (rate, sample) = fps_rate(self.fps_sample.get(), frames, now);
+        self.fps_sample.set(Some(sample));
+        rate
     }
 
     /// (Re)start the remembered source on `hwnd`. Any previous engine is
@@ -292,9 +310,12 @@ impl MediaBackend for MediaEngineBackend {
 
     fn stats(&self) -> BackendStats {
         // Hardware decode is not observable through the engine; the probe
-        // (MFTEnumEx) is slice 4. M2 measures externally instead.
+        // (MFTEnumEx) is slice 4. `None` means "unknown" so `status` never
+        // prints `hwdec: false` while the GPU decoder is actually busy
+        // (M2 measured it at 13.99 % on this build). M2 measures externally
+        // instead.
         let mut stats = BackendStats {
-            hardware_decode: false,
+            hardware_decode: None,
             ..BackendStats::default()
         };
         let Some(engine) = &self.engine else {
@@ -320,8 +341,14 @@ impl MediaBackend for MediaEngineBackend {
             stats.dropped_frames = statistic(&ex, MF_MEDIA_ENGINE_STATISTIC_FRAMES_DROPPED)
                 .map(|value| value as u64)
                 .unwrap_or(0);
-            stats.fps =
-                statistic(&ex, MF_MEDIA_ENGINE_STATISTIC_FRAMES_PER_SECOND).unwrap_or(0.0) as f32;
+            // `MF_MEDIA_ENGINE_STATISTIC_FRAMES_PER_SECOND` is not filled
+            // by the engine on Windows 11 build 26200: `GetStatistics`
+            // answers `None` for it while `FRAMES_RENDERED` and
+            // `FRAMES_DROPPED` both return values (measured 2026-11-08,
+            // M4 S3b). The rate is therefore measured here from the
+            // rendered-frame counter over the interval between two
+            // `stats()` calls instead of trusting that statistic.
+            stats.fps = self.measured_fps(stats.decoded_frames);
         }
         stats
     }
@@ -427,6 +454,34 @@ fn pump_messages() {
     }
 }
 
+/// The measured `fps` behind `BackendStats::fps` (M4 S3b): frames over the
+/// wall time between two samples, taken from `FRAMES_RENDERED` — the
+/// engine's own `FRAMES_PER_SECOND` statistic is not filled on Windows 11
+/// build 26200 (measured 2026-11-08).
+///
+/// Returns the rate plus the sample to store for the next call. A `0.0`
+/// rate means "not measurable yet" and `status` omits the field rather
+/// than printing a fake zero: the first sample, a counter that restarted
+/// because the engine was recreated, or an interval shorter than 500 ms
+/// (two refreshes close together — the anchor is kept so the window grows).
+fn fps_rate(previous: Option<(u64, Instant)>, frames: u64, now: Instant) -> (f32, (u64, Instant)) {
+    const MEASURE_WINDOW: Duration = Duration::from_millis(500);
+    let Some((previous_frames, anchor)) = previous else {
+        return (0.0, (frames, now));
+    };
+    if frames < previous_frames {
+        // The engine was recreated (`attach_surface` reloads from 0):
+        // restart instead of dividing a negative delta.
+        return (0.0, (frames, now));
+    }
+    let elapsed = now.duration_since(anchor);
+    if elapsed < MEASURE_WINDOW {
+        return (0.0, (previous_frames, anchor));
+    }
+    let rate = (frames - previous_frames) as f64 / elapsed.as_secs_f64();
+    (rate as f32, (frames, now))
+}
+
 /// Read one engine statistic; the PROPVARIANT type depends on the counter.
 fn statistic(ex: &IMFMediaEngineEx, id: MF_MEDIA_ENGINE_STATISTIC) -> Option<f64> {
     // SAFETY: GetStatistics initializes the PROPVARIANT; only the scalar
@@ -511,5 +566,48 @@ mod tests {
             file_url(Path::new(r"C:\videos\clip.mp4")),
             "file:///C:/videos/clip.mp4"
         );
+    }
+
+    #[test]
+    fn fps_rate_needs_two_samples_before_it_reports() {
+        let t0 = Instant::now();
+        let (rate, sample) = fps_rate(None, 0, t0);
+        assert_eq!(rate, 0.0, "one sample is not a rate");
+        assert_eq!(sample, (0, t0));
+    }
+
+    #[test]
+    fn fps_rate_divides_frames_by_the_window() {
+        let t0 = Instant::now();
+        let (rate, sample) = fps_rate(Some((100, t0)), 220, t0 + Duration::from_secs(2));
+        assert!((rate - 60.0).abs() < 0.001, "expected 60, got {rate}");
+        assert_eq!(sample, (220, t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn fps_rate_restarts_when_the_counter_restarts() {
+        // `attach_surface` recreates the engine and reloads from 0, so the
+        // next sample is smaller than the previous one.
+        let t0 = Instant::now();
+        let (rate, sample) = fps_rate(Some((600, t0)), 12, t0 + Duration::from_secs(2));
+        assert_eq!(rate, 0.0, "a negative delta must never become a rate");
+        assert_eq!(sample, (12, t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn fps_rate_keeps_the_anchor_when_the_window_is_too_short() {
+        let t0 = Instant::now();
+        let (rate, sample) = fps_rate(Some((100, t0)), 110, t0 + Duration::from_millis(200));
+        assert_eq!(rate, 0.0, "a 200 ms window is too short to report");
+        assert_eq!(
+            sample,
+            (100, t0),
+            "the anchor must survive so the window grows instead of restarting"
+        );
+        // The next call divides over the full window from the original
+        // anchor: 60 frames in 2 s = 30 fps. Had the anchor restarted at
+        // the short call it would read 50 in 1.8 s ≈ 27.8 fps.
+        let (rate, _) = fps_rate(Some(sample), 160, t0 + Duration::from_secs(2));
+        assert!((rate - 30.0).abs() < 0.001, "expected 30, got {rate}");
     }
 }

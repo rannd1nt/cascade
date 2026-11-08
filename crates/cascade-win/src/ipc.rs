@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use cascade_core::ipc::{
     self, encode_line, no_data, AutostartStatus, DecodeError, EnabledData, LibraryAddData,
-    LibraryRemoveData, MonitorData, Ping, Response, SetData, Settings, SettingsPatch, Status,
-    MAX_LINE_BYTES, PIPE_PREFIX,
+    LibraryRef, LibraryRemoveData, MonitorData, Ping, Response, SetData, Settings, SettingsPatch,
+    Status, VideoSize, MAX_LINE_BYTES, PIPE_PREFIX,
 };
 use cascade_core::PROTOCOL_VERSION;
 use windows_sys::Win32::Foundation::{
@@ -88,11 +88,35 @@ pub struct StatusSnapshot {
     pub mode: String,
     pub paused_reasons: Vec<String>,
     pub monitors: Vec<MonitorInfo>,
+    /// Playback counters for the one monitor the engine draws on
+    /// (M4 S3b); `None` while no video is loaded and attached.
+    pub playback: Option<PlaybackStatus>,
     pub host_strategy: String,
     pub repaint_level: u32,
     /// File-backed settings; the `autostart` field inside is the
     /// placeholder — the wire edge fills it from the registry.
     pub settings: Settings,
+}
+
+/// The `monitors[]` row the engine is actually drawing on (`ipc.md` §4).
+///
+/// Built on the render loop from `MediaBackend::stats()` plus the applied
+/// source. Every field is `Option` for an honest reason: `None` means the
+/// daemon has nothing to report (no library entry, a backend that cannot
+/// observe hardware decode, a counter the engine does not deliver) — never
+/// a placeholder value (M4 S3b).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaybackStatus {
+    /// Monitor id of the host window the engine is attached to. The row
+    /// with this id gets the fields; every other monitor stays `None`
+    /// (single-surface engine, design-m2 §5).
+    pub monitor: String,
+    /// Library entry for the applied path, when the path is in the library.
+    pub source: Option<LibraryRef>,
+    pub hwdec: Option<bool>,
+    pub fps: Option<f32>,
+    pub dropped: Option<u64>,
+    pub video: Option<VideoSize>,
 }
 
 impl StatusSnapshot {
@@ -103,6 +127,7 @@ impl StatusSnapshot {
             mode: "boot".to_string(),
             paused_reasons: Vec::new(),
             monitors: monitor::enumerate(),
+            playback: None,
             host_strategy: String::new(),
             repaint_level: 0,
             settings: Settings::default(),
@@ -723,15 +748,24 @@ fn build_status(snapshot: &StatusSnapshot) -> Status {
         monitors: snapshot
             .monitors
             .iter()
-            .map(|monitor| cascade_core::ipc::MonitorStatus {
-                id: monitor.id.clone(),
-                rect: monitor.rect,
-                primary: monitor.primary,
-                source: None,
-                hwdec: None,
-                fps: None,
-                dropped: None,
-                video: None,
+            .map(|monitor| {
+                // Only the monitor the engine is attached to carries
+                // playback fields; the rest keep their `None`s and the
+                // wire omits them (`ipc.md` §4, M4 S3b).
+                let playback = snapshot
+                    .playback
+                    .as_ref()
+                    .filter(|playback| playback.monitor == monitor.id);
+                cascade_core::ipc::MonitorStatus {
+                    id: monitor.id.clone(),
+                    rect: monitor.rect,
+                    primary: monitor.primary,
+                    source: playback.and_then(|playback| playback.source.clone()),
+                    hwdec: playback.and_then(|playback| playback.hwdec),
+                    fps: playback.and_then(|playback| playback.fps),
+                    dropped: playback.and_then(|playback| playback.dropped),
+                    video: playback.and_then(|playback| playback.video),
+                }
             })
             .collect(),
         memory: memory_status(),
@@ -1056,6 +1090,7 @@ mod tests {
             mode: "boot".to_string(),
             paused_reasons: Vec::new(),
             monitors: Vec::new(),
+            playback: None,
             host_strategy: String::new(),
             repaint_level: 0,
             settings: Settings::default(),
@@ -1065,6 +1100,83 @@ mod tests {
             !snapshot.settings.autostart,
             "autostart is filled from the registry at the wire edge"
         );
+    }
+
+    #[test]
+    fn build_status_fills_only_the_attached_monitor_row() {
+        // M4 S3b: the playback row lands on the monitor the engine is
+        // attached to; every other monitor keeps its `None`s and the wire
+        // omits them (ipc.md §4). An unobservable value stays `None` —
+        // never a placeholder `false`.
+        let monitors = vec![
+            MonitorInfo {
+                handle: 0,
+                id: r"\\.\DISPLAY1".to_string(),
+                rect: cascade_core::Rect::new(0, 0, 1366, 768),
+                work: cascade_core::Rect::new(0, 0, 1366, 728),
+                primary: true,
+            },
+            MonitorInfo {
+                handle: 0,
+                id: r"\\.\DISPLAY2".to_string(),
+                rect: cascade_core::Rect::new(1366, 0, 1920, 1080),
+                work: cascade_core::Rect::new(1366, 0, 1920, 1040),
+                primary: false,
+            },
+        ];
+        let snapshot = StatusSnapshot {
+            mode: "attached".to_string(),
+            paused_reasons: Vec::new(),
+            monitors,
+            playback: Some(PlaybackStatus {
+                monitor: r"\\.\DISPLAY2".to_string(),
+                source: Some(LibraryRef {
+                    id: "a3f2".to_string(),
+                    title: "Furina".to_string(),
+                }),
+                hwdec: None,
+                fps: Some(59.94),
+                dropped: Some(0),
+                video: Some(VideoSize { w: 1920, h: 1080 }),
+            }),
+            host_strategy: "workerw_child".to_string(),
+            repaint_level: 1,
+            settings: Settings::default(),
+        };
+        let status = build_status(&snapshot);
+        let idle = &status.monitors[0];
+        assert!(
+            idle.source.is_none()
+                && idle.hwdec.is_none()
+                && idle.fps.is_none()
+                && idle.dropped.is_none()
+                && idle.video.is_none(),
+            "a monitor without the engine must stay empty"
+        );
+        let playing = &status.monitors[1];
+        assert_eq!(
+            playing.source.as_ref().map(|source| source.id.as_str()),
+            Some("a3f2")
+        );
+        assert_eq!(
+            playing.source.as_ref().map(|source| source.title.as_str()),
+            Some("Furina")
+        );
+        assert!(
+            playing.hwdec.is_none(),
+            "an unobservable hwdec must stay None, not false"
+        );
+        assert_eq!(playing.fps, Some(59.94));
+        assert_eq!(playing.dropped, Some(0));
+        assert_eq!(playing.video, Some(VideoSize { w: 1920, h: 1080 }));
+
+        // Wire shape: known fields present, unknown field omitted.
+        let line = encode_line(&status).expect("encode");
+        assert!(!line.contains("hwdec"), "{line}");
+        assert!(line.contains(r#""fps":59.94"#), "{line}");
+        assert!(line.contains(r#""title":"Furina""#), "{line}");
+        let back: Status = serde_json::from_str(&line).expect("decode");
+        assert_eq!(back, status, "Status roundtrips");
     }
 
     #[test]
