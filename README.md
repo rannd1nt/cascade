@@ -7,12 +7,13 @@ after a reboot, and never touches your files.
 
 No WebView2. No Electron. No bundled mpv/ffmpeg. One small executable.
 
-> **Status: M0 complete (feasibility), M1 host + lifecycle gates A–F passing on the
-> target machine.** Solid colour renders behind the icons via DXGI; clean stop, hard
-> kill, unclean-exit recovery, Explorer-restart recovery, reboot autostart (M1-E) and
-> focus/sleep (M1-F) are measured working. Next: M2 — native player Tier 1 (design
-> approved). Evidence: [`docs/spike-m0.md`](docs/spike-m0.md) and
-> [`docs/reliability.md`](docs/reliability.md) §11.
+> **Status (2026-11-08):** M0–M1 complete (all gates A–F measured, `docs/reliability.md`
+> §11); M2 native player shipping — hardware decode + quality rows re-measured on the
+> current build (`docs/benchmark-m2.md` §11); M3 shipped for session-lock only, the
+> remaining pause collectors are designed in `docs/design-m3b.md`; **M4 (IPC + CLI +
+> library) in progress — S0–S3 + the restart-on-switch slice done, next S3b → S4**
+> (`docs/design-m4.md` §8). The daemon plays H.264 behind the icons, is fully
+> controllable over a named pipe, and every exit path restores the desktop.
 
 ---
 
