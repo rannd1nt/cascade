@@ -94,6 +94,12 @@ pub struct Response {
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<WireError>,
+    /// In-process handshake flag: the daemon set a different-file
+    /// `wallpaper.set` and will restart itself right after the client has
+    /// this answer (design-m2 §4). Never on the wire — it is daemon-side
+    /// bookkeeping, so `ipc.md` §2 is unchanged.
+    #[serde(skip)]
+    pub flush_after: bool,
 }
 
 impl Response {
@@ -104,6 +110,7 @@ impl Response {
             ok: true,
             data: Some(data),
             error: None,
+            flush_after: false,
         }
     }
 
@@ -117,6 +124,7 @@ impl Response {
                 code,
                 message: message.into(),
             }),
+            flush_after: false,
         }
     }
 }

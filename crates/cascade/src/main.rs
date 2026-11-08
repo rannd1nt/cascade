@@ -105,7 +105,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     // depend on media, so the binary injects it.
     let probe: daemon::ProbeFn = Box::new(cascade_media::probe);
     match daemon::run(options, backend, factory, probe) {
-        Ok(()) => Ok(ExitCode::SUCCESS),
+        Ok(daemon::RunExit::Exit) => Ok(ExitCode::SUCCESS),
+        // A different-file `wallpaper.set` was answered: the exit ladder
+        // has repainted and `state.json` holds the new path; re-exec so
+        // the child loads it with flat memory (design-m2 §4).
+        Ok(daemon::RunExit::Respawn) => respawn_child(),
         Err(err) => {
             // Best effort: a console close may already have invalidated the
             // handles, and a panic here would be reported as a crash.
@@ -113,6 +117,49 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             Ok(ExitCode::from(1))
         }
     }
+}
+
+/// Re-exec this binary after a respawn-triggering `wallpaper.set`
+/// (design-m2 §4). The child inherits everything except `--video` (it
+/// must read the new path from `state.json`, not the flag that started
+/// this process) and sets `CASCADE_RESPAWN` so it retries the session
+/// pipe until this process exits. A failed spawn leaves a repainted
+/// desktop and a correct `state.json` — the next start loads the new
+/// file anyway; the error still surfaces as a non-zero exit.
+fn respawn_child() -> Result<ExitCode, String> {
+    let exe = std::env::current_exe().map_err(|err| format!("respawn: {err}"))?;
+    match std::process::Command::new(exe)
+        .args(respawn_args())
+        .env("CASCADE_RESPAWN", "1")
+        .spawn()
+    {
+        Ok(child) => {
+            cascade_win::dlog!("cascade: respawned as pid {}", child.id());
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Err(format!("respawn: {err}")),
+    }
+}
+
+/// The respawn argv: this process's arguments minus `--video` and its
+/// value. Pure so the filter is unit-testable without touching argv.
+fn respawn_args() -> Vec<std::ffi::OsString> {
+    filter_video_flag(std::env::args_os().skip(1).collect())
+}
+
+fn filter_video_flag(raw: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skip_next = false;
+    for arg in raw {
+        if skip_next {
+            skip_next = false;
+        } else if arg == "--video" {
+            skip_next = true;
+        } else {
+            out.push(arg);
+        }
+    }
+    out
 }
 
 /// Parse `run`/`--autostart` options. Kept free of side effects so the
@@ -970,6 +1017,27 @@ mod tests {
     fn run_options_without_video_have_no_source() {
         let options = parse_run_options(&args(&["--color", "187A86"])).expect("valid options");
         assert!(options.video.is_none());
+    }
+
+    #[test]
+    fn respawn_filter_drops_video_flag_and_keeps_everything_else() {
+        // `--video` and its value go; the child reads `state.json` instead
+        // (design-m2 §4). Position anywhere, other options untouched.
+        let raw = |list: &[&str]| -> Vec<std::ffi::OsString> {
+            list.iter().map(std::ffi::OsString::from).collect()
+        };
+        assert_eq!(
+            filter_video_flag(raw(&["run", "--video", r"C:\a.mp4", "--repaint", "2"])),
+            raw(&["run", "--repaint", "2"])
+        );
+        assert_eq!(
+            filter_video_flag(raw(&["run", "--color", "FF0000", "--video", r"C:\b.mp4"])),
+            raw(&["run", "--color", "FF0000"])
+        );
+        assert_eq!(filter_video_flag(raw(&["run"])), raw(&["run"]));
+        assert_eq!(filter_video_flag(raw(&[])), raw(&[]));
+        // A trailing `--video` with no value loses nothing else.
+        assert_eq!(filter_video_flag(raw(&["run", "--video"])), raw(&["run"]));
     }
 
     #[test]

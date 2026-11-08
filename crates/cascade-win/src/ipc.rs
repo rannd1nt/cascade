@@ -195,12 +195,13 @@ impl Command {
 }
 
 /// The channel half the server thread owns (design-m4 §2.2): it receives
-/// snapshots and responses, forwards commands, and acks a flushed `quit`.
-/// The main loop keeps the mirrored senders/receivers.
+/// snapshots and responses, forwards commands, and acks a response whose
+/// write is done (`quit`, and a respawn-triggering `wallpaper.set` —
+/// design-m2 §4). The main loop keeps the mirrored senders/receivers.
 pub struct PipeChannels {
     pub messages: Receiver<ServerMsg>,
     pub commands: Sender<Command>,
-    pub quit_flushed: Sender<()>,
+    pub flush_acked: Sender<()>,
 }
 
 /// The server half: created on the main thread (it *is* the single-instance
@@ -592,7 +593,16 @@ fn dispatch_line(
             ),
         ),
     };
-    write_response(handle, &response)
+    let written = write_response(handle, &response);
+    if response.flush_after {
+        // The client has its answer (or is gone): ack so the main loop can
+        // run the exit ladder and respawn (design-m2 §4 — the same flush
+        // handshake as `quit`, design-m4 §2.3). Acking even a failed write
+        // keeps the decision made in the main loop from stalling on a
+        // client that disappeared mid-answer.
+        let _ = channels.flush_acked.send(());
+    }
+    written
 }
 
 /// Hand a mutating command to the main loop and wait for its response
@@ -666,7 +676,7 @@ fn quit_flow(
     let written = write_response(handle, &response);
     if response.ok {
         // The main loop waits for this before running the exit ladder.
-        let _ = channels.quit_flushed.send(());
+        let _ = channels.flush_acked.send(());
     }
     written
 }
@@ -1110,7 +1120,7 @@ mod tests {
         let channels = PipeChannels {
             messages: msg_rx,
             commands: std::sync::mpsc::channel().0,
-            quit_flushed: std::sync::mpsc::channel().0,
+            flush_acked: std::sync::mpsc::channel().0,
         };
         msg_tx
             .send(ServerMsg::Response(Response::ok(99, no_data())))

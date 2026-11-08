@@ -383,11 +383,22 @@ struct BackendGuard {
     /// backend stays out of the host path entirely, so a run with no video
     /// behaves exactly like M1 (design-m2 §2.2).
     loaded: bool,
+    /// HWND the engine is currently bound to, set only after a successful
+    /// `attach_surface` and cleared by every detach/take. `wallpaper.set`
+    /// uses it to recognise "already playing this file on this window"
+    /// and skip the load entirely (design-m2 §4).
+    attached_hwnd: Option<isize>,
+    /// Successful `load`s in this process (the startup load counts as 1).
+    /// Every load pipeline retains ~50 MB until process exit
+    /// (design-m4 §8.3), so once this is ≥ 1 a different-file set restarts
+    /// the daemon instead of loading again (design-m2 §4).
+    session_loads: u32,
 }
 
 impl BackendGuard {
     fn take(&mut self) -> Option<Box<dyn MediaBackend>> {
         self.loaded = false;
+        self.attached_hwnd = None;
         self.backend.take()
     }
 
@@ -397,6 +408,7 @@ impl BackendGuard {
     /// (design-m2 §3.3 ordering). Without this, reattach-with-video wedges
     /// the main thread (benchmark-m2.md §7.1).
     fn detach_surface(&mut self) -> BackendResult<()> {
+        self.attached_hwnd = None;
         if let Some(backend) = self.backend.as_mut() {
             backend.detach_surface()?;
         }
@@ -450,11 +462,17 @@ fn attach_backend(backend: &mut BackendGuard, host: &mut Host, assigned: Option<
     let Some(engine) = backend.backend.as_mut() else {
         return;
     };
+    let hwnd = surface.hwnd;
     if let Err(err) = engine.attach_surface(surface) {
         derr!("backend: attach failed: {err}");
         // Ownership table (design-m2 §4): video failure returns the client
         // area to the colour presenter.
         host.restore_presenter();
+    } else {
+        // Reuse bookkeeping (design-m2 §4 reload amendment): only a
+        // successful attach makes the engine eligible for the same-HWND
+        // reload path in `set_wallpaper`.
+        backend.attached_hwnd = Some(hwnd);
     }
 }
 
@@ -543,11 +561,13 @@ struct Loop<'a> {
 }
 
 /// Result of one drain: responses to write after the snapshot refresh,
-/// plus the `quit` flush-ack handshake flag (design-m4 §2.3).
+/// plus the `quit` flush-ack handshake flag (design-m4 §2.3) and the
+/// restart decision for a different-file `wallpaper.set` (design-m2 §4).
 #[derive(Default)]
 struct Pending {
     responses: Vec<Response>,
     quit: bool,
+    respawn: Option<u64>,
 }
 
 fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
@@ -762,6 +782,41 @@ fn clock_seed() -> u64 {
 /// check the file, and hand the client area back to the colour presenter
 /// *before* any playback surgery — every failure path then leaves the
 /// desktop painted (AGENTS §3.1).
+///
+/// Is the backend already bound to exactly the window this set would
+/// attach to? A `None` target (no host window) never qualifies.
+fn reuse_surface(loaded: bool, attached: Option<isize>, target: Option<isize>) -> bool {
+    loaded && target.is_some() && attached == target
+}
+
+/// What one `wallpaper.set` does in this process (design-m2 §4):
+///
+/// | Action   | When | Cost |
+/// |----------|------|------|
+/// | `Skip`   | same file already playing on the very window | none — no load, no restart, PID unchanged |
+/// | `Restart`| any other set after this process has loaded once | exit ladder + respawn; each load pipeline retains ~50 MB until process exit (design-m4 §8.3), so only a fresh process stays flat |
+/// | `Load`   | first load of a fresh process (or before anything loaded) | one pipeline, the baseline cost |
+///
+/// `Restart` wins over `Load` once `session_loads ≥ 1` regardless of path:
+/// a failed or cleared earlier load still left retention behind, and an
+/// inconsistent "sometimes restart" rule would confuse users.
+#[derive(Debug, PartialEq, Eq)]
+enum SetAction {
+    Skip,
+    Restart,
+    Load,
+}
+
+fn set_action(same_path: bool, reusable: bool, session_loads: u32) -> SetAction {
+    if same_path && reusable {
+        SetAction::Skip
+    } else if session_loads >= 1 {
+        SetAction::Restart
+    } else {
+        SetAction::Load
+    }
+}
+
 fn set_wallpaper(
     ctx: &mut Loop,
     id: u64,
@@ -789,13 +844,59 @@ fn set_wallpaper(
         ));
         return;
     }
-    // 3. Detach the engine while its playback HWND is still alive, then
+    // 3. Skip / restart / load decision (design-m2 §4). The same file
+    //    already playing on the very window: a pure no-op — no load, no
+    //    restart, no growth. Anything else once this process has loaded:
+    //    restart it (the client is answered first; the flush ack then runs
+    //    the exit ladder and respawns). Only a fresh process loads here.
+    let host_windows = ctx.host.windows();
+    let target_hwnd = monitor
+        .as_deref()
+        .and_then(|id| host_windows.iter().find(|window| window.monitor.id == id))
+        .or_else(|| host_windows.first())
+        .map(|window| window.hwnd as isize);
+    let same_path = ctx.state.video.as_deref() == Some(path.as_str());
+    let reusable = reuse_surface(ctx.backend.loaded, ctx.backend.attached_hwnd, target_hwnd);
+    match set_action(same_path, reusable, ctx.backend.session_loads) {
+        SetAction::Skip => {
+            dlog!("set: already playing this file on this window; no-op");
+            // The same window can be named differently (None vs. its id);
+            // keep state.json in step with the request either way.
+            if ctx.state.monitor != monitor {
+                ctx.state.monitor = monitor;
+                if let Err(err) = ctx.store.save(ctx.state) {
+                    derr!("state: {err}");
+                }
+            }
+            pending.responses.push(Response::ok(id, no_data()));
+            return;
+        }
+        SetAction::Restart => {
+            // Persist the new path first: the child process reads it back
+            // on start (design-m2 §4). The client receives this answer, the
+            // flush ack runs the exit ladder (repaint included), then the
+            // process respawns and the child loads the file with flat RAM.
+            ctx.state.video = Some(path.clone());
+            ctx.state.monitor = monitor;
+            if let Err(err) = ctx.store.save(ctx.state) {
+                derr!("state: {err}");
+            }
+            let mut response = Response::ok(id, no_data());
+            response.flush_after = true;
+            pending.responses.push(response);
+            pending.respawn = Some(id);
+            dlog!("set: different video; restarting the daemon to release retained memory");
+            return;
+        }
+        SetAction::Load => dlog!("set: loading {}", path),
+    }
+    // 4. Detach the engine while its playback HWND is still alive, then
     //    take the client area back for the colour presenter (design-m2 §4).
     if let Err(err) = ctx.backend.detach_surface() {
         derr!("set: backend detach failed: {err}");
     }
     ctx.host.restore_presenter();
-    // 4. Build a backend on demand: `cascade-win` may not depend on
+    // 5. Build a backend on demand: `cascade-win` may not depend on
     //    `cascade-media` (AGENTS §4), so the binary provides the factory.
     if ctx.backend.backend.is_none() {
         match (ctx.factory)(Path::new(&path)) {
@@ -810,7 +911,7 @@ fn set_wallpaper(
             }
         }
     }
-    // 5. Load the new source. A failure keeps the colour (step 3) and
+    // 6. Load the new source. A failure keeps the colour (step 4) and
     //    drops the broken path so the next start does not replay it.
     let failure = match ctx.backend.backend.as_mut() {
         Some(backend) => backend
@@ -834,13 +935,16 @@ fn set_wallpaper(
         return;
     }
     ctx.backend.loaded = true;
-    // 6. Persist so the next start replays this file (design-m2 §5).
+    // One more pipeline retained ~50 MB (design-m4 §8.3): from now on this
+    // process restarts itself instead of loading again (design-m2 §4).
+    ctx.backend.session_loads += 1;
+    // 7. Persist so the next start replays this file (design-m2 §5).
     ctx.state.video = Some(path.clone());
     ctx.state.monitor = monitor;
     if let Err(err) = ctx.store.save(ctx.state) {
         derr!("state: {err}");
     }
-    // 7. Attach to the assigned monitor, then apply the pause rules.
+    // 8. Attach to the assigned monitor, then apply the pause rules.
     attach_backend(ctx.backend, ctx.host, ctx.state.monitor.as_deref());
     apply_playback(
         ctx.backend,
@@ -909,6 +1013,46 @@ fn run_restore(
     }
 }
 
+/// How `run()` ended (design-m2 §4). `Exit` is any normal stop; `Respawn`
+/// means a different-file `wallpaper.set` was answered, the exit ladder
+/// has run, and the caller must re-exec this binary so the child loads
+/// the new file with flat memory.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunExit {
+    Exit,
+    Respawn,
+}
+
+/// How long a respawn child waits for its parent to release the session
+/// pipe (design-m2 §4): the parent only runs its exit ladder and returns
+/// from `main`, so seconds are ample — and a hang here still degrades to
+/// the normal single-instance error, never to a second daemon.
+const RESPAWN_PIPE_WAIT: Duration = Duration::from_secs(5);
+const RESPAWN_PIPE_POLL: Duration = Duration::from_millis(100);
+
+/// Create the session pipe on a `CASCADE_RESPAWN` start: the parent owns
+/// it until the process exits, so retry the contention instead of reading
+/// it as another live daemon. After the deadline the normal single-
+/// instance verdict applies (`control` may already be gone by then, in
+/// which case the raw pipe error is returned).
+fn create_respawn_pipe() -> Result<PipeServer, DaemonError> {
+    let deadline = Instant::now() + RESPAWN_PIPE_WAIT;
+    loop {
+        match PipeServer::create() {
+            Ok(pipe) => return Ok(pipe),
+            Err(code) => {
+                if Instant::now() >= deadline {
+                    if let Some(existing) = control::find_existing() {
+                        return Err(DaemonError::AlreadyRunning(existing as usize));
+                    }
+                    return Err(DaemonError::Pipe(code));
+                }
+                std::thread::sleep(RESPAWN_PIPE_POLL);
+            }
+        }
+    }
+}
+
 /// Run the daemon until asked to stop. Always repaints the desktop before
 /// returning, including on the restore path.
 pub fn run(
@@ -916,7 +1060,7 @@ pub fn run(
     backend: Option<Box<dyn MediaBackend>>,
     factory: BackendFactory,
     probe: ProbeFn,
-) -> Result<(), DaemonError> {
+) -> Result<RunExit, DaemonError> {
     // Declared first, therefore dropped last on every exit path (`Ok`, an
     // early `Err`, and panic unwinding): only then is `EXIT_DONE` signalled,
     // which lets a waiting console-control handler return — and Windows only
@@ -928,6 +1072,8 @@ pub fn run(
     let mut backend_guard = BackendGuard {
         backend,
         loaded: false,
+        attached_hwnd: None,
+        session_loads: 0,
     };
 
     // The pipe is the primary single-instance lock (`ipc.md` §1): the first
@@ -935,13 +1081,21 @@ pub fn run(
     // fails here. The control window check stays as the fallback for an
     // older daemon that has no pipe yet. On any failure `pipe` drops and
     // closes the handle, so nothing is left behind.
-    let pipe = match PipeServer::create() {
-        Ok(pipe) => pipe,
-        Err(code) => {
-            if let Some(existing) = control::find_existing() {
-                return Err(DaemonError::AlreadyRunning(existing as usize));
+    //
+    // A respawn child (design-m2 §4) spawns while its parent still owns
+    // the pipe, so contention is expected, not a second daemon: retry
+    // until the parent's exit ladder finishes instead of failing fast.
+    let pipe = if std::env::var_os("CASCADE_RESPAWN").is_some() {
+        create_respawn_pipe()?
+    } else {
+        match PipeServer::create() {
+            Ok(pipe) => pipe,
+            Err(code) => {
+                if let Some(existing) = control::find_existing() {
+                    return Err(DaemonError::AlreadyRunning(existing as usize));
+                }
+                return Err(DaemonError::Pipe(code));
             }
-            return Err(DaemonError::Pipe(code));
         }
     };
     if let Some(existing) = control::find_existing() {
@@ -1033,6 +1187,9 @@ pub fn run(
                 Ok(()) => {
                     dlog!("  video: {}", source.display());
                     backend_guard.loaded = true;
+                    // The startup pipeline counts: any later set must
+                    // restart instead of loading again (design-m2 §4).
+                    backend_guard.session_loads += 1;
                 }
                 Err(err) => derr!("video: {err}; continuing with the colour background"),
             },
@@ -1114,7 +1271,7 @@ pub fn run(
     if let Err(code) = pipe.serve(PipeChannels {
         messages: msg_rx,
         commands: cmd_tx,
-        quit_flushed: flush_tx,
+        flush_acked: flush_tx,
     }) {
         // The desktop must stay up regardless: log and continue without a
         // control channel (the control-window fallback still detects a
@@ -1123,6 +1280,9 @@ pub fn run(
     }
 
     let mut msg = MSG::default();
+    // Set when a `wallpaper.set` decided this process must re-exec; read
+    // once after the exit ladder to pick the `run()` result (design-m2 §4).
+    let mut respawn_after = false;
     while !control::quit_requested() {
         // Commands from the pipe thread first (design-m4 §2.2): apply
         // every queued mutation, publish the resulting snapshot, and only
@@ -1151,7 +1311,11 @@ pub fn run(
             }
             pending
         };
-        let Pending { responses, quit } = pending;
+        let Pending {
+            responses,
+            quit,
+            respawn,
+        } = pending;
         if !responses.is_empty() {
             refresh_status(
                 &msg_tx,
@@ -1168,12 +1332,16 @@ pub fn run(
                 }
             }
         }
-        if quit {
+        if quit || respawn.is_some() {
             // The pipe thread flushes its write to the client, then acks;
-            // only then does the exit ladder start (design-m4 §2.3). A
-            // missing ack must not keep the daemon alive forever.
+            // only then does the exit ladder start (design-m4 §2.3 — a
+            // respawn-triggering `wallpaper.set` shares that handshake,
+            // design-m2 §4). A missing ack must not keep the daemon alive.
             if let Err(err) = flush_rx.recv_timeout(QUIT_FLUSH_WAIT) {
-                derr!("ipc: quit flush ack missing ({err}); quitting anyway");
+                derr!("ipc: flush ack missing ({err}); quitting anyway");
+            }
+            if respawn.is_some() {
+                respawn_after = true;
             }
             control::request_quit();
         }
@@ -1315,7 +1483,11 @@ pub fn run(
     if let Err(err) = saved {
         derr!("state: {err}");
     }
-    Ok(())
+    if respawn_after {
+        Ok(RunExit::Respawn)
+    } else {
+        Ok(RunExit::Exit)
+    }
 }
 
 #[cfg(test)]
@@ -1382,6 +1554,8 @@ mod tests {
         let mut backend = BackendGuard {
             backend: Some(Box::new(mock)),
             loaded: true,
+            attached_hwnd: None,
+            session_loads: 0,
         };
         let settings = Settings::default();
         let mut flags = Flags { user_paused: true };
@@ -1402,6 +1576,8 @@ mod tests {
         let mut backend = BackendGuard {
             backend: Some(Box::new(mock)),
             loaded: true,
+            attached_hwnd: None,
+            session_loads: 0,
         };
         let flags = Flags::default();
 
@@ -1431,6 +1607,8 @@ mod tests {
         let mut not_loaded = BackendGuard {
             backend: Some(Box::new(mock)),
             loaded: false,
+            attached_hwnd: None,
+            session_loads: 0,
         };
         apply_playback(
             &mut not_loaded,
@@ -1445,6 +1623,8 @@ mod tests {
         let mut no_backend = BackendGuard {
             backend: None,
             loaded: true,
+            attached_hwnd: None,
+            session_loads: 0,
         };
         apply_playback(
             &mut no_backend,
@@ -1452,6 +1632,38 @@ mod tests {
             &Flags::default(),
             true,
         );
+    }
+
+    #[test]
+    fn reuse_surface_only_for_a_loaded_engine_on_the_same_window() {
+        // Loaded and bound to exactly the target window: reuse.
+        assert!(reuse_surface(true, Some(0x1234), Some(0x1234)));
+        // No video loaded (cleared / first set): full path.
+        assert!(!reuse_surface(false, None, Some(0x1234)));
+        // Attached elsewhere (monitor switch): full path recreates.
+        assert!(!reuse_surface(true, Some(0x1234), Some(0x5678)));
+        // Detached (clear / restore / repair in flight): full path.
+        assert!(!reuse_surface(true, None, Some(0x1234)));
+        // No host window at all: never reuse.
+        assert!(!reuse_surface(true, Some(0x1234), None));
+        assert!(!reuse_surface(false, None, None));
+    }
+
+    #[test]
+    fn set_action_covers_the_eight_decision_cells() {
+        // Same file, already on this window: skip — regardless of loads.
+        assert_eq!(set_action(true, true, 0), SetAction::Skip);
+        assert_eq!(set_action(true, true, 1), SetAction::Skip);
+        assert_eq!(set_action(true, true, 7), SetAction::Skip);
+        // Same file but not reusable (other window / detached): restart
+        // once this process has loaded, else the first load runs.
+        assert_eq!(set_action(true, false, 1), SetAction::Restart);
+        assert_eq!(set_action(true, false, 0), SetAction::Load);
+        // Different file: restart after any load, load on a fresh process.
+        assert_eq!(set_action(false, true, 1), SetAction::Restart);
+        assert_eq!(set_action(false, true, 0), SetAction::Load);
+        assert_eq!(set_action(false, false, 1), SetAction::Restart);
+        assert_eq!(set_action(false, false, 0), SetAction::Load);
     }
 
     #[test]
