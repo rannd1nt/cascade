@@ -15,7 +15,7 @@ use cascade_core::{
     BackendError, BackendResult, BackendStats, HostSurface, MediaBackend, PlaybackOptions,
 };
 use windows::core::{implement, Interface, BSTR};
-use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MFMediaEngineClassFactory, IMFAttributes, IMFMediaEngine, IMFMediaEngineClassFactory,
     IMFMediaEngineEx, IMFMediaEngineNotify, IMFMediaEngineNotify_Impl, MFCreateAttributes,
@@ -29,8 +29,20 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, PostQuitMessage, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
+    DispatchMessageW, IsWindow, PeekMessageW, PostQuitMessage, TranslateMessage, MSG, PM_REMOVE,
+    WM_QUIT,
 };
+
+/// Best-effort probe line on stderr (mirrors `derr!` in `cascade-win`;
+/// `cascade-media` may not depend on it — AGENTS §4). Never panics: these
+/// probes run on detach/exit paths where a failed write during `CTRL_CLOSE`
+/// must not skip the repaint ladder (AGENTS §3.1).
+macro_rules! probe {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
 
 /// How long `attach_surface` waits for the first decodable frame.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -180,8 +192,8 @@ impl MediaEngineBackend {
         match unsafe { engine.SetMuted(true) } {
             Ok(()) => Ok(engine),
             Err(err) => {
-                // SAFETY: created above; shut down before releasing it.
-                let _ = unsafe { engine.Shutdown() };
+                // SAFETY: created above; released via the guarded helper.
+                shutdown_or_release(engine, hwnd);
                 Err(at("SetMuted", err))
             }
         }
@@ -225,9 +237,9 @@ impl MediaEngineBackend {
     /// shut down first: reattach recreates it (design-m2 §4).
     fn start_on(&mut self, hwnd: isize) -> BackendResult<()> {
         if let Some(old) = self.engine.take() {
-            // SAFETY: created by us on this thread; released before a
-            // replacement is created.
-            let _ = unsafe { old.Shutdown() };
+            // `self.hwnd` is still the old engine's window: it is only
+            // updated together with a successful attach below.
+            shutdown_or_release(old, self.hwnd);
         }
         let source = self
             .source
@@ -241,21 +253,49 @@ impl MediaEngineBackend {
                 Ok(())
             }
             Err(err) => {
-                // SAFETY: created above; release it on the failure path so
+                // SAFETY: created above; released via the guarded helper so
                 // MFShutdown never races a live engine.
-                let _ = unsafe { engine.Shutdown() };
+                shutdown_or_release(engine, hwnd);
                 Err(err)
             }
         }
     }
 }
 
+/// Shut the engine down — or release it without `Shutdown()` when its
+/// playback HWND no longer exists.
+///
+/// Measured on build 26200.9711 (`docs/notes-s7-shellrestart.md` R2/R3):
+/// `IMFMediaEngine::Shutdown()` blocks **forever** once the
+/// `MF_MEDIA_ENGINE_PLAYBACK_HWND` window is dead — the shell can destroy
+/// that window before any of our detach paths runs, and the STA render
+/// thread cannot pump messages from inside the blocking call. A plain
+/// `Release` returns promptly and leaves no file lock behind (R4: probes
+/// `m3`/`m4`, reattach reloaded the same file, all gates green).
+/// Every `Shutdown()` call site goes through this helper.
+fn shutdown_or_release(engine: IMFMediaEngine, hwnd: isize) {
+    // SAFETY: pure validity check on a raw handle (Microsoft docs:
+    // IsWindow tolerates stale handles).
+    let alive = unsafe { IsWindow(Some(HWND(hwnd as _))) }.as_bool();
+    probe!("[wd] m1: MediaEngine::Shutdown enter (hwnd={hwnd}, IsWindow={alive})");
+    if alive {
+        // SAFETY: created by us on this thread; releases the playback
+        // window first (design-m2 §3.3).
+        let _ = unsafe { engine.Shutdown() };
+        probe!("[wd] m2: MediaEngine::Shutdown returned");
+    } else {
+        probe!("[wd] m3: hwnd dead - skipping Shutdown, releasing engine");
+        drop(engine);
+        probe!("[wd] m4: engine Release returned");
+    }
+}
+
 impl Drop for MediaEngineBackend {
     fn drop(&mut self) {
         if let Some(engine) = self.engine.take() {
-            // SAFETY: created by us on this thread; the engine must shut
-            // down before MFShutdown (design-m2 §3.3).
-            let _ = unsafe { engine.Shutdown() };
+            // The engine must go before MFShutdown (design-m2 §3.3);
+            // the helper skips a blocking Shutdown() on a dead HWND.
+            shutdown_or_release(engine, self.hwnd);
         }
         // Fields drop next in declaration order: `_mf` (MFShutdown) before
         // `_com` (CoUninitialize).
@@ -361,10 +401,9 @@ impl MediaBackend for MediaEngineBackend {
 
     fn detach_surface(&mut self) -> BackendResult<()> {
         if let Some(engine) = self.engine.take() {
-            // SAFETY: created by us; releases the playback window first
-            // (design-m2 §3.3). Source and desired state survive so a later
-            // `attach_surface` starts over from the file.
-            let _ = unsafe { engine.Shutdown() };
+            // Probes m1–m4 live inside the helper (unbuffered, best-effort):
+            // they name the exact step if this path ever wedges again.
+            shutdown_or_release(engine, self.hwnd);
         }
         self.hwnd = 0;
         Ok(())
