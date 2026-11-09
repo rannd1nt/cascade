@@ -13,8 +13,8 @@ use std::path::Path;
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD,
-    RRF_RT_REG_SZ,
+    HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, RRF_NOEXPAND, RRF_RT_REG_BINARY,
+    RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 
 use crate::wide;
@@ -23,6 +23,11 @@ pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub const STARTUP_APPROVED_KEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 pub const AUTOSTART_VALUE: &str = "Cascade";
+
+/// The per-user environment key (`HKCU\Environment`), where the user `Path`
+/// lives (design-m4 §6.1 step 3: user-level only, never the machine PATH).
+pub const ENVIRONMENT_KEY: &str = "Environment";
+pub const PATH_VALUE: &str = "Path";
 
 /// Read a `REG_SZ` value. Returns `None` when the key or value is absent.
 pub fn read_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
@@ -66,6 +71,52 @@ pub fn read_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
         return None;
     }
     Some(wide::from_wide(&buf))
+}
+
+/// Read a string value **without expanding** it, returning `(kind, text)`.
+///
+/// Used for `HKCU\Environment\Path`, which may be `REG_SZ` or
+/// `REG_EXPAND_SZ`; both the kind and the raw text (`%VAR%` intact) must
+/// survive a read-modify-write so we never rewrite another tool's entries
+/// in expanded form (design-m4 §6.1 step 3).
+pub fn read_string_raw(root: HKEY, subkey: &str, value: &str) -> Option<(u32, String)> {
+    let sub = wide::to_wide(subkey);
+    let val = wide::to_wide(value);
+
+    let mut kind = 0u32;
+    let mut size = 0u32;
+    // SAFETY: size query as in `read_string`; RRF_NOEXPAND keeps `%VAR%`
+    // literal instead of resolving it against the current environment.
+    let rc = unsafe {
+        RegGetValueW(
+            root,
+            sub.as_ptr(),
+            val.as_ptr(),
+            RRF_RT_REG_SZ | RRF_NOEXPAND,
+            &mut kind,
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if rc != ERROR_SUCCESS || size == 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u16; (size as usize).div_ceil(2) + 1];
+    let mut size2 = (buf.len() * 2) as u32;
+    // SAFETY: buffer is large enough for `size2` bytes as reported above.
+    let rc = unsafe {
+        RegGetValueW(
+            root,
+            sub.as_ptr(),
+            val.as_ptr(),
+            RRF_RT_REG_SZ | RRF_NOEXPAND,
+            &mut kind,
+            buf.as_mut_ptr().cast(),
+            &mut size2,
+        )
+    };
+    (rc == ERROR_SUCCESS).then_some((kind, wide::from_wide(&buf)))
 }
 
 /// List the direct subkey names of a key (read-only). A missing or
@@ -192,6 +243,13 @@ fn open_for_write(subkey: &str) -> Result<HKEY, u32> {
 
 /// Write a `REG_SZ` value under `HKEY_CURRENT_USER`.
 pub fn write_string(subkey: &str, value: &str, data: &str) -> Result<(), u32> {
+    write_string_typed(subkey, value, REG_SZ, data)
+}
+
+/// Write a string value under `HKEY_CURRENT_USER` with an explicit kind
+/// (`REG_SZ` or `REG_EXPAND_SZ`), preserving the kind the value already
+/// had (design-m4 §6.1 step 3).
+pub fn write_string_typed(subkey: &str, value: &str, kind: u32, data: &str) -> Result<(), u32> {
     let key = open_for_write(subkey)?;
     let val = wide::to_wide(value);
     let data_w = wide::to_wide(data);
@@ -201,7 +259,7 @@ pub fn write_string(subkey: &str, value: &str, data: &str) -> Result<(), u32> {
             key,
             val.as_ptr(),
             0,
-            REG_SZ,
+            kind,
             data_w.as_ptr().cast(),
             (data_w.len() * 2) as u32,
         )

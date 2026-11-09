@@ -105,6 +105,25 @@ fn stdio_valid() -> bool {
     handle_valid(STD_OUTPUT_HANDLE) && handle_valid(STD_ERROR_HANDLE)
 }
 
+/// `true` when this process has (or can join) a console: valid redirected
+/// handles, the parent's console, or an own console window.
+///
+/// May attach to the parent console as a side effect — joining never creates
+/// a window (see the module docs). Used by the bare-invocation flow
+/// (design-m4 §6.2) *before* [`prepare_stdio`] decides whether to allocate
+/// one, so a double-click is distinguishable from a typed command.
+pub fn have_console() -> bool {
+    if stdio_valid() {
+        return true;
+    }
+    // SAFETY: no arguments are read and no pointers are passed.
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 } {
+        return true;
+    }
+    // SAFETY: takes no arguments; the return value is only compared.
+    unsafe { !GetConsoleWindow().is_null() }
+}
+
 fn handle_valid(id: u32) -> bool {
     // SAFETY: `id` is a constant std-handle identifier; the returned handle
     // is only compared, never dereferenced here.
