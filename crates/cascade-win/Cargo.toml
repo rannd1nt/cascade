@@ -44,4 +44,12 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    # M4 S4 device profile (design-m4 §5.1): `IDXGIOutput6::GetDesc1` is
+    # cfg-gated on Common + Gdi (the desc carries an HMONITOR).
+    "Win32_Graphics_Gdi",
+    # M4 S4 device profile (design-m4 §5.1): hardware-MFT enumeration for the
+    # decode capability (windows-sys ships no MF APIs) + the COM apartment
+    # MFTEnumEx needs on the calling thread.
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
 ] }

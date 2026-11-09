@@ -4,6 +4,7 @@ pub mod config;
 pub mod console;
 pub mod control;
 pub mod daemon;
+pub mod device;
 pub mod doctor;
 pub mod dpi;
 pub mod host;

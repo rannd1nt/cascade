@@ -6,6 +6,7 @@ use std::path::Path;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+pub mod device;
 pub mod ipc;
 pub mod library;
 pub mod rule_engine;

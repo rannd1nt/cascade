@@ -10,10 +10,11 @@
 
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+    RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD,
+    RRF_RT_REG_SZ,
 };
 
 use crate::wide;
@@ -65,6 +66,53 @@ pub fn read_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
         return None;
     }
     Some(wide::from_wide(&buf))
+}
+
+/// List the direct subkey names of a key (read-only). A missing or
+/// unreadable key yields an empty list instead of an error — used by
+/// `device::collect` to walk the display driver class key.
+pub fn enum_subkeys(root: HKEY, subkey: &str) -> Vec<String> {
+    let sub = wide::to_wide(subkey);
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: read-only open; `key` is closed on every return path below.
+    let rc = unsafe { RegOpenKeyExW(root, sub.as_ptr(), 0, KEY_READ, &mut key) };
+    if rc != ERROR_SUCCESS {
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    let mut index = 0u32;
+    loop {
+        // Registry key names are capped at 255 chars; +1 for the NUL.
+        let mut buf = vec![0u16; 257];
+        let mut length = (buf.len() - 1) as u32;
+        // SAFETY: `key` is open; the buffer/length pair describes itself.
+        // Any non-success (including a too-long name or access denied on
+        // one subkey) ends the walk instead of spinning.
+        let rc = unsafe {
+            RegEnumKeyExW(
+                key,
+                index,
+                buf.as_mut_ptr(),
+                &mut length,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if rc != ERROR_SUCCESS {
+            break;
+        }
+        names.push(wide::from_wide(&buf[..length as usize]));
+        index += 1;
+    }
+    // SAFETY: handle came from `RegOpenKeyExW` above and is no longer used.
+    unsafe { RegCloseKey(key) };
+    names
 }
 
 /// Read a `REG_DWORD` value.
