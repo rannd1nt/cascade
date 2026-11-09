@@ -259,16 +259,29 @@ fn attach(
 /// `None` is not fatal: the daemon stays alive and retries on the next tick.
 fn reattach(monitors: &[MonitorInfo], opts: &DaemonOptions) -> Option<(ShellSurface, Host)> {
     let started = Instant::now();
+    let mut attempt = 0;
     while started.elapsed() < RECOVERY_WINDOW {
+        attempt += 1;
+        derr!(
+            "[wd] p12: reattach attempt {attempt} (elapsed {:?})",
+            started.elapsed()
+        );
         match shell::discover(Duration::from_millis(750)) {
-            Ok(surface) => match attach(surface, monitors, opts) {
-                Ok(host) => return Some((surface, host)),
-                Err(err) => derr!("reattach: {err}"),
-            },
+            Ok(surface) => {
+                derr!("[wd] p13: discover ok, attaching");
+                match attach(surface, monitors, opts) {
+                    Ok(host) => {
+                        derr!("[wd] p14: attach ok");
+                        return Some((surface, host));
+                    }
+                    Err(err) => derr!("reattach: {err}"),
+                }
+            }
             Err(err) => derr!("reattach: {err}"),
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    derr!("[wd] p15: RECOVERY_WINDOW exhausted, returning None");
     None
 }
 
@@ -411,10 +424,18 @@ fn watchdog_tick(
         return true;
     }
     derr!("watchdog: host window is no longer healthy; repairing");
+    // `[wd]` probes: every silent step of this repair path carries one, so a
+    // wedge stops on the exact step instead of between two log lines. The
+    // write is unbuffered (see `derr!`) and therefore on disk before a hang.
+    derr!("[wd] p1: entering surface_is_alive/restack");
+    let alive_before = shell::surface_is_alive(surface);
+    derr!("[wd] p2: surface_is_alive={alive_before}");
 
     // Cheap repair first: another window may simply have been raised above us.
-    if shell::surface_is_alive(surface) {
+    if alive_before {
+        derr!("[wd] p3: restacking");
         host.restack();
+        derr!("[wd] p4: restack returned, healthy={}", host.is_healthy());
         if host.is_healthy() {
             dlog!("watchdog: z-order restored");
             return true;
@@ -423,16 +444,25 @@ fn watchdog_tick(
 
     // Detach backend before destroying host windows so engine Shutdown()
     // runs while its playback HWND is still alive (design-m2 §3.3).
+    derr!("[wd] p5: before backend.detach_surface()");
     if let Err(err) = backend.detach_surface() {
         derr!("watchdog: backend detach failed: {err}");
     }
+    derr!("[wd] p6: backend.detach_surface() returned");
 
+    derr!("[wd] p7: before host.detach()");
     host.detach();
+    derr!("[wd] p8: host.detach() returned");
     if shell::surface_is_alive(surface) {
+        derr!("[wd] p9: before repaint ladder");
         let report = repaint::ladder(surface, snapshot, 1);
+        derr!("[wd] p10: repaint ladder returned");
         print_repaint("watchdog", &report);
+    } else {
+        derr!("[wd] p9: surface dead, repaint skipped");
     }
 
+    derr!("[wd] p11: before reattach()");
     match reattach(monitors, opts) {
         Some((new_surface, new_host)) => {
             *surface = new_surface;

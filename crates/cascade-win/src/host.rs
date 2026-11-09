@@ -25,8 +25,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     GWLP_USERDATA, GWL_STYLE, HWND_BOTTOM, HWND_TOP, IDC_ARROW, LWA_ALPHA, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE,
-    WM_ENDSESSION, WM_ERASEBKGND, WM_NCDESTROY, WM_PAINT, WM_QUERYENDSESSION, WNDCLASSEXW,
-    WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_NCDESTROY, WM_PAINT, WM_QUERYENDSESSION,
+    WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::monitor::MonitorInfo;
@@ -283,6 +283,13 @@ unsafe extern "system" fn host_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // `[wd]` probes (M4 S7 diagnosis): does the shell's kill of our parent
+    // reach this wndproc as WM_DESTROY/WM_NCDESTROY? The render loop pumps
+    // every wake (daemon.rs message drain), so "no line here" means the
+    // message was never sent, not that it was never dispatched. Unbuffered.
+    if msg == WM_DESTROY || msg == WM_NCDESTROY {
+        crate::derr!("[wd] wndproc: msg=0x{msg:08X} hwnd=0x{:X}", hwnd as usize);
+    }
     match msg {
         WM_ERASEBKGND => {
             // SAFETY: wParam carries the device context for this message.
