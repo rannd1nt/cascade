@@ -22,16 +22,23 @@ use cascade_core::library::{dedupe_key, LibraryItem};
 use cascade_core::rule_engine::{BatteryAction, PowerProfile};
 use cascade_core::MediaBackend;
 use cascade_media::{MediaEngineBackend, SourceReaderBackend};
-use cascade_win::{console, control, daemon, doctor, dpi, host, ipc, registry, state};
+use cascade_win::{console, control, daemon, doctor, dpi, host, install, ipc, registry, state};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // First: every path below may print.
-    console::prepare_stdio(is_daemon_role(&args));
     dpi::set_per_monitor_v2();
-    match dispatch(&args) {
+    // The bare form decides its own stdio strategy *after* the install
+    // prompt decision (design-m4 §6.2); every other role prepares stdio
+    // first — every path below may print.
+    let result = if args.is_empty() {
+        bare_main()
+    } else {
+        console::prepare_stdio(is_daemon_role(&args));
+        dispatch(&args)
+    };
+    match result {
         Ok(code) => code,
         Err(message) => {
             eprintln!("cascade: {message}");
@@ -40,8 +47,74 @@ fn main() -> ExitCode {
     }
 }
 
-/// `run`, `--autostart`, and the bare form start the long-lived daemon;
-/// everything else is a one-shot CLI command that must print.
+/// What a bare `cascade` (no arguments) should do (design-m4 §6.2, D5).
+/// Pure so the decision is unit-testable without a window station.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BareAction {
+    /// Internal respawn child of a bare-started daemon: run, stay silent.
+    RespawnRun,
+    /// Not installed: ask before installing (double-click or typed).
+    PromptInstall,
+    /// Installed and a console exists (typed command): run the engine.
+    Run,
+    /// Installed but double-clicked: usage only, never start unprompted.
+    Usage,
+}
+
+fn bare_action(installed: bool, have_console: bool, respawn: bool) -> BareAction {
+    if respawn {
+        BareAction::RespawnRun
+    } else if !installed {
+        BareAction::PromptInstall
+    } else if have_console {
+        BareAction::Run
+    } else {
+        BareAction::Usage
+    }
+}
+
+/// The bare-invocation flow. Unlike every other role this one may show a
+/// dialog *before* stdio exists — allocating a console first would flash a
+/// window next to the prompt (design-m4 §6.2).
+fn bare_main() -> Result<ExitCode, String> {
+    let respawn = std::env::var_os("CASCADE_RESPAWN").is_some();
+    let action = bare_action(
+        install::is_installed_here(),
+        console::have_console(),
+        respawn,
+    );
+    match action {
+        // The internal respawn keeps the silent daemon strategy (M1-F:
+        // never allocate a console for the long-lived role).
+        BareAction::RespawnRun => {
+            console::prepare_stdio(true);
+            cmd_run(&[])
+        }
+        BareAction::Run => {
+            console::prepare_stdio(false);
+            cmd_run(&[])
+        }
+        BareAction::Usage => {
+            console::prepare_stdio(false);
+            print_help();
+            Ok(ExitCode::SUCCESS)
+        }
+        BareAction::PromptInstall => {
+            if install::confirm_install() {
+                console::prepare_stdio(false);
+                cmd_install(&[])
+            } else {
+                console::prepare_stdio(false);
+                print_help();
+                Ok(ExitCode::SUCCESS)
+            }
+        }
+    }
+}
+
+/// `run` and `--autostart` start the long-lived daemon; everything else is
+/// a one-shot CLI command that must print. The bare form is decided in
+/// [`bare_main`] before this is reached.
 fn is_daemon_role(args: &[String]) -> bool {
     matches!(
         args.first().map(String::as_str),
@@ -67,6 +140,8 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Some("library") => cmd_library(&args[1..]),
         Some("assess") => cmd_assess(&args[1..]),
         Some("autostart") => cmd_autostart(&args[1..]),
+        Some("install") => cmd_install(&args[1..]),
+        Some("uninstall") => cmd_uninstall(&args[1..]),
         Some("version") | Some("--version") | Some("-V") => {
             println!("cascade {VERSION}");
             Ok(ExitCode::SUCCESS)
@@ -288,6 +363,45 @@ fn cmd_doctor() -> Result<ExitCode, String> {
     let report = doctor::collect(VERSION);
     report.print();
     Ok(ExitCode::SUCCESS)
+}
+
+/// `cascade install` — copy this exe to `%LOCALAPPDATA%\Cascade`, generate
+/// the `cascade.cmd` shim, update the user PATH, enable autostart, and
+/// start the engine (design-m4 §6.1). Runs from wherever the exe is.
+fn cmd_install(args: &[String]) -> Result<ExitCode, String> {
+    if !args.is_empty() {
+        return Err(format!(
+            "install takes no arguments (got: {})",
+            args.join(" ")
+        ));
+    }
+    let source = std::env::current_exe().map_err(|err| format!("install: {err}"))?;
+    install::install_from(&source)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cascade uninstall [--purge]` — reverse the install (design-m4 §6.1).
+/// Without `--purge`, `library.json` and `state.json` are kept.
+fn cmd_uninstall(args: &[String]) -> Result<ExitCode, String> {
+    let purge = uninstall_options(args)?;
+    install::uninstall(purge)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Parse `uninstall` options. Pure so the flag handling is unit-testable.
+fn uninstall_options(args: &[String]) -> Result<bool, String> {
+    let mut purge = false;
+    for arg in args {
+        match arg.as_str() {
+            "--purge" => purge = true,
+            other => {
+                return Err(format!(
+                    "uninstall: unknown option {other} (expected --purge)"
+                ))
+            }
+        }
+    }
+    Ok(purge)
 }
 
 fn cmd_signal(message: u32, label: &str) -> Result<ExitCode, String> {
@@ -1177,6 +1291,10 @@ fn print_help() {
     println!("                                        no file: device + recommendation;");
     println!("                                        with a file: + its warnings");
     println!("  cascade autostart on|off|status");
+    println!(
+        "  cascade install                    copy this exe to %LOCALAPPDATA%\\Cascade + PATH"
+    );
+    println!("  cascade uninstall [--purge]        remove the install (--purge also drops state)");
     println!("  cascade ui");
     println!();
     println!("  run is the default. --autostart is accepted for the Run key.");
@@ -1202,6 +1320,27 @@ mod tests {
         assert!(!is_daemon_role(&args(&["--repaint", "2"])));
         assert!(!is_daemon_role(&args(&["--color", "FF0000"])));
         assert!(!is_daemon_role(&args(&["--video", "clip.mp4"])));
+    }
+
+    #[test]
+    fn bare_action_follows_the_d5_flow() {
+        // Respawn wins: the internal child must never hit the prompt.
+        assert_eq!(bare_action(true, true, true), BareAction::RespawnRun);
+        assert_eq!(bare_action(false, false, true), BareAction::RespawnRun);
+        // Not installed: always the Yes/No prompt (D5), console or not.
+        assert_eq!(bare_action(false, true, false), BareAction::PromptInstall);
+        assert_eq!(bare_action(false, false, false), BareAction::PromptInstall);
+        // Installed: typed command runs, double-click shows usage only.
+        assert_eq!(bare_action(true, true, false), BareAction::Run);
+        assert_eq!(bare_action(true, false, false), BareAction::Usage);
+    }
+
+    #[test]
+    fn uninstall_options_only_accept_purge() {
+        assert_eq!(uninstall_options(&[]), Ok(false));
+        assert_eq!(uninstall_options(&args(&["--purge"])), Ok(true));
+        assert!(uninstall_options(&args(&["--nope"])).is_err());
+        assert!(uninstall_options(&args(&["--purge", "--nope"])).is_err());
     }
 
     #[test]
