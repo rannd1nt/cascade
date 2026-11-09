@@ -7,13 +7,14 @@ after a reboot, and never touches your files.
 
 No WebView2. No Electron. No bundled mpv/ffmpeg. One small executable.
 
-> **Status (2026-11-08):** M0–M1 complete (all gates A–F measured, `docs/reliability.md`
+> **Status (2026-11-09):** M0–M1 complete (all gates A–F measured, `docs/reliability.md`
 > §11); M2 native player shipping — hardware decode + quality rows re-measured on the
 > current build (`docs/benchmark-m2.md` §11); M3 shipped for session-lock only, the
 > remaining pause collectors are designed in `docs/design-m3b.md`; **M4 (IPC + CLI +
-> library) in progress — S0–S3 + the restart-on-switch slice done, next S3b → S4**
+> library + assessment + install) in progress — S0–S6 done, next S7**
 > (`docs/design-m4.md` §8). The daemon plays H.264 behind the icons, is fully
-> controllable over a named pipe, and every exit path restores the desktop.
+> controllable over a named pipe, `cascade install` puts `cascade` on your PATH,
+> and every exit path restores the desktop.
 
 ---
 
@@ -109,6 +110,15 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
   PowerShell to wait) or `cmd /c cascade status`. After `cascade install` a generated
   `cascade.cmd` shim makes plain `cascade ...` calls synchronous; the measurements are
   in `docs/design-m4.md` §6.4.
+- **Redirected output through cmd/PowerShell comes out empty — exit codes still
+  work.** When `cmd.exe` or Windows PowerShell starts `cascade ...` with its
+  output redirected (`cascade --help > out.txt`, `cascade --help | findstr ...`),
+  the GUI child's text lands on the parent's hidden console instead of the
+  redirect and is lost (measured, Windows 11 build 26200.9711; every exit code
+  arrives, e.g. the HEVC refusal's `2`). Printing on a real interactive console
+  is unaffected. To capture text, start the exe directly with a redirect you
+  own (`Start-Process -RedirectStandardOutput ...`), which is what the test
+  harness does. Details in `docs/design-m4.md` §6.4.
 
 ## Build (from WSL, no Windows toolchain required)
 
@@ -134,9 +144,17 @@ Run the resulting `.exe` from Windows. Release artifacts are built by GitHub Act
 
 ## Uninstall
 
-1. Quit Cascade (tray → Quit, or `cascade quit`).
-2. `cascade autostart off`.
-3. Delete the executable and `%APPDATA%\Cascade` / `%LOCALAPPDATA%\Cascade`.
+```
+cascade uninstall [--purge]
+```
+
+One command reverses every install step: it stops the engine, turns autostart
+off, removes the `bin` shim directory from your user PATH, deletes the shim and
+the installed copy (if the copy is the running image, a small helper in `%TEMP%`
+finishes the delete right after it exits), and removes Cascade's own files from
+`%LOCALAPPDATA%\Cascade`. `library.json` and `state.json` are kept unless you
+pass `--purge`. Other files in that folder (your `measurements\` logs, for
+example) are left alone.
 
 Your videos are untouched — they were never copied or modified.
 
