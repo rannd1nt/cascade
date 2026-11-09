@@ -14,13 +14,16 @@ use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+use cascade_core::assess::{assess, recommend, Assessment};
+use cascade_core::device::{DeviceProfile, MonitorProfile};
 use cascade_core::ipc::{
-    no_data, LibraryAddResult, LibraryItemsData, LibraryPruneResult, LibraryRef, RejectedPath,
-    Response, Settings, VideoSize,
+    no_data, AssessReport, DeviceSummary, ItemAssessment, LibraryAddResult, LibraryItemsData,
+    LibraryPruneResult, LibraryRef, MonitorSummary, RejectedPath, Response, SetReport, Settings,
+    VideoSize,
 };
 use cascade_core::library::{Library, LibraryItem, VideoMetadata};
 use cascade_core::rule_engine::{BatteryAction, RuleEngine, SessionState};
-use cascade_core::{BackendResult, HostSurface, MediaBackend, MonitorId, PlaybackOptions};
+use cascade_core::{BackendResult, Fit, HostSurface, MediaBackend, MonitorId, PlaybackOptions};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{
@@ -912,17 +915,200 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
                 )),
             }
         }
+        Command::Assess { id, path, monitor } => {
+            // Read-only diagnosis (design-m4 §3/§5): collect the device
+            // fresh (D13 — no cached profile can go stale), resolve the
+            // descriptor probe-once, run the pure metric engine. An
+            // `error` severity here is a diagnosis, not a refusal.
+            let device = crate::device::collect();
+            let target = match pick_monitor(&device, monitor.as_deref()) {
+                Ok(target) => target.clone(),
+                Err(message) => {
+                    pending.responses.push(Response::err(
+                        id,
+                        cascade_core::ipc::ErrorCode::NotFound,
+                        message,
+                    ));
+                    return;
+                }
+            };
+            let summary = device_summary(&device);
+            let report = match path {
+                None => AssessReport {
+                    monitor: target.id.clone(),
+                    device: summary,
+                    recommendation: recommend(&target),
+                    video: None,
+                    warnings: Vec::new(),
+                },
+                Some(path) => {
+                    if !Path::new(&path).is_file() {
+                        pending.responses.push(Response::err(
+                            id,
+                            cascade_core::ipc::ErrorCode::FileMissing,
+                            format!("video file not found: {path}"),
+                        ));
+                        return;
+                    }
+                    let (meta, refreshed) = match descriptor_for(ctx, &path) {
+                        Ok(pair) => pair,
+                        Err(reason) => {
+                            pending.responses.push(Response::err(
+                                id,
+                                cascade_core::ipc::ErrorCode::UnsupportedCodec,
+                                format!("cannot assess {path}: {reason}"),
+                            ));
+                            return;
+                        }
+                    };
+                    if refreshed {
+                        persist_library(ctx);
+                    }
+                    let Assessment {
+                        warnings,
+                        recommendation,
+                    } = assess(&meta, &device, &target, Fit::Contain);
+                    AssessReport {
+                        monitor: target.id.clone(),
+                        device: summary,
+                        recommendation,
+                        video: Some(meta),
+                        warnings,
+                    }
+                }
+            };
+            match serde_json::to_value(report) {
+                Ok(value) => pending.responses.push(Response::ok(id, value)),
+                Err(err) => pending.responses.push(Response::err(
+                    id,
+                    cascade_core::ipc::ErrorCode::Internal,
+                    format!("could not build the assess report: {err}"),
+                )),
+            }
+        }
     }
+}
+
+/// The D13 staleness proof for one file: modification time in Unix
+/// seconds and byte size. Either side can fail to read (unreadable
+/// metadata, pre-epoch mtime) — `None` on that side means "cannot prove
+/// freshness", and [`LibraryItem::proof_matches`] then treats the entry
+/// as stale instead of guessing.
+fn file_proof(path: &Path) -> (Option<u64>, Option<u64>) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return (None, None);
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs());
+    (mtime, Some(meta.len()))
+}
+
+/// D13: the descriptor for a path — reuse the library's stored metadata
+/// while its `mtime`+`size` proof still matches the file on disk, else
+/// probe the container (the SourceReader dies inside that call; plain
+/// data comes back) and refresh the stored entry so the new proof and
+/// metadata persist across the next restart.
+///
+/// Returns the descriptor plus whether an entry was refreshed — the
+/// caller persists the library only then. Never a load, never a retained
+/// MF object (D13 leak rules: the 2026-11-08 ~50 MB/load leak stays
+/// closed, design-m4 §8.3).
+fn descriptor_for(ctx: &mut Loop, path: &str) -> Result<(VideoMetadata, bool), String> {
+    let (mtime, size) = file_proof(Path::new(path));
+    if let Some(entry) = ctx.library.find_by_path(path) {
+        if entry.proof_matches(mtime, size) {
+            return Ok((entry.metadata(), false));
+        }
+    }
+    let meta = (ctx.probe)(Path::new(path))?;
+    let key = cascade_core::library::dedupe_key(path);
+    let mut refreshed = false;
+    if let Some(entry) = ctx
+        .library
+        .items
+        .iter_mut()
+        .find(|item| cascade_core::library::dedupe_key(&item.path) == key)
+    {
+        let mut fresh = LibraryItem::new(
+            entry.id.clone(),
+            entry.path.clone(),
+            meta.clone(),
+            entry.added_at,
+        );
+        if let (Some(mtime), Some(size)) = (mtime, size) {
+            fresh = fresh.with_proof(mtime, size);
+        }
+        *entry = fresh;
+        refreshed = true;
+    }
+    Ok((meta, refreshed))
+}
+
+/// The device facts an `assess` response carries (`ipc.md` §3).
+fn device_summary(device: &DeviceProfile) -> DeviceSummary {
+    DeviceSummary {
+        gpu_decode: device
+            .decode
+            .as_ref()
+            .map(|decode| decode.gpu_codecs.clone())
+            .unwrap_or_default(),
+        ram_total_mb: device.ram.as_ref().map(|ram| ram.total_mb),
+        monitors: device
+            .monitors
+            .iter()
+            .map(|monitor| MonitorSummary {
+                id: monitor.id.clone(),
+                width: monitor.rect.w,
+                height: monitor.rect.h,
+                refresh_hz: monitor.refresh_hz,
+                hdr: monitor.hdr,
+                primary: monitor.primary,
+            })
+            .collect(),
+    }
+}
+
+/// The monitor an assessment targets: the requested id, else the primary,
+/// else the first row. A named monitor that does not exist gets the same
+/// `not_found` wording `set` uses (design-m4 §5.4: assess per monitor).
+fn pick_monitor<'a>(
+    device: &'a DeviceProfile,
+    requested: Option<&str>,
+) -> Result<&'a MonitorProfile, String> {
+    if let Some(id) = requested {
+        return device
+            .monitors
+            .iter()
+            .find(|monitor| monitor.id == id)
+            .ok_or_else(|| format!("no monitor {id}; run `cascade status` to list them"));
+    }
+    device
+        .monitors
+        .iter()
+        .find(|monitor| monitor.primary)
+        .or_else(|| device.monitors.first())
+        .ok_or_else(|| "no display is attached to this session".to_string())
 }
 
 /// `library.add` (design-m4 §4): canonicalise each path, check it is a
 /// file, probe its metadata, dedupe by canonical path. Rejections are
 /// per-path — one bad file never fails the batch, and nothing is ever
 /// copied or modified (AGENTS §3.3).
+///
+/// D13 probe-once: an already-stored entry whose `mtime`+`size` proof
+/// still matches is reused without touching Media Foundation at all; a
+/// replaced file at the same path is re-probed here. Every accepted item
+/// also gets its assessment (step 5 of design-m4 §5.3) so the M5 badge
+/// data exists from the moment the item enters the library — errors in
+/// it never block an add (the library is paths only).
 fn library_add(ctx: &mut Loop, paths: Vec<String>) -> LibraryAddResult {
     let mut result = LibraryAddResult {
         added: Vec::new(),
         rejected: Vec::new(),
+        assessments: Vec::new(),
     };
     let seed = clock_seed();
     for (index, raw) in paths.into_iter().enumerate() {
@@ -946,18 +1132,30 @@ fn library_add(ctx: &mut Loop, paths: Vec<String>) -> LibraryAddResult {
             continue;
         }
         let display = cascade_core::library::display_path(&canonical.to_string_lossy());
-        let meta = match (ctx.probe)(Path::new(&canonical)) {
-            Ok(meta) => meta,
-            Err(reason) => {
-                result.rejected.push(RejectedPath {
-                    path: display,
-                    reason,
-                });
-                continue;
-            }
+        let (mtime, size) = file_proof(&canonical);
+        let cached = ctx
+            .library
+            .find_by_path(&display)
+            .filter(|entry| entry.proof_matches(mtime, size))
+            .map(LibraryItem::metadata);
+        let meta = match cached {
+            Some(meta) => meta,
+            None => match (ctx.probe)(Path::new(&canonical)) {
+                Ok(meta) => meta,
+                Err(reason) => {
+                    result.rejected.push(RejectedPath {
+                        path: display,
+                        reason,
+                    });
+                    continue;
+                }
+            },
         };
         let id = ctx.library.generate_id(seed.wrapping_add(index as u64));
-        let item = LibraryItem::new(id, display, meta, clock_seed());
+        let mut item = LibraryItem::new(id, display, meta, clock_seed());
+        if let (Some(mtime), Some(size)) = (mtime, size) {
+            item = item.with_proof(mtime, size);
+        }
         // `Added` and `Updated` (a re-add refreshes metadata) both land in
         // `added` — the existing entry is what the caller gets back.
         let item = match ctx.library.add(item) {
@@ -965,6 +1163,29 @@ fn library_add(ctx: &mut Loop, paths: Vec<String>) -> LibraryAddResult {
             | cascade_core::library::AddOutcome::Updated(item) => item,
         };
         result.added.push(item);
+    }
+    // One device collection per batch, only when something got in: the
+    // primary monitor is the badge's default target (the GUI passes the
+    // assigned one later, design-m4 §5.4).
+    if !result.added.is_empty() {
+        let device = crate::device::collect();
+        if let Ok(target) = pick_monitor(&device, None) {
+            let target = target.clone();
+            let entries: Vec<(String, String, VideoMetadata)> = result
+                .added
+                .iter()
+                .map(|item| (item.id.clone(), item.path.clone(), item.metadata()))
+                .collect();
+            for (id, path, meta) in entries {
+                let assessment = assess(&meta, &device, &target, Fit::Contain);
+                result.assessments.push(ItemAssessment {
+                    id,
+                    path,
+                    warnings: assessment.warnings,
+                    recommendation: assessment.recommendation,
+                });
+            }
+        }
     }
     result
 }
@@ -1054,6 +1275,52 @@ fn set_wallpaper(
         ));
         return;
     }
+    // 2b. S5 (design-m4 §5.3): probe — staleness-aware via the library's
+    //     `mtime`+`size` proof (D13), data only, never a load — and assess
+    //     BEFORE the response is built: a different file restarts this
+    //     process right after the client has the answer, so the warnings
+    //     must already be in it. An `error` (codec policy) rejects here;
+    //     `warn`/`info` print honestly and the set still applies.
+    let mut report = SetReport {
+        video: None,
+        warnings: Vec::new(),
+        recommendation: None,
+    };
+    let device = crate::device::collect();
+    if let Ok(target) = pick_monitor(&device, monitor.as_deref()) {
+        let target = target.clone();
+        match descriptor_for(ctx, &path) {
+            Ok((meta, refreshed)) => {
+                if refreshed {
+                    persist_library(ctx);
+                }
+                let assessment = assess(&meta, &device, &target, Fit::Contain);
+                if let Some(error) = assessment.first_error() {
+                    pending.responses.push(Response::err(
+                        id,
+                        cascade_core::ipc::ErrorCode::UnsupportedCodec,
+                        format!("{} — {}", error.detail, error.fix),
+                    ));
+                    return;
+                }
+                report.video = Some(meta);
+                report.warnings = assessment.warnings;
+                report.recommendation = Some(assessment.recommendation);
+            }
+            Err(reason) => {
+                pending.responses.push(Response::err(
+                    id,
+                    cascade_core::ipc::ErrorCode::UnsupportedCodec,
+                    format!("cannot play {path}: {reason}"),
+                ));
+                return;
+            }
+        }
+    } else {
+        // No monitor row to assess against — apply the video without
+        // claims rather than refuse it (never invent a measurement).
+        dlog!("set: no display profile; skipping the assessment");
+    }
     // 3. Skip / restart / load decision (design-m2 §4). The same file
     //    already playing on the very window: a pure no-op — no load, no
     //    restart, no growth. Anything else once this process has loaded:
@@ -1078,7 +1345,7 @@ fn set_wallpaper(
                     derr!("state: {err}");
                 }
             }
-            pending.responses.push(Response::ok(id, no_data()));
+            push_set_ok(pending, id, report);
             return;
         }
         SetAction::Restart => {
@@ -1091,7 +1358,14 @@ fn set_wallpaper(
             if let Err(err) = ctx.store.save(ctx.state) {
                 derr!("state: {err}");
             }
-            let mut response = Response::ok(id, no_data());
+            let value = match serde_json::to_value(&report) {
+                Ok(value) => value,
+                Err(err) => {
+                    derr!("set: could not build the set report: {err}");
+                    no_data()
+                }
+            };
+            let mut response = Response::ok(id, value);
             response.flush_after = true;
             pending.responses.push(response);
             pending.respawn = Some(id);
@@ -1162,7 +1436,21 @@ fn set_wallpaper(
         ctx.flags,
         control::session_locked(),
     );
-    pending.responses.push(Response::ok(id, no_data()));
+    push_set_ok(pending, id, report);
+}
+
+/// The `wallpaper.set` success payload (S5): the assessment that ran
+/// before the answer. A serialization failure of plain data is logged
+/// and answered with an empty ok — the video is applied by then and an
+/// internal error must not claim otherwise.
+fn push_set_ok(pending: &mut Pending, id: u64, report: SetReport) {
+    match serde_json::to_value(&report) {
+        Ok(value) => pending.responses.push(Response::ok(id, value)),
+        Err(err) => {
+            derr!("set: could not build the set report: {err}");
+            pending.responses.push(Response::ok(id, no_data()));
+        }
+    }
 }
 
 /// `wallpaper.clear`: unload the video and hand the desktop back to the

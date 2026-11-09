@@ -129,6 +129,7 @@ mod tests {
                 codec: "H264".to_string(),
                 profile: None,
                 level: None,
+                hdr: None,
             },
             1_700_000_000,
         )

@@ -21,9 +21,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cascade_core::ipc::{
-    self, encode_line, no_data, AutostartStatus, DecodeError, EnabledData, LibraryAddData,
-    LibraryRef, LibraryRemoveData, MonitorData, Ping, Response, SetData, Settings, SettingsPatch,
-    Status, VideoSize, MAX_LINE_BYTES, PIPE_PREFIX,
+    self, encode_line, no_data, AssessRequest, AutostartStatus, DecodeError, EnabledData,
+    LibraryAddData, LibraryRef, LibraryRemoveData, MonitorData, Ping, Response, SetData, Settings,
+    SettingsPatch, Status, VideoSize, MAX_LINE_BYTES, PIPE_PREFIX,
 };
 use cascade_core::PROTOCOL_VERSION;
 use windows_sys::Win32::Foundation::{
@@ -194,6 +194,14 @@ pub enum Command {
         item_id: String,
         monitor: Option<String>,
     },
+    /// `assess` (S5, design-m4 §5): probe-once when the library's
+    /// `mtime`+`size` proof is stale, run the pure metric engine, answer
+    /// with the report. Read-only — never touches playback.
+    Assess {
+        id: u64,
+        path: Option<String>,
+        monitor: Option<String>,
+    },
     Quit {
         id: u64,
     },
@@ -214,6 +222,7 @@ impl Command {
             | Self::LibraryRemove { id, .. }
             | Self::LibraryPrune { id }
             | Self::SetWallpaperById { id, .. }
+            | Self::Assess { id, .. }
             | Self::Quit { id } => *id,
         }
     }
@@ -587,6 +596,22 @@ fn dispatch_line(
             }
         }
         "library.prune" => forward(channels, latest, Command::LibraryPrune { id: request.id }),
+        "assess" => match serde_json::from_value::<AssessRequest>(request.data.clone()) {
+            Ok(data) => forward(
+                channels,
+                latest,
+                Command::Assess {
+                    id: request.id,
+                    path: data.path,
+                    monitor: data.monitor,
+                },
+            ),
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::BadRequest,
+                format!("assess data: {err}"),
+            ),
+        },
         "settings.set" => {
             match serde_json::from_value::<SettingsPatch>(request.data.clone()) {
                 Ok(patch) => forward(
