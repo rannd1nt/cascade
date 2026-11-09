@@ -282,6 +282,10 @@ pub struct RejectedPath {
 pub struct LibraryAddResult {
     pub added: Vec<crate::library::LibraryItem>,
     pub rejected: Vec<RejectedPath>,
+    /// Per-added-entry assessment (S5, design-m4 §5.3 step 5). Omitted
+    /// while empty so pre-S5 payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assessments: Vec<ItemAssessment>,
 }
 
 /// `library.prune` response: how many entries were dropped because their
@@ -289,6 +293,86 @@ pub struct LibraryAddResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryPruneResult {
     pub removed: u32,
+}
+
+// --- Assessment shapes (ipc.md §3, design-m4 §5, S5) ------------------------
+
+/// `assess` request data: an optional file and an optional target monitor.
+/// Neither = device profile + recommendation for the primary monitor
+/// (design-m4 §3). Read-only; works while nothing is playing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssessRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
+}
+
+/// One monitor row of an `assess` response — the same geometry `status`
+/// prints, plus the refresh/HDR facts the metrics used.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorSummary {
+    pub id: String,
+    pub width: i32,
+    pub height: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_hz: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr: Option<bool>,
+    pub primary: bool,
+}
+
+/// The device facts an `assess` response carries: what the CLI prints
+/// with no file, and what `--json` scripts and the GUI read.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeviceSummary {
+    /// Sorted decode labels from the D12 union (D3D11 GPU profiles ∪
+    /// hardware MFT input types), e.g. `["av01","h264","hevc", …]`.
+    pub gpu_decode: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_total_mb: Option<u64>,
+    pub monitors: Vec<MonitorSummary>,
+}
+
+/// `assess` response (`ipc.md` §3): the selected monitor, the device
+/// facts, the recommendation for that monitor, and — when a file was
+/// named — its descriptor plus the structured warnings. `warnings` is
+/// always present (empty without a file); an `error` severity here is a
+/// diagnosis, not a refusal (`assess` never blocks — only `set` does).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssessReport {
+    pub monitor: String,
+    pub device: DeviceSummary,
+    pub recommendation: crate::assess::Recommendation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<crate::library::VideoMetadata>,
+    #[serde(default)]
+    pub warnings: Vec<crate::assess::Warning>,
+}
+
+/// One added library entry's assessment (design-m4 §5.3 step 5): the badge
+/// data the M5 GUI renders per item, computed at the moment it enters the
+/// library. Additive field on `library.add` — old clients ignore it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ItemAssessment {
+    pub id: String,
+    pub path: String,
+    pub warnings: Vec<crate::assess::Warning>,
+    pub recommendation: crate::assess::Recommendation,
+}
+
+/// `wallpaper.set` success data (additive, design-m4 §5.3): the assessment
+/// that ran **before** the answer went out — `error` severities never
+/// appear here (they were rejected instead). `recommendation` is `None`
+/// only when the device reported no monitor to recommend for.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SetReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<crate::library::VideoMetadata>,
+    #[serde(default)]
+    pub warnings: Vec<crate::assess::Warning>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<crate::assess::Recommendation>,
 }
 
 // --- Status shape (ipc.md §4) ------------------------------------------------
@@ -836,6 +920,7 @@ mod tests {
                 path: "C:\\gone.mp4".to_string(),
                 reason: "file not found".to_string(),
             }],
+            assessments: Vec::new(),
         };
         let line = encode_line(&result).expect("encode");
         assert!(
@@ -843,12 +928,60 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("file not found"), "{line}");
+        // Empty additive fields stay off the wire (pre-S5 payloads are
+        // byte-identical).
+        assert!(!line.contains("assessments"), "{line}");
 
         let items: LibraryItemsData = serde_json::from_str(r#"{"items":[]}"#).expect("list data");
         assert!(items.items.is_empty());
 
         let pruned: LibraryPruneResult = serde_json::from_str(r#"{"removed":3}"#).expect("prune");
         assert_eq!(pruned.removed, 3);
+    }
+
+    /// S5 wire shapes (ipc.md §3): `assess` request/report round-trip,
+    /// and the additive `set`/`add` fields tolerate pre-S5 payloads.
+    #[test]
+    fn assess_shapes_round_trip_and_stay_additive() {
+        use crate::assess::Recommendation;
+
+        // An empty object is a valid `assess` request (device profile).
+        let empty: AssessRequest = serde_json::from_str("{}").expect("empty request");
+        assert_eq!(empty, AssessRequest::default());
+        let request: AssessRequest =
+            serde_json::from_str(r#"{"path":"C:\\a.mp4","monitor":"\\\\.\\DISPLAY1"}"#)
+                .expect("request");
+        assert_eq!(request.path.as_deref(), Some(r"C:\a.mp4"));
+        assert_eq!(request.monitor.as_deref(), Some(r"\\.\DISPLAY1"));
+
+        let report = AssessReport {
+            monitor: r"\\.\DISPLAY1".to_string(),
+            device: DeviceSummary::default(),
+            recommendation: Recommendation {
+                width: 1366,
+                height: 768,
+                note: "exact display resolution".to_string(),
+            },
+            video: None,
+            warnings: Vec::new(),
+        };
+        let line = encode_line(&report).expect("encode");
+        assert!(
+            line.contains("\"monitor\"") && line.contains("\"recommendation\""),
+            "{line}"
+        );
+        assert!(line.contains("\"device\""), "{line}");
+        // Optional keys stay off the wire while unset.
+        assert!(!line.contains("\"video\""), "{line}");
+        let back: AssessReport = serde_json::from_str(&line).expect("decode");
+        assert_eq!(back, report);
+
+        // A pre-S5 `wallpaper.set` success payload decodes with defaults —
+        // an old daemon's `{}` never breaks the new CLI.
+        let legacy: SetReport = serde_json::from_str("{}").expect("legacy set payload");
+        assert!(legacy.warnings.is_empty());
+        assert!(legacy.video.is_none());
+        assert!(legacy.recommendation.is_none());
     }
 
     #[test]

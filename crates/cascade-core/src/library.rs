@@ -34,6 +34,19 @@ pub struct LibraryItem {
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
+    /// HDR transfer function found in the container: `Some(true)` = PQ/HLG,
+    /// `Some(false)` = a known SDR transfer, `None` = attribute absent
+    /// (D13: assessment input, additive field — old files decode without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr: Option<bool>,
+    /// Staleness proof (D13): file modification time in Unix seconds at
+    /// probe time, paired with `size`. Same path + different proof = the
+    /// file was replaced (4K → 1080p) and is re-probed on the next touch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<u64>,
+    /// Staleness proof (D13): file size in bytes at probe time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
     /// Unix seconds when the entry was first added.
     pub added_at: u64,
 }
@@ -57,6 +70,9 @@ pub struct VideoMetadata {
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
+    /// HDR transfer function found in the container (see [`LibraryItem::hdr`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr: Option<bool>,
 }
 
 impl LibraryItem {
@@ -76,7 +92,48 @@ impl LibraryItem {
             codec: meta.codec,
             profile: meta.profile,
             level: meta.level,
+            hdr: meta.hdr,
+            mtime: None,
+            size: None,
             added_at,
+        }
+    }
+
+    /// Attach the file's staleness proof (D13): the `mtime` + `size` the
+    /// probe saw, so the next touch can tell a replaced file at the same
+    /// path from an unchanged one without opening it.
+    #[must_use]
+    pub fn with_proof(mut self, mtime: u64, size: u64) -> Self {
+        self.mtime = Some(mtime);
+        self.size = Some(size);
+        self
+    }
+
+    /// Does the stored proof still describe the file on disk? An entry
+    /// probed before D13 (proof `None` on either side) is always stale —
+    /// re-probe once rather than trust metadata of unknown vintage.
+    pub fn proof_matches(&self, mtime: Option<u64>, size: Option<u64>) -> bool {
+        match (self.mtime, self.size, mtime, size) {
+            (Some(item_mtime), Some(item_size), Some(mtime), Some(size)) => {
+                item_mtime == mtime && item_size == size
+            }
+            _ => false,
+        }
+    }
+
+    /// The stored metadata back in probe shape — what `assess()` consumes
+    /// when the staleness proof still matches (D13: no re-probe needed).
+    pub fn metadata(&self) -> VideoMetadata {
+        VideoMetadata {
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            duration_ms: self.duration_ms,
+            bitrate_bps: self.bitrate_bps,
+            codec: self.codec.clone(),
+            profile: self.profile.clone(),
+            level: self.level.clone(),
+            hdr: self.hdr,
         }
     }
 }
@@ -210,6 +267,9 @@ mod tests {
             codec: "H264".to_string(),
             profile: Some("100".to_string()),
             level: Some("41".to_string()),
+            hdr: Some(false),
+            mtime: None,
+            size: None,
             added_at: 1_700_000_000,
         }
     }
@@ -333,6 +393,11 @@ mod tests {
         ] {
             assert!(text.contains(key), "missing {key} in {text}");
         }
+        // The staleness proof is additive: unset fields are omitted from
+        // the wire (a pre-D13 library document has neither key).
+        assert!(!text.contains("mtime"), "{text}");
+        assert!(!text.contains(r#""size""#), "{text}");
+        assert!(text.contains(r#""hdr""#), "{text}");
         // A file without optional attributes decodes (serde defaults).
         let minimal = r#"{"id":"aa11","path":"C:\\a.mp4","title":"a",
             "width":1,"height":1,"codec":"H264","added_at":0}"#;
@@ -347,5 +412,47 @@ mod tests {
         let back: Library =
             serde_json::from_str(&serde_json::to_string(&library).expect("json")).expect("decode");
         assert_eq!(back, library);
+    }
+
+    /// D13: `mtime` + `size` decide whether a stored descriptor still
+    /// describes the file on disk — the whole re-probe trigger, pure.
+    #[test]
+    fn staleness_proof_matches_only_when_both_numbers_are_the_same() {
+        let proofed = item(r"C:\videos\a.mp4", "a1b2").with_proof(1_700_000_123, 42_424_242);
+        // Identical proof → the cached metadata stands, no re-probe.
+        assert!(proofed.proof_matches(Some(1_700_000_123), Some(42_424_242)));
+        // Same path, replaced content (4K → 1080p): either number moved.
+        assert!(!proofed.proof_matches(Some(1_700_000_999), Some(42_424_242)));
+        assert!(!proofed.proof_matches(Some(1_700_000_123), Some(1)));
+        // Unreadable proof on either side is "stale", never "fresh".
+        assert!(!proofed.proof_matches(None, Some(42_424_242)));
+        assert!(!proofed.proof_matches(Some(1_700_000_123), None));
+        // A pre-D13 entry (no stored proof) re-probes once, then is stable.
+        let legacy = item(r"C:\videos\b.mp4", "c3d4");
+        assert!(!legacy.proof_matches(Some(1), Some(1)));
+    }
+
+    /// The stored entry round-trips back into probe shape for `assess()`
+    /// without touching the file (D13: probe-once).
+    #[test]
+    fn metadata_rebuilds_the_probe_result_from_the_stored_entry() {
+        let mut stored = item(r"C:\videos\a.mp4", "a1b2");
+        stored.hdr = Some(true);
+        let meta = stored.metadata();
+        assert_eq!(meta.width, stored.width);
+        assert_eq!(meta.height, stored.height);
+        assert_eq!(meta.codec, stored.codec);
+        assert_eq!(meta.profile.as_deref(), Some("100"));
+        assert_eq!(meta.hdr, Some(true));
+        // new() carries hdr over; the proof attaches afterwards.
+        let fresh = LibraryItem::new(
+            "ee77".to_string(),
+            r"C:\videos\new.mp4".to_string(),
+            meta,
+            1_800_000_000,
+        )
+        .with_proof(7, 9);
+        assert_eq!(fresh.hdr, Some(true));
+        assert_eq!((fresh.mtime, fresh.size), (Some(7), Some(9)));
     }
 }
