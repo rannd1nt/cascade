@@ -10,11 +10,13 @@ use std::path::Path;
 use cascade_core::library::VideoMetadata;
 use windows::core::PCWSTR;
 use windows::Win32::Media::MediaFoundation::{
-    MFCreateSourceReaderFromURL, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC,
-    MFVideoFormat_MPEG2, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MPEG2_LEVEL,
-    MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_PD_DURATION,
+    MFCreateSourceReaderFromURL, MFShutdown, MFStartup, MFVideoFormat_AV1, MFVideoFormat_H264,
+    MFVideoFormat_HEVC, MFVideoFormat_MPEG2, MFVideoTransFunc_2084, MFVideoTransFunc_HLG,
+    MFSTARTUP_FULL, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MPEG2_LEVEL,
+    MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_PD_DURATION, MF_VERSION,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{VT_I8, VT_UI8};
 
 use crate::source_reader::{
@@ -23,7 +25,42 @@ use crate::source_reader::{
 
 /// Probe one file: existence is checked by the caller (it wants its own
 /// error text), everything else comes from the container's video type.
+///
+/// Self-contained by design (D13): COM and MF are started on the calling
+/// thread and shut down again before returning, so any caller (daemon
+/// main loop, CLI, future GUI) can probe without prior setup — and no MF
+/// or COM state is left behind by the call.
 pub fn probe(path: &Path) -> Result<VideoMetadata, String> {
+    // Same order as `cascade_win::device::decode`: MFT/source-reader MF
+    // calls block or fail without COM + MF started on this thread
+    // (observed 2026-11-07 in the cascade-media probe).
+    let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    // RPC_E_CHANGED_MODE: the thread already has another apartment. Then
+    // this call did not initialize anything, so it must not be uninitialized.
+    let com_owned = com.is_ok();
+    // SAFETY: exact `MF_VERSION`, balancing the MFShutdown below.
+    let mf = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) };
+    if mf.is_err() {
+        if com_owned {
+            // SAFETY: balances the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+        return Err("media foundation is not available".to_string());
+    }
+    let result = probe_container(path);
+    // Shutdown order: MF first, then COM (design-m2 §3.3).
+    let _ = unsafe { MFShutdown() };
+    if com_owned {
+        // SAFETY: balances the successful CoInitializeEx above.
+        unsafe { CoUninitialize() };
+    }
+    result
+}
+
+/// The container read itself. Every MF object created here (the source
+/// reader, its media types) dies inside this call — plain data is what
+/// returns (D13 leak rules: never a retained MF object).
+fn probe_container(path: &Path) -> Result<VideoMetadata, String> {
     let url = file_url(path);
     let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: `wide` is nul-terminated and outlives the call; MF does not
@@ -74,6 +111,13 @@ pub fn probe(path: &Path) -> Result<VideoMetadata, String> {
         .ok()
         .map(|value| value.to_string());
 
+    // HDR detection (M7): PQ (2084) and HLG are the HDR transfer
+    // functions; a present-but-other value is a declared SDR transfer;
+    // an absent attribute stays None — unknown, never guessed.
+    let hdr = unsafe { mt.GetUINT32(&MF_MT_TRANSFER_FUNCTION) }
+        .ok()
+        .map(hdr_from_transfer);
+
     Ok(VideoMetadata {
         width,
         height,
@@ -83,7 +127,13 @@ pub fn probe(path: &Path) -> Result<VideoMetadata, String> {
         codec,
         profile,
         level,
+        hdr,
     })
+}
+
+/// Is this `MF_MT_TRANSFER_FUNCTION` value an HDR transfer (PQ/HLG)?
+fn hdr_from_transfer(value: u32) -> bool {
+    value == MFVideoTransFunc_2084.0 as u32 || value == MFVideoTransFunc_HLG.0 as u32
 }
 
 /// `MF_MT_FRAME_RATE` packs numerator (high dword) over denominator.
@@ -182,6 +232,16 @@ mod tests {
         assert_eq!(codec_name(&vp9), "VP90");
         let odd = windows::core::GUID::from_values(0x0000_0001, 0, 0, [0; 8]);
         assert_eq!(codec_name(&odd), "00000001");
+    }
+
+    #[test]
+    fn hdr_transfer_values_map_to_sdr_or_hdr() {
+        // PQ (2084) and HLG are HDR; every declared SDR transfer is not;
+        // the mapping decides M7's severity on the wire (core assess).
+        assert!(hdr_from_transfer(MFVideoTransFunc_2084.0 as u32));
+        assert!(hdr_from_transfer(MFVideoTransFunc_HLG.0 as u32));
+        assert!(!hdr_from_transfer(5)); // BT.709
+        assert!(!hdr_from_transfer(0)); // Unknown declared as unknown
     }
 
     /// Manual probe of a real file — run by hand, never in CI (no media
