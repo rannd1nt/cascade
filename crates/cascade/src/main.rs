@@ -11,10 +11,12 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use cascade_core::assess::{codec_key, Recommendation, Severity, Warning};
+use cascade_core::device::{level_name, profile_name};
 use cascade_core::ipc::{
-    no_data, AutostartStatus, EnabledData, LibraryAddData, LibraryAddResult, LibraryItemsData,
-    LibraryPruneResult, LibraryRemoveData, MonitorData, PausePatch, SetData, Settings,
-    SettingsPatch,
+    no_data, AssessReport, AssessRequest, AutostartStatus, EnabledData, LibraryAddData,
+    LibraryAddResult, LibraryItemsData, LibraryPruneResult, LibraryRemoveData, MonitorData,
+    PausePatch, SetData, SetReport, Settings, SettingsPatch,
 };
 use cascade_core::library::{dedupe_key, LibraryItem};
 use cascade_core::rule_engine::{BatteryAction, PowerProfile};
@@ -63,6 +65,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Some("quit") => cmd_quit(&args[1..]),
         Some("settings") => cmd_settings(&args[1..]),
         Some("library") => cmd_library(&args[1..]),
+        Some("assess") => cmd_assess(&args[1..]),
         Some("autostart") => cmd_autostart(&args[1..]),
         Some("version") | Some("--version") | Some("-V") => {
             println!("cascade {VERSION}");
@@ -579,8 +582,19 @@ fn cmd_set(args: &[String]) -> Result<ExitCode, String> {
     };
     let payload =
         serde_json::to_value(data).map_err(|err| format!("could not build request: {err}"))?;
-    ipc::request("wallpaper.set", payload).map_err(|err| err.to_string())?;
+    let data = ipc::request("wallpaper.set", payload).map_err(|err| err.to_string())?;
     println!("{label}");
+    // S5 (design-m4 §5.3): the daemon assessed before answering — a
+    // rejection (`error`) already surfaced through the Err above; what
+    // comes back here is the honest print-then-apply part.
+    if let Ok(report) = serde_json::from_value::<SetReport>(data) {
+        print_warnings(&report.warnings);
+        if !report.warnings.is_empty() {
+            if let Some(rec) = &report.recommendation {
+                print_recommendation(rec);
+            }
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -873,6 +887,12 @@ fn library_add(args: &[String]) -> Result<ExitCode, String> {
         .map_err(|err| format!("engine sent an unreadable add result: {err}"))?;
     for item in &result.added {
         println!("added: {} ({})", item.title, item.path);
+        // Badge data computed at the moment the item entered the library
+        // (design-m4 §5.3 step 5) — printed here so the CLI is honest too;
+        // an `error` row never blocks an add (the library is paths only).
+        if let Some(assessment) = result.assessments.iter().find(|a| a.id == item.id) {
+            print_warnings(&assessment.warnings);
+        }
     }
     if !result.rejected.is_empty() {
         let details = result
@@ -967,6 +987,170 @@ fn format_duration(ms: u64) -> String {
     }
 }
 
+/// `cascade assess [<file>] [--monitor <id>] [--json]` (design-m4 §3):
+/// no file → device profile + recommendation for the selected monitor;
+/// with a file → + that file's descriptor and structured warnings.
+/// Read-only, never blocks — an `error` row is a diagnosis (only
+/// `cascade set` refuses). The path is absolutised here: the daemon's
+/// working directory is not the CLI's.
+fn cmd_assess(args: &[String]) -> Result<ExitCode, String> {
+    let mut path: Option<String> = None;
+    let mut monitor: Option<String> = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--monitor" => {
+                if monitor.is_some() {
+                    return Err("--monitor given twice".to_string());
+                }
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--monitor needs a monitor id like \\\\.\\DISPLAY1".to_string()
+                })?;
+                monitor = Some(value.clone());
+                index += 2;
+            }
+            "--json" => {
+                if json {
+                    return Err("--json given twice".to_string());
+                }
+                json = true;
+                index += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option for assess: {other}"));
+            }
+            other => {
+                if path.is_some() {
+                    return Err("assess takes at most one file".to_string());
+                }
+                let absolute = std::path::absolute(other)
+                    .map_err(|err| format!("cannot resolve {other}: {err}"))?;
+                path = Some(absolute.display().to_string());
+                index += 1;
+            }
+        }
+    }
+    let payload = serde_json::to_value(AssessRequest { path, monitor })
+        .map_err(|err| format!("could not build request: {err}"))?;
+    let data = ipc::request("assess", payload).map_err(|err| err.to_string())?;
+    if json {
+        let text = serde_json::to_string_pretty(&data)
+            .map_err(|err| format!("could not print the report: {err}"))?;
+        println!("{text}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let report: AssessReport = serde_json::from_value(data)
+        .map_err(|err| format!("engine sent an unreadable assess report: {err}"))?;
+    print_assess_report(&report);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One structured warning, three lines: measured values, consequence,
+/// fix (design-m4 §5.2 — this text is what the M5 badge shows).
+fn print_warnings(warnings: &[Warning]) {
+    for warning in warnings {
+        println!(
+            "[{}] {}: {}",
+            warning.severity.as_str(),
+            warning.metric.as_str(),
+            warning.detail
+        );
+        println!("         → {}", warning.consequence);
+        println!("         fix: {}", warning.fix);
+    }
+}
+
+fn print_recommendation(rec: &Recommendation) {
+    println!("recommend {}x{} — {}", rec.width, rec.height, rec.note);
+}
+
+/// The readable `assess` report (the `--json` form is the raw payload).
+fn print_assess_report(report: &AssessReport) {
+    let decode = if report.device.gpu_decode.is_empty() {
+        "unknown".to_string()
+    } else {
+        report.device.gpu_decode.join(", ")
+    };
+    let ram = report
+        .device
+        .ram_total_mb
+        .map(|mb| format!("{mb} MB"))
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("device   GPU decode: {decode} · RAM: {ram}");
+    if let Some(monitor) = report
+        .device
+        .monitors
+        .iter()
+        .find(|monitor| monitor.id == report.monitor)
+    {
+        let hz = monitor
+            .refresh_hz
+            .map(|hz| format!(" @ {hz} Hz"))
+            .unwrap_or_default();
+        let transfer = match monitor.hdr {
+            Some(true) => "HDR",
+            Some(false) => "SDR",
+            None => "transfer unknown",
+        };
+        println!(
+            "monitor  {} {}x{}{hz}, {transfer}",
+            monitor.id, monitor.width, monitor.height
+        );
+    }
+    print_recommendation(&report.recommendation);
+    if let Some(video) = &report.video {
+        let key = codec_key(&video.codec);
+        let profile = video
+            .profile
+            .as_deref()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|profile| profile_name(&key, profile))
+            .unwrap_or_else(|| video.codec.clone());
+        let level = video
+            .level
+            .as_deref()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|level| format!(", level {}", level_name(&key, level)))
+            .unwrap_or_default();
+        let fps = video
+            .fps
+            .map(|fps| format!("{fps:.2} fps"))
+            .unwrap_or_else(|| "-".to_string());
+        let bitrate = video
+            .bitrate_bps
+            .map(|bps| format!("{} kbps", bps / 1000))
+            .unwrap_or_else(|| "-".to_string());
+        let transfer = match video.hdr {
+            Some(true) => "HDR",
+            Some(false) => "SDR",
+            None => "transfer unknown",
+        };
+        println!(
+            "video    {}x{} {profile}{level} {fps} {bitrate}, {transfer}",
+            video.width, video.height
+        );
+    }
+    print_warnings(&report.warnings);
+    if report.video.is_none() {
+        return;
+    }
+    let errors = report
+        .warnings
+        .iter()
+        .filter(|warning| warning.severity == Severity::Error)
+        .count();
+    if errors > 0 {
+        println!(
+            "{errors} error(s) — `cascade set` refuses this file (codec policy, architecture.md §6)"
+        );
+    } else if report.warnings.is_empty() {
+        println!("no warnings — this video fits the display and the hardware");
+    } else {
+        println!("{} warning(s)", report.warnings.len());
+    }
+}
+
 fn print_help() {
     println!("cascade {VERSION}");
     println!();
@@ -989,6 +1173,9 @@ fn print_help() {
     println!("  cascade library add <path>...         files are referenced, never copied");
     println!("  cascade library remove <id|path>      remove from library (file untouched)");
     println!("  cascade library prune                 drop entries whose files are gone");
+    println!("  cascade assess [<file>] [--monitor <id>] [--json]");
+    println!("                                        no file: device + recommendation;");
+    println!("                                        with a file: + its warnings");
     println!("  cascade autostart on|off|status");
     println!("  cascade ui");
     println!();
@@ -1257,6 +1444,7 @@ mod tests {
                 codec: "H264".to_string(),
                 profile: None,
                 level: None,
+                hdr: None,
             },
             0,
         )];
