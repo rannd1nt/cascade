@@ -23,7 +23,9 @@ use cascade_core::ipc::{
 };
 use cascade_core::library::{Library, LibraryItem, VideoMetadata};
 use cascade_core::rule_engine::{BatteryAction, RuleEngine, SessionState};
-use cascade_core::{BackendResult, Fit, HostSurface, MediaBackend, MonitorId, PlaybackOptions};
+use cascade_core::{
+    BackendResult, Fit, HostSurface, MediaBackend, MonitorId, PlaybackOptions, PresentationMode,
+};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{
@@ -845,6 +847,7 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
             pending.responses.push(Response::ok(id, no_data()));
         }
         Command::SettingsSet { id, patch } => {
+            let previous_mode = ctx.settings.engine_mode;
             ctx.settings.apply_patch(patch);
             if let Err(err) = config::save(ctx.settings) {
                 // Applied in memory regardless: a read-only profile dir
@@ -861,16 +864,47 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
                 ctx.flags,
                 control::session_locked(),
             );
+            // AGENTS §3.15 + `design-engine-mode.md` §3: a changed
+            // `engine_mode` means the engine must be *built* differently,
+            // and building it is a load pipeline — every load retains ≈50 MB
+            // until process exit (`design-m4.md` §8.3, the bug that made
+            // every `wallpaper.set` restart). So: persist as plain state,
+            // answer the client, then the exit ladder respawns and the child
+            // reads config.toml and builds the engine exactly once, in the
+            // requested mode. No in-process rebuild is ever attempted.
+            let action =
+                engine_mode_action(previous_mode, ctx.settings.engine_mode, ctx.backend.loaded);
             let mut payload = *ctx.settings;
             // Wire edge for this response (design-m4 D10): Run key, not file.
             payload.autostart = registry::autostart_state(&exe_path()).registered;
-            match serde_json::to_value(payload) {
-                Ok(value) => pending.responses.push(Response::ok(id, value)),
-                Err(err) => pending.responses.push(Response::err(
+            let mut response = match serde_json::to_value(payload) {
+                Ok(value) => Response::ok(id, value),
+                Err(err) => Response::err(
                     id,
                     cascade_core::ipc::ErrorCode::Internal,
                     format!("could not build settings: {err}"),
-                )),
+                ),
+            };
+            match action {
+                PresentationModeAction::Restart => {
+                    // The client gets this answer first; the flush ack then
+                    // runs the exit ladder — the same handshake as a
+                    // `wallpaper.set` restart (design-m2 §4).
+                    response.flush_after = true;
+                    dlog!(
+                        "settings: engine_mode → {}; restarting to build the engine in that mode",
+                        ctx.settings.engine_mode.as_str()
+                    );
+                }
+                PresentationModeAction::PersistOnly => dlog!(
+                    "settings: engine_mode → {}; no engine loaded, applied at the next load",
+                    ctx.settings.engine_mode.as_str()
+                ),
+                PresentationModeAction::Keep => {}
+            }
+            pending.responses.push(response);
+            if action == PresentationModeAction::Restart {
+                pending.respawn = Some(id);
             }
         }
         Command::Quit { id } => {
@@ -1279,6 +1313,35 @@ fn set_action(same_path: bool, reusable: bool, session_loads: u32) -> SetAction 
     }
 }
 
+/// What a `settings set` that touched `engine_mode` must do next
+/// (`design-engine-mode.md` §3, AGENTS §3.15: never rebuild an engine
+/// inside a live daemon — a load pipeline retains ≈50 MB until exit,
+/// `design-m4.md` §8.3).
+///
+/// | `Keep`       | value unchanged | nothing happened: no restart, no log |
+/// | `PersistOnly`| changed, no engine loaded | plain state; the next load builds with it |
+/// | `Restart`    | changed while an engine holds the old route | answer, exit ladder, respawn — the child builds the engine once |
+#[derive(Debug, PartialEq, Eq)]
+enum PresentationModeAction {
+    Keep,
+    PersistOnly,
+    Restart,
+}
+
+fn engine_mode_action(
+    previous: PresentationMode,
+    current: PresentationMode,
+    backend_loaded: bool,
+) -> PresentationModeAction {
+    if previous == current {
+        PresentationModeAction::Keep
+    } else if backend_loaded {
+        PresentationModeAction::Restart
+    } else {
+        PresentationModeAction::PersistOnly
+    }
+}
+
 fn set_wallpaper(
     ctx: &mut Loop,
     id: u64,
@@ -1429,8 +1492,16 @@ fn set_wallpaper(
     // 6. Load the new source. A failure keeps the colour (step 4) and
     //    drops the broken path so the next start does not replay it.
     let failure = match ctx.backend.backend.as_mut() {
+        // The requested engine route rides the existing boundary
+        // (`design-engine-mode.md` §4): read here, once, per load.
         Some(backend) => backend
-            .load(Path::new(&path), &PlaybackOptions::default())
+            .load(
+                Path::new(&path),
+                &PlaybackOptions {
+                    engine_mode: ctx.settings.engine_mode,
+                    ..PlaybackOptions::default()
+                },
+            )
             .err()
             .map(|err| err.to_string()),
         None => Some("no media backend is available".to_string()),
@@ -1712,7 +1783,16 @@ pub fn run(
     let assigned = previous.as_ref().and_then(|state| state.monitor.clone());
     if let Some(source) = &video {
         match backend_guard.backend.as_mut() {
-            Some(backend) => match backend.load(source, &PlaybackOptions::default()) {
+            // The startup load carries the persisted route too: the child
+            // of a mode-toggle respawn builds the engine once, in it
+            // (`design-engine-mode.md` §3).
+            Some(backend) => match backend.load(
+                source,
+                &PlaybackOptions {
+                    engine_mode: settings.engine_mode,
+                    ..PlaybackOptions::default()
+                },
+            ) {
                 Ok(()) => {
                     dlog!("  video: {}", source.display());
                     backend_guard.loaded = true;
@@ -2263,6 +2343,50 @@ mod tests {
         assert_eq!(set_action(false, true, 0), SetAction::Load);
         assert_eq!(set_action(false, false, 1), SetAction::Restart);
         assert_eq!(set_action(false, false, 0), SetAction::Load);
+    }
+
+    #[test]
+    fn engine_mode_change_decides_between_keep_persist_and_restart() {
+        // Same value: a no-op, whatever the engine is doing.
+        assert_eq!(
+            engine_mode_action(PresentationMode::Accurate, PresentationMode::Accurate, true),
+            PresentationModeAction::Keep
+        );
+        assert_eq!(
+            engine_mode_action(
+                PresentationMode::Efficient,
+                PresentationMode::Efficient,
+                false
+            ),
+            PresentationModeAction::Keep
+        );
+        // Changed with an engine holding the old route: respawn (AGENTS
+        // §3.15 — never rebuild in-process).
+        assert_eq!(
+            engine_mode_action(
+                PresentationMode::Accurate,
+                PresentationMode::Efficient,
+                true
+            ),
+            PresentationModeAction::Restart
+        );
+        assert_eq!(
+            engine_mode_action(
+                PresentationMode::Efficient,
+                PresentationMode::Accurate,
+                true
+            ),
+            PresentationModeAction::Restart
+        );
+        // Changed with nothing loaded: persist only, no process churn.
+        assert_eq!(
+            engine_mode_action(
+                PresentationMode::Accurate,
+                PresentationMode::Efficient,
+                false
+            ),
+            PresentationModeAction::PersistOnly
+        );
     }
 
     #[test]

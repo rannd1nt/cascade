@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use cascade_core::ipc::Settings;
 use cascade_core::rule_engine::{BatteryAction, PauseSettings, PowerProfile};
+use cascade_core::PresentationMode;
 use serde::{Deserialize, Serialize};
 
 /// `config.toml` on disk. The table layout mirrors the documented example
@@ -36,6 +37,10 @@ pub struct General {
     pub restore_wallpaper_on_exit: bool,
     /// Consumed by the M5 tray.
     pub tray: bool,
+    /// Engine route the child builds at start (`design-engine-mode.md` §2):
+    /// `accurate` (default) or `efficient`. Absent in an older file decodes
+    /// to `accurate`, so upgrading never changes behaviour on its own.
+    pub engine_mode: PresentationMode,
 }
 
 impl Default for General {
@@ -43,6 +48,7 @@ impl Default for General {
         Self {
             restore_wallpaper_on_exit: true,
             tray: true,
+            engine_mode: PresentationMode::Accurate,
         }
     }
 }
@@ -141,6 +147,7 @@ impl Config {
             on_battery: self.power.on_battery.unwrap_or(BatteryAction::Off),
             restore_wallpaper_on_exit: self.general.restore_wallpaper_on_exit,
             tray: self.general.tray,
+            engine_mode: self.general.engine_mode,
             ..Settings::default()
         };
         if preset {
@@ -154,6 +161,7 @@ impl Config {
             general: General {
                 restore_wallpaper_on_exit: settings.restore_wallpaper_on_exit,
                 tray: settings.tray,
+                engine_mode: settings.engine_mode,
             },
             power: Power {
                 profile: settings.power_profile,
@@ -184,6 +192,7 @@ mod tests {
         settings.power_profile = PowerProfile::Quality;
         settings.on_battery = BatteryAction::Continue;
         settings.tray = false;
+        settings.engine_mode = PresentationMode::Efficient;
         write(&path, &settings).expect("write");
         let text = fs::read_to_string(&path).expect("read back");
         let loaded = read(&text);
@@ -218,6 +227,7 @@ mod tests {
             "[pause]",
             "restore_wallpaper_on_exit = true",
             "tray = true",
+            "engine_mode = \"accurate\"",
             "profile = \"off\"",
             "on_battery = \"off\"",
             "fullscreen = true",
@@ -261,5 +271,11 @@ mod tests {
         assert!(loaded.pause.fullscreen, "missing key uses the default");
         assert_eq!(loaded.power_profile, PowerProfile::Off);
         assert!(loaded.restore_wallpaper_on_exit);
+        // A file written before the toggle existed keeps honest colour.
+        assert_eq!(loaded.engine_mode, PresentationMode::Accurate);
+
+        // An explicit engine_mode is read back (design-engine-mode §5).
+        let efficient = read("[general]\nengine_mode = \"efficient\"\n");
+        assert_eq!(efficient.engine_mode, PresentationMode::Efficient);
     }
 }
