@@ -1180,6 +1180,13 @@ impl MediaBackend for SourceReaderBackend {
         Ok(())
     }
 
+    fn set_volume(&mut self, _level: u8) -> BackendResult<()> {
+        // No audio stream exists on this route — every stream but the video
+        // is deselected at load (the `--aid=no` equivalent), so there is no
+        // session to adjust (design-volume §6).
+        Ok(())
+    }
+
     fn stats(&self) -> BackendStats {
         BackendStats {
             // `load` refuses to run without a successful probe, so a

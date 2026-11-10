@@ -163,6 +163,10 @@ pub struct PlaybackOptions {
     /// over the existing win → media boundary so no trait method and no
     /// dependency edge had to be added (AGENTS §4).
     pub engine_mode: PresentationMode,
+    /// Audio level 0–100 for this load (`design-volume.md` §4): `0` = muted
+    /// (default), `1–100` = audible at `level / 100`. Same boundary trick
+    /// as `engine_mode`; runtime changes travel as `MediaBackend::set_volume`.
+    pub volume: u8,
 }
 
 impl Default for PlaybackOptions {
@@ -175,6 +179,7 @@ impl Default for PlaybackOptions {
             max_fps: None,
             power_saver: false,
             engine_mode: PresentationMode::Accurate,
+            volume: 0,
         }
     }
 }
@@ -238,6 +243,10 @@ pub trait MediaBackend {
     fn play(&mut self) -> BackendResult<()>;
     fn pause(&mut self) -> BackendResult<()>;
     fn set_looping(&mut self, on: bool) -> BackendResult<()>;
+    /// Apply an audio level 0–100 to the engine (`design-volume.md` §3) —
+    /// a live property change like `play`/`pause`, never a reload. Backends
+    /// with no audio session implement it as a no-op.
+    fn set_volume(&mut self, level: u8) -> BackendResult<()>;
     fn stats(&self) -> BackendStats;
     fn attach_surface(&mut self, surface: HostSurface) -> BackendResult<()>;
     fn detach_surface(&mut self) -> BackendResult<()>;
@@ -310,6 +319,8 @@ mod tests {
         assert!(!opts.power_saver);
         // Honest colour is the default route (design-engine-mode §2).
         assert_eq!(opts.engine_mode, PresentationMode::Accurate);
+        // Silent by default (design-volume §1).
+        assert_eq!(opts.volume, 0);
     }
 
     #[test]
@@ -382,6 +393,9 @@ mod tests {
                 Ok(())
             }
             fn set_looping(&mut self, _on: bool) -> BackendResult<()> {
+                Ok(())
+            }
+            fn set_volume(&mut self, _level: u8) -> BackendResult<()> {
                 Ok(())
             }
             fn stats(&self) -> BackendStats {

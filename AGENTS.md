@@ -35,11 +35,13 @@ Keep answers and reasoning in the language the user writes in (Indonesian is fin
 ## 2. Scope discipline
 
 In scope for v1: video playback, desktop host, library (paths only), small GUI, tray,
-pause rules, autostart, reliability.
+pause rules, autostart, reliability, the video track's own volume (0–100, default 0 —
+`docs/design-volume.md`).
 
 Do **not** build any of this unless the user explicitly re-scopes:
 
-- HTML/WebView2/JS wallpapers, web content, shaders, particles, audio.
+- HTML/WebView2/JS wallpapers, web content, shaders, particles, audio (only the
+  video track's volume above is in scope; no audio features beyond it).
 - Windows 10 support, cross-platform abstractions, mobile.
 - Marketplace, accounts, cloud sync, telemetry, auto-update.
 - Plugin systems, scripting, custom codec packs.

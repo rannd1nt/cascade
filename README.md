@@ -107,6 +107,11 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
   planned; independently, if the frame-server ever fails ≥3 times in a row it falls
   back to rendering mode, which keeps the wallpaper but re-introduces the colour
   defect (`docs/design-engine-mode.md`).
+- **Audio is off by default.** The video's own audio track plays only when you set a
+  level: `cascade settings set volume 50` (0–100, `0` = muted — the default; the
+  change applies immediately, no restart). The wallpaper never touches the system
+  master volume, and there is no audio beyond the video track itself
+  (`docs/design-volume.md`).
 - An external drive that is unplugged counts as "missing"; the entry is pruned from the
   library (no relocate flow, by design).
 - The desktop-host API is undocumented and has changed before. Two strategies plus a

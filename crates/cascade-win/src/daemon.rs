@@ -848,6 +848,7 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
         }
         Command::SettingsSet { id, patch } => {
             let previous_mode = ctx.settings.engine_mode;
+            let previous_volume = ctx.settings.volume;
             ctx.settings.apply_patch(patch);
             if let Err(err) = config::save(ctx.settings) {
                 // Applied in memory regardless: a read-only profile dir
@@ -864,6 +865,24 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
                 ctx.flags,
                 control::session_locked(),
             );
+            // Volume is a property of the **live** engine (design-volume
+            // §3): no rebuild, no load pipeline, so AGENTS §3.15 does not
+            // apply — the change goes to the running engine in-process and
+            // the PID stays. Without a backend the value simply waits for
+            // the next load, which primes the engine from settings.
+            if ctx.settings.volume != previous_volume {
+                if let Some(engine) = ctx.backend.backend.as_mut() {
+                    match engine.set_volume(ctx.settings.volume) {
+                        Ok(()) => dlog!("settings: volume → {}", ctx.settings.volume),
+                        Err(err) => derr!("settings: volume: {err}"),
+                    }
+                } else {
+                    dlog!(
+                        "settings: volume → {}; no backend, applied at the next load",
+                        ctx.settings.volume
+                    );
+                }
+            }
             // AGENTS §3.15 + `design-engine-mode.md` §3: a changed
             // `engine_mode` means the engine must be *built* differently,
             // and building it is a load pipeline — every load retains ≈50 MB
@@ -1499,6 +1518,7 @@ fn set_wallpaper(
                 Path::new(&path),
                 &PlaybackOptions {
                     engine_mode: ctx.settings.engine_mode,
+                    volume: ctx.settings.volume,
                     ..PlaybackOptions::default()
                 },
             )
@@ -1790,6 +1810,7 @@ pub fn run(
                 source,
                 &PlaybackOptions {
                     engine_mode: settings.engine_mode,
+                    volume: settings.volume,
                     ..PlaybackOptions::default()
                 },
             ) {
@@ -2196,6 +2217,9 @@ mod tests {
             Ok(())
         }
         fn set_looping(&mut self, _on: bool) -> BackendResult<()> {
+            Ok(())
+        }
+        fn set_volume(&mut self, _level: u8) -> BackendResult<()> {
             Ok(())
         }
         fn stats(&self) -> BackendStats {

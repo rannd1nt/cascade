@@ -482,6 +482,10 @@ pub struct Settings {
     /// `status.monitors[].engine` — the two can legitimately differ (the
     /// frame-server's one-way fallback, the dev A/B knob).
     pub engine_mode: PresentationMode,
+    /// Audio level 0–100 (`design-volume.md` §2): `0` = muted — **the
+    /// default**, `1–100` = audible at `level / 100`. Applied to the live
+    /// engine without a restart (§3.15 does not apply — no load pipeline).
+    pub volume: u8,
 }
 
 impl Default for Settings {
@@ -494,6 +498,7 @@ impl Default for Settings {
             tray: true,
             autostart: false,
             engine_mode: PresentationMode::Accurate,
+            volume: 0,
         }
     }
 }
@@ -525,6 +530,9 @@ pub struct SettingsPatch {
     /// Engine route change (`design-engine-mode.md` §3): the daemon applies
     /// it by respawning, never by rebuilding the engine in-process.
     pub engine_mode: Option<PresentationMode>,
+    /// Audio level change (`design-volume.md` §3): the daemon applies it to
+    /// the **live** engine — no rebuild, no respawn.
+    pub volume: Option<u8>,
 }
 
 impl Settings {
@@ -580,6 +588,12 @@ impl Settings {
         }
         if let Some(mode) = patch.engine_mode {
             self.engine_mode = mode;
+        }
+        if let Some(level) = patch.volume {
+            // Wire input is clamped here (the CLI already rejects >100):
+            // a hand-crafted pipe client can send anything, and the engine
+            // must only ever see 0..=100 (design-volume.md §3).
+            self.volume = level.min(100);
         }
 
         // Preset fill (design-m4 §2.6): only when this patch changed the
@@ -784,6 +798,8 @@ mod tests {
         );
         // Honest colour is the default route (design-engine-mode §2).
         assert_eq!(settings.engine_mode, PresentationMode::Accurate);
+        // Silent by default (design-volume §1).
+        assert_eq!(settings.volume, 0);
         // ipc.md §5 documented pause defaults.
         assert!(settings.pause.fullscreen);
         assert!(!settings.pause.maximized);
@@ -806,6 +822,7 @@ mod tests {
             r#""tray":true"#,
             r#""autostart":false"#,
             r#""engine_mode":"accurate""#,
+            r#""volume":0"#,
         ] {
             assert!(line.contains(key), "missing {key} in {line}");
         }
@@ -829,6 +846,30 @@ mod tests {
         let patch: SettingsPatch = serde_json::from_str(r#"{"tray":false}"#).expect("patch");
         settings.apply_patch(patch);
         assert_eq!(settings.engine_mode, before, "absent key keeps its value");
+    }
+
+    #[test]
+    fn volume_patch_applies_clamps_and_leaves_other_keys_alone() {
+        let mut settings = Settings::default();
+        let patch: SettingsPatch = serde_json::from_str(r#"{"volume":50}"#).expect("patch");
+        settings.apply_patch(patch);
+        assert_eq!(settings.volume, 50, "a valid level applies");
+        assert_eq!(
+            settings.engine_mode,
+            PresentationMode::Accurate,
+            "untouched"
+        );
+
+        // Absent key = no change (the forward-compatibility rule).
+        let patch: SettingsPatch = serde_json::from_str(r#"{"tray":false}"#).expect("patch");
+        settings.apply_patch(patch);
+        assert_eq!(settings.volume, 50, "absent key keeps its value");
+
+        // Wire input beyond 100 clamps — the CLI rejects it first, but a
+        // hand-crafted pipe client is not the CLI (design-volume §3).
+        let patch: SettingsPatch = serde_json::from_str(r#"{"volume":200}"#).expect("patch");
+        settings.apply_patch(patch);
+        assert_eq!(settings.volume, 100, "wire input clamps to 100");
     }
 
     #[test]

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use crate::colour::ColourTags;
 use crate::source_reader::{
-    create_d3d11, create_dxgi_device_manager, create_swapchain, query_frame_rate,
+    create_d3d11, create_dxgi_device_manager, create_swapchain, file_url, query_frame_rate,
     sequence_header_tags, E3bPipeline,
 };
 use cascade_core::{
@@ -350,6 +350,17 @@ impl MediaBackend for MediaEngineBackend {
         Ok(())
     }
 
+    fn set_volume(&mut self, level: u8) -> BackendResult<()> {
+        // Remembered even with no thread yet (applied when the playback
+        // thread spawns) and mirrored into the running engine — a live
+        // property change, never a reload (design-volume §3).
+        self.opts.volume = level;
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.send(EngineCmd::SetVolume(level));
+        }
+        Ok(())
+    }
+
     fn stats(&self) -> BackendStats {
         // Atomics only — no COM on the main thread (design §4.5.1).
         // Hardware decode stays `None`: the engine cannot observe it and
@@ -468,6 +479,8 @@ enum EngineCmd {
     Play,
     Pause,
     SetLooping(bool),
+    /// Audio level 0–100 applied to the live engine (`design-volume.md` §3).
+    SetVolume(u8),
     Stop,
 }
 
@@ -743,7 +756,7 @@ impl Server {
             .mf_device
             .as_ref()
             .ok_or_else(|| String::from("no decode device"))?;
-        let engine = create_frame_server_engine(mf_device)?;
+        let engine = create_frame_server_engine(mf_device, self.opts.volume)?;
         if let Err(reason) = run_source(&engine, &self.source, self.opts.looping, self.want_playing)
         {
             // Frame-server engine: no HWND → the release path (U5).
@@ -759,10 +772,10 @@ impl Server {
     }
 
     /// Rendering start (fallback and rendering reload): the proven
-    /// variant-A engine bound to `hwnd`, muted before any source can make
-    /// a sound (design-m2 §5).
+    /// variant-A engine bound to `hwnd`, primed with the configured volume
+    /// before any source can make a sound (design-m2 §5, design-volume §4).
     fn start_rendering(&mut self, hwnd: isize) -> Result<(), String> {
-        let engine = create_rendering_engine(hwnd)?;
+        let engine = create_rendering_engine(hwnd, self.opts.volume)?;
         if let Err(reason) = run_source(&engine, &self.source, self.opts.looping, self.want_playing)
         {
             shutdown_or_release(engine, hwnd);
@@ -1007,6 +1020,20 @@ impl Server {
                     // SAFETY: live engine on its own thread.
                     if let Err(err) = unsafe { engine.SetLoop(on) } {
                         probe!("[p1] SetLoop failed: {}", err.message());
+                    }
+                }
+                false
+            }
+            EngineCmd::SetVolume(level) => {
+                // Remembered for the next engine too (a rebuild after a
+                // reattach/reload must not go back to the old level), then
+                // applied to the live one. A failure is logged, never
+                // fatal — same fire-and-forget contract as Play/Pause
+                // (design-volume §3).
+                self.opts.volume = level;
+                if let Some(engine) = &self.engine {
+                    if let Err(reason) = apply_volume(engine, level) {
+                        probe!("[p1] volume {level} failed: {reason}");
                     }
                 }
                 false
@@ -1488,9 +1515,9 @@ fn copy_nv12_plane(
 
 /// The frame-server engine — the exact E3-1 setup (design §4.2): no
 /// `MF_MEDIA_ENGINE_PLAYBACK_HWND`, the DXGI manager bound to `device`,
-/// the mandatory callback sink, muted before a source can make a sound
-/// (design-m2 §5).
-fn create_frame_server_engine(device: &ID3D11Device) -> Result<IMFMediaEngine, String> {
+/// the mandatory callback sink, primed with the configured volume before a
+/// source can make a sound (design-m2 §5, design-volume §4).
+fn create_frame_server_engine(device: &ID3D11Device, volume: u8) -> Result<IMFMediaEngine, String> {
     let manager = create_dxgi_device_manager(device)?;
     let attrs = new_engine_attrs()?;
     // Frame-server mode: PLAYBACK_HWND is deliberately NOT set (MSDN
@@ -1501,18 +1528,27 @@ fn create_frame_server_engine(device: &ID3D11Device) -> Result<IMFMediaEngine, S
         .map_err(|err| format!("SetUnknown DXGI_MANAGER: {}", err.message()))?;
     let engine = instantiate_engine(&attrs)?;
     // SAFETY: created above; release path (no HWND) on failure.
-    mute_engine(engine, 0)
+    if let Err(reason) = apply_volume(&engine, volume) {
+        shutdown_or_release(engine, 0);
+        return Err(reason);
+    }
+    Ok(engine)
 }
 
 /// The rendering engine (the proven variant-A path, design §4.4).
-fn create_rendering_engine(hwnd: isize) -> Result<IMFMediaEngine, String> {
+fn create_rendering_engine(hwnd: isize, volume: u8) -> Result<IMFMediaEngine, String> {
     let attrs = new_engine_attrs()?;
     // SAFETY: the HWND travels as a UINT64 (Microsoft docs:
     // MF_MEDIA_ENGINE_PLAYBACK_HWND).
     unsafe { attrs.SetUINT64(&MF_MEDIA_ENGINE_PLAYBACK_HWND, hwnd as u64) }
         .map_err(|err| format!("SetUINT64 PLAYBACK_HWND: {}", err.message()))?;
     let engine = instantiate_engine(&attrs)?;
-    mute_engine(engine, hwnd)
+    // SAFETY: created above; release path (the window) on failure.
+    if let Err(reason) = apply_volume(&engine, volume) {
+        shutdown_or_release(engine, hwnd);
+        return Err(reason);
+    }
+    Ok(engine)
 }
 
 /// Attributes object with the mandatory event sink set (required in every
@@ -1543,17 +1579,31 @@ fn instantiate_engine(attrs: &IMFAttributes) -> Result<IMFMediaEngine, String> {
         .map_err(|err| format!("CreateInstance: {}", err.message()))
 }
 
-/// Mute before any source exists (design-m2 §5). `hwnd` is the rendering
-/// window (or 0 for a frame-server engine) and selects the teardown path
-/// in [`shutdown_or_release`] if the mute fails.
-fn mute_engine(engine: IMFMediaEngine, hwnd: isize) -> Result<IMFMediaEngine, String> {
-    match unsafe { engine.SetMuted(true) } {
-        Ok(()) => Ok(engine),
-        Err(err) => {
-            shutdown_or_release(engine, hwnd);
-            Err(format!("SetMuted: {}", err.message()))
-        }
-    }
+/// The audible state for a `0..=100` level (`design-volume.md` §2):
+/// `(muted, linear gain)` — `0` is muted (the documented default), anything
+/// else plays at `level / 100`. Levels above 100 cannot arrive through the
+/// CLI or the wire (both validate/clamp), but a hand-edited `config.toml`
+/// could try, so this mapping clamps instead of erroring — the engine only
+/// ever sees `0..=100`.
+fn engine_volume(level: u8) -> (bool, f64) {
+    let level = level.min(100);
+    (level == 0, f64::from(level) / 100.0)
+}
+
+/// Apply an audio level to a live engine: `SetMuted` first (so a level of
+/// 0 is silent before anything else happens), then `SetVolume`. Runs at
+/// engine construction — before `SetSource`, design-m2 §5 — and on every
+/// runtime `EngineCmd::SetVolume` (design-volume §3). The caller decides
+/// whether a failure tears the engine down (construction) or is only
+/// logged (runtime).
+fn apply_volume(engine: &IMFMediaEngine, level: u8) -> Result<(), String> {
+    let (muted, gain) = engine_volume(level);
+    // SAFETY: live engine on its own thread; both calls are documented
+    // IMFMediaEngine methods (SetMuted, SetVolume 0.0–1.0).
+    unsafe { engine.SetMuted(muted) }.map_err(|err| format!("SetMuted: {}", err.message()))?;
+    // SAFETY: same live engine; the gain comes from `engine_volume`.
+    unsafe { engine.SetVolume(gain) }.map_err(|err| format!("SetVolume: {}", err.message()))?;
+    Ok(())
 }
 
 /// Load `source` into an engine: SetSource → Load → bounded readiness
@@ -1723,70 +1773,24 @@ fn statistic(ex: &IMFMediaEngineEx, id: MF_MEDIA_ENGINE_STATISTIC) -> Option<f64
     }
 }
 
-/// `Path` → `file:///` URL for `SetSource`, percent-encoded (MF wants a
-/// URL; the spaces in a typical user path must not survive).
-fn file_url(path: &Path) -> String {
-    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut raw = absolute.to_string_lossy().replace('\\', "/");
-    if let Some(rest) = raw.strip_prefix("//?/UNC/") {
-        raw = format!("//{rest}");
-    } else if let Some(rest) = raw.strip_prefix("//?/") {
-        raw = rest.to_string();
-    }
-    // `raw` is now "C:/..." or "//server/share/...".
-    let mut url = if raw.starts_with("//") {
-        String::from("file:")
-    } else {
-        String::from("file:///")
-    };
-    for byte in raw.bytes() {
-        match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~'
-            | b'/'
-            | b':'
-            | b'!'
-            | b'$'
-            | b'&'
-            | b'\''
-            | b'('
-            | b')'
-            | b'*'
-            | b'+'
-            | b','
-            | b';'
-            | b'=' => url.push(byte as char),
-            _ => url.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    url
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn file_url_percent_encodes_spaces() {
-        // canonicalize fails for a path that does not exist; the fallback
-        // must still produce a valid URL.
+    fn engine_volume_maps_levels_and_clamps_the_top() {
+        // design-volume §2: 0 is muted (the default), 1–100 is the gain.
+        assert_eq!(engine_volume(0), (true, 0.0), "default is silent");
         assert_eq!(
-            file_url(Path::new(r"C:\videos\my clip.mp4")),
-            "file:///C:/videos/my%20clip.mp4"
+            engine_volume(1),
+            (false, 0.01),
+            "one is the quietest audible"
         );
-    }
-
-    #[test]
-    fn file_url_keeps_plain_paths() {
-        assert_eq!(
-            file_url(Path::new(r"C:\videos\clip.mp4")),
-            "file:///C:/videos/clip.mp4"
-        );
+        assert_eq!(engine_volume(50), (false, 0.5));
+        assert_eq!(engine_volume(100), (false, 1.0), "full scale");
+        // Beyond 100 only a hand-edited config.toml could produce it; the
+        // mapping clamps so the engine never sees a gain above 1.0.
+        assert_eq!(engine_volume(255), (false, 1.0), "clamped");
     }
 
     #[test]

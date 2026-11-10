@@ -41,6 +41,10 @@ pub struct General {
     /// `accurate` (default) or `efficient`. Absent in an older file decodes
     /// to `accurate`, so upgrading never changes behaviour on its own.
     pub engine_mode: PresentationMode,
+    /// Audio level 0–100 (`design-volume.md` §2): `0` = muted (default).
+    /// Absent in an older file decodes to `0`, so upgrading never makes
+    /// noise on its own.
+    pub volume: u8,
 }
 
 impl Default for General {
@@ -49,6 +53,7 @@ impl Default for General {
             restore_wallpaper_on_exit: true,
             tray: true,
             engine_mode: PresentationMode::Accurate,
+            volume: 0,
         }
     }
 }
@@ -148,6 +153,9 @@ impl Config {
             restore_wallpaper_on_exit: self.general.restore_wallpaper_on_exit,
             tray: self.general.tray,
             engine_mode: self.general.engine_mode,
+            // A hand-edited `volume = 200` must not reach the engine
+            // (design-volume §3): the CLI and the wire clamp too.
+            volume: self.general.volume.min(100),
             ..Settings::default()
         };
         if preset {
@@ -162,6 +170,7 @@ impl Config {
                 restore_wallpaper_on_exit: settings.restore_wallpaper_on_exit,
                 tray: settings.tray,
                 engine_mode: settings.engine_mode,
+                volume: settings.volume,
             },
             power: Power {
                 profile: settings.power_profile,
@@ -193,6 +202,7 @@ mod tests {
         settings.on_battery = BatteryAction::Continue;
         settings.tray = false;
         settings.engine_mode = PresentationMode::Efficient;
+        settings.volume = 50;
         write(&path, &settings).expect("write");
         let text = fs::read_to_string(&path).expect("read back");
         let loaded = read(&text);
@@ -228,6 +238,7 @@ mod tests {
             "restore_wallpaper_on_exit = true",
             "tray = true",
             "engine_mode = \"accurate\"",
+            "volume = 0",
             "profile = \"off\"",
             "on_battery = \"off\"",
             "fullscreen = true",
@@ -273,9 +284,17 @@ mod tests {
         assert!(loaded.restore_wallpaper_on_exit);
         // A file written before the toggle existed keeps honest colour.
         assert_eq!(loaded.engine_mode, PresentationMode::Accurate);
+        // …and a file written before volume existed stays silent.
+        assert_eq!(loaded.volume, 0, "old files never make noise");
 
         // An explicit engine_mode is read back (design-engine-mode §5).
         let efficient = read("[general]\nengine_mode = \"efficient\"\n");
         assert_eq!(efficient.engine_mode, PresentationMode::Efficient);
+
+        // An explicit volume is read back; above 100 clamps (design-volume §3).
+        let audible = read("[general]\nvolume = 50\n");
+        assert_eq!(audible.volume, 50);
+        let too_loud = read("[general]\nvolume = 200\n");
+        assert_eq!(too_loud.volume, 100, "hand-edited file clamps to 100");
     }
 }

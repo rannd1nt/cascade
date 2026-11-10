@@ -802,6 +802,7 @@ fn print_settings(settings: &Settings) {
     println!("power_profile: {}", settings.power_profile.as_str());
     println!("on_battery: {}", settings.on_battery.as_str());
     println!("engine_mode: {}", settings.engine_mode.as_str());
+    println!("volume: {}", settings.volume);
     println!("pause.fullscreen: {}", settings.pause.fullscreen);
     println!("pause.maximized: {}", settings.pause.maximized);
     println!("pause.display_off: {}", settings.pause.display_off);
@@ -859,6 +860,11 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
     if key == "engine_mode" {
         println!("  daemon restarts to apply it if a video is playing");
     }
+    // Volume is the opposite case (`design-volume.md` §3): a live property
+    // change, applied without a restart.
+    if key == "volume" {
+        println!("  applied to the playing video immediately (no restart)");
+    }
     // A contradictory-but-allowed combination applies and warns (D9).
     if let Some(warning) = settings.conflict_warning() {
         println!("  warning: {warning}");
@@ -892,6 +898,14 @@ fn build_patch(key: &str, value: &str) -> Result<(SettingsPatch, String), String
                 .ok_or_else(|| format!("engine_mode expects accurate|efficient, got {value}"))?;
             patch.engine_mode = Some(mode);
             mode.as_str().to_string()
+        }
+        "volume" => {
+            // Strict at the CLI (design-volume §3): out-of-range is an
+            // error here, never a silent clamp — the daemon clamps only
+            // what a hand-crafted pipe client sends.
+            let level = parse_volume(value)?;
+            patch.volume = Some(level);
+            level.to_string()
         }
         "restore_wallpaper_on_exit" | "tray" => {
             let flag = parse_bool(value)?;
@@ -929,7 +943,7 @@ fn build_patch(key: &str, value: &str) -> Result<(SettingsPatch, String), String
 fn unknown_setting_key(key: &str) -> String {
     format!(
         "unknown setting key '{key}' (valid: power_profile, on_battery, engine_mode, \
-         pause.fullscreen, pause.maximized, pause.display_off, pause.session_lock, \
+         volume, pause.fullscreen, pause.maximized, pause.display_off, pause.session_lock, \
          pause.screensaver, pause.remote_session, restore_wallpaper_on_exit, tray, autostart)"
     )
 }
@@ -944,6 +958,19 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     } else {
         Err(format!("expected true or false, got {value}"))
     }
+}
+
+/// `0..=100`, the audio level (`design-volume.md` §2). Parsed as `u32`
+/// first so `-1` and `abc` get the same readable error as `101`.
+fn parse_volume(value: &str) -> Result<u8, String> {
+    let level: u32 = value
+        .trim()
+        .parse()
+        .map_err(|_| format!("volume expects a number 0-100, got {value}"))?;
+    if level > 100 {
+        return Err(format!("volume expects 0-100, got {value}"));
+    }
+    Ok(level as u8)
 }
 
 // --- Library commands (M4 S3, ipc.md §3 / design-m4 §4) ---------------------
@@ -1295,6 +1322,7 @@ fn print_help() {
     println!("  cascade settings get [--json]");
     println!("  cascade settings set <key> <value>    keys: power_profile, on_battery,");
     println!("                                        engine_mode accurate|efficient,");
+    println!("                                        volume 0-100 (0 = muted),");
     println!("                                        pause.fullscreen, pause.maximized,");
     println!("                                        pause.display_off, pause.session_lock,");
     println!("                                        pause.screensaver, pause.remote_session,");
@@ -1532,6 +1560,13 @@ mod tests {
         assert_eq!(patch.engine_mode, Some(PresentationMode::Accurate));
         assert_eq!(canonical, "accurate");
 
+        // Volume: the boundaries and the middle are valid (design-volume §2).
+        for value in ["0", "50", "100"] {
+            let (patch, canonical) = build_patch("volume", value).expect("valid");
+            assert_eq!(patch.volume, Some(value.parse::<u8>().expect("number")));
+            assert_eq!(canonical, value, "canonical spelling is the number");
+        }
+
         // Unknown keys fail with the list of valid ones — never ignored.
         for key in ["video", "pause.nope", "battery"] {
             let err = build_patch(key, "true").expect_err("must reject");
@@ -1547,6 +1582,13 @@ mod tests {
         assert!(build_patch("engine_mode", "quality").is_err());
         assert!(build_patch("tray", "yes").is_err());
         assert!(build_patch("pause.fullscreen", "on").is_err());
+        // Volume rejects everything outside 0..=100 — never a silent clamp.
+        for bad in ["101", "255", "-1", "abc", "", "50.5", "1e2"] {
+            assert!(
+                build_patch("volume", bad).is_err(),
+                "must reject volume {bad:?}"
+            );
+        }
         // `autostart` is a valid key overall but not a settings patch —
         // `settings_set` intercepts it before `build_patch`.
         assert!(build_patch("autostart", "true").is_err());
@@ -1559,6 +1601,18 @@ mod tests {
         assert!(!parse_bool("False").expect("mixed"));
         assert!(parse_bool("1").is_err());
         assert!(parse_bool("on").is_err());
+    }
+
+    #[test]
+    fn volume_values_are_numbers_from_zero_to_hundred() {
+        assert_eq!(parse_volume("0").expect("zero"), 0, "the default is valid");
+        assert_eq!(parse_volume("100").expect("full"), 100);
+        assert_eq!(parse_volume(" 50 ").expect("trimmed"), 50);
+        // Every rejection says what is valid (design-volume §3).
+        for bad in ["101", "255", "-1", "abc"] {
+            let err = parse_volume(bad).expect_err("must reject");
+            assert!(err.contains("0-100"), "error must state the range: {err}");
+        }
     }
 
     #[test]
