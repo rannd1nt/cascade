@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::rule_engine::{BatteryAction, PauseSettings, PowerProfile};
-use crate::PROTOCOL_VERSION;
+use crate::{PresentationMode, PROTOCOL_VERSION};
 
 /// Hard cap per line in bytes (`ipc.md` §2: 1 MiB, larger → `too_large`).
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -477,6 +477,11 @@ pub struct Settings {
     /// Filled from the Run key at the wire edge; never persisted to
     /// `config.toml` (design-m4 D10).
     pub autostart: bool,
+    /// **Requested** engine route (`design-engine-mode.md` §2): `accurate`
+    /// (default) or `efficient`. The route actually running is reported by
+    /// `status.monitors[].engine` — the two can legitimately differ (the
+    /// frame-server's one-way fallback, the dev A/B knob).
+    pub engine_mode: PresentationMode,
 }
 
 impl Default for Settings {
@@ -488,6 +493,7 @@ impl Default for Settings {
             restore_wallpaper_on_exit: true,
             tray: true,
             autostart: false,
+            engine_mode: PresentationMode::Accurate,
         }
     }
 }
@@ -516,6 +522,9 @@ pub struct SettingsPatch {
     pub on_battery: Option<BatteryAction>,
     pub restore_wallpaper_on_exit: Option<bool>,
     pub tray: Option<bool>,
+    /// Engine route change (`design-engine-mode.md` §3): the daemon applies
+    /// it by respawning, never by rebuilding the engine in-process.
+    pub engine_mode: Option<PresentationMode>,
 }
 
 impl Settings {
@@ -568,6 +577,9 @@ impl Settings {
         }
         if let Some(value) = patch.tray {
             self.tray = value;
+        }
+        if let Some(mode) = patch.engine_mode {
+            self.engine_mode = mode;
         }
 
         // Preset fill (design-m4 §2.6): only when this patch changed the
@@ -770,6 +782,8 @@ mod tests {
             !settings.autostart,
             "filled from the registry at the wire edge"
         );
+        // Honest colour is the default route (design-engine-mode §2).
+        assert_eq!(settings.engine_mode, PresentationMode::Accurate);
         // ipc.md §5 documented pause defaults.
         assert!(settings.pause.fullscreen);
         assert!(!settings.pause.maximized);
@@ -791,11 +805,30 @@ mod tests {
             r#""restore_wallpaper_on_exit":true"#,
             r#""tray":true"#,
             r#""autostart":false"#,
+            r#""engine_mode":"accurate""#,
         ] {
             assert!(line.contains(key), "missing {key} in {line}");
         }
         let back: Settings = serde_json::from_str(&line).expect("decode");
         assert_eq!(back, Settings::default(), "Settings roundtrips");
+    }
+
+    #[test]
+    fn engine_mode_patch_applies_and_leaves_other_keys_alone() {
+        let mut settings = Settings::default();
+        let patch: SettingsPatch =
+            serde_json::from_str(r#"{"engine_mode":"efficient"}"#).expect("patch");
+        settings.apply_patch(patch);
+        assert_eq!(settings.engine_mode, PresentationMode::Efficient);
+        // Everything else is untouched — a mode switch changes one key.
+        assert_eq!(settings.power_profile, PowerProfile::Off);
+        assert!(settings.tray);
+
+        // Absent key = no change, exactly like the other patch fields.
+        let before = settings.engine_mode;
+        let patch: SettingsPatch = serde_json::from_str(r#"{"tray":false}"#).expect("patch");
+        settings.apply_patch(patch);
+        assert_eq!(settings.engine_mode, before, "absent key keeps its value");
     }
 
     #[test]

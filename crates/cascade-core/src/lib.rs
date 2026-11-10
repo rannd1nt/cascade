@@ -107,6 +107,50 @@ pub enum Fit {
     Stretch,
 }
 
+/// Which presentation route the backend builds at load time
+/// (`settings set engine_mode`, `design-engine-mode.md` §2).
+///
+/// Named `PresentationMode` to stay distinct from the lifecycle
+/// [`EngineMode`] (Boot/Attached/…). This is the **requested** mode: read
+/// once, when the engine is created, and never re-read on a running engine
+/// (AGENTS §3.15 — no code path reconfigures a live engine). The **actual**
+/// route is reported separately by `status.monitors[].engine`
+/// (`frame-server` | `rendering`), because the accurate route keeps its
+/// one-way fallback to rendering and the dev knob `CASCADE_ENGINE_RENDER=1`
+/// forces rendering without touching this setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentationMode {
+    /// Frame-server + CPU staging bridge: correct colour on BT.601 content,
+    /// at the measured cost of ~33.50% CPU / ~225 MB on the target machine
+    /// (2026-11-10, `rnd-media-engine-bottleneck.md` §6).
+    #[default]
+    Accurate,
+    /// Rendering/EVR route: much cheaper (~9.00–10.32% CPU / ~121 MB) with
+    /// the documented wrong colour on BT.601 content — the trade the user
+    /// opts into, never a silent downgrade (AGENTS §8).
+    Efficient,
+}
+
+impl PresentationMode {
+    /// Parse the wire/CLI spelling. Case-insensitive.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "accurate" => Some(Self::Accurate),
+            "efficient" => Some(Self::Efficient),
+            _ => None,
+        }
+    }
+
+    /// Must match the serde spelling (`ipc.md` §5).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accurate => "accurate",
+            Self::Efficient => "efficient",
+        }
+    }
+}
+
 /// What the caller wants from a backend for one loaded source
 /// (`architecture.md` §6).
 #[derive(Clone, Debug)]
@@ -115,17 +159,22 @@ pub struct PlaybackOptions {
     pub looping: bool,
     pub max_fps: Option<u32>,
     pub power_saver: bool,
+    /// Engine route to build at load (`design-engine-mode.md` §4). Carried
+    /// over the existing win → media boundary so no trait method and no
+    /// dependency edge had to be added (AGENTS §4).
+    pub engine_mode: PresentationMode,
 }
 
 impl Default for PlaybackOptions {
     fn default() -> Self {
         // M2 defaults (design-m2 §5): contain-only, loop on, uncapped fps,
-        // no power profiles.
+        // no power profiles; the engine route defaults to honest colour.
         Self {
             fit: Fit::Contain,
             looping: true,
             max_fps: None,
             power_saver: false,
+            engine_mode: PresentationMode::Accurate,
         }
     }
 }
@@ -259,6 +308,28 @@ mod tests {
         assert!(opts.looping);
         assert_eq!(opts.max_fps, None);
         assert!(!opts.power_saver);
+        // Honest colour is the default route (design-engine-mode §2).
+        assert_eq!(opts.engine_mode, PresentationMode::Accurate);
+    }
+
+    #[test]
+    fn engine_mode_parses_and_serialises_as_documented() {
+        // CLI/wire spelling (`ipc.md` §5): case-insensitive in, exact out.
+        assert_eq!(
+            PresentationMode::parse("accurate"),
+            Some(PresentationMode::Accurate)
+        );
+        assert_eq!(
+            PresentationMode::parse(" Efficient "),
+            Some(PresentationMode::Efficient)
+        );
+        assert_eq!(PresentationMode::parse("fast"), None);
+        assert_eq!(PresentationMode::Accurate.as_str(), "accurate");
+        assert_eq!(PresentationMode::Efficient.as_str(), "efficient");
+        assert_eq!(
+            serde_json::to_value(PresentationMode::Efficient).expect("serialise"),
+            serde_json::json!("efficient")
+        );
     }
 
     #[test]
