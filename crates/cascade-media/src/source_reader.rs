@@ -40,11 +40,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::colour::{colour_tags, ColourTags, VideoMatrix, VideoRange};
+use crate::fit::fit_rects;
 use cascade_core::{
-    BackendError, BackendResult, BackendStats, HostSurface, MediaBackend, PlaybackOptions,
+    BackendError, BackendResult, BackendStats, Fit, HostSurface, MediaBackend, PlaybackOptions,
 };
 use windows::core::{Interface, BOOL};
-use windows::Win32::Foundation::{HMODULE, HWND, RECT};
+use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
@@ -434,6 +436,23 @@ impl SourceReaderBackend {
             }
         };
 
+        // ── Colour tags from the bitstream (P1 colour fix) ──
+        // MF ignores H.264 VUI colour flags (notes-p1-color-601 D1) and the
+        // canonical gate asset has no `colr` box (E1-1), so the SPS VUI is
+        // the only trustworthy matrix source (design-p1-color §4.1).
+        // Computed once per load: the sequence header belongs to the file,
+        // so the reader reopens below (E3b fallback) do not change it.
+        let colour = sequence_header_tags(&reader);
+        eprintln!(
+            "cascade: SourceReader: colour tags: matrix={} range={} (VUI matrix_coefficients={})",
+            colour.matrix.as_str(),
+            colour.range.as_str(),
+            colour
+                .matrix_coefficients
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<absent>".to_string())
+        );
+
         // ── Negotiate a DECODED output ──
         // Without an explicit output type the reader hands out the native
         // compressed H.264 access units (~140 KB per sample), not decoded
@@ -533,6 +552,7 @@ impl SourceReaderBackend {
                 &back_buffer,
                 frame_rate,
                 (config.width, config.height),
+                colour,
             ) {
                 Ok(pipe) => {
                     eprintln!(
@@ -975,6 +995,7 @@ impl SourceReaderBackend {
                         video_h as usize,
                         config.width as usize,
                         config.height as usize,
+                        colour,
                     );
                 }
 
@@ -1171,6 +1192,9 @@ impl MediaBackend for SourceReaderBackend {
                 self.height.load(Ordering::Acquire),
             ),
             fps: self.measured_fps.load(Ordering::Acquire) as f32,
+            // Not an MF media engine: the `engine` status field is the
+            // engine backend's alone (design-p1-color §4.5.1).
+            engine_mode: None,
         }
     }
 
@@ -1350,7 +1374,7 @@ fn frame_rate_from_u64(packed: u64) -> (u32, u32) {
 
 /// Read `MF_MT_FRAME_RATE` from the native video type for the E3b video
 /// processor content description. `None` when the file does not report one.
-fn query_frame_rate(reader: &IMFSourceReader) -> Option<(u32, u32)> {
+pub(crate) fn query_frame_rate(reader: &IMFSourceReader) -> Option<(u32, u32)> {
     // SAFETY: stream/type indices are the documented video-stream defaults.
     let mt = unsafe { reader.GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0) }.ok()?;
     // SAFETY: `mt` is a live media type; a missing key surfaces as an error.
@@ -1407,7 +1431,9 @@ type E3Path = &'static str;
 /// `MF_SOURCE_READER_D3D_MANAGER` — per the Microsoft docs that is the
 /// switch which makes the source reader decode on the GPU (not
 /// `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS`, which is a no-op for DXVA).
-fn create_dxgi_device_manager(device: &ID3D11Device) -> Result<IMFDXGIDeviceManager, String> {
+pub(crate) fn create_dxgi_device_manager(
+    device: &ID3D11Device,
+) -> Result<IMFDXGIDeviceManager, String> {
     let mut reset_token: u32 = 0;
     let mut manager: Option<IMFDXGIDeviceManager> = None;
     // SAFETY: out-params are initialised; MF owns the returned manager.
@@ -1706,12 +1732,22 @@ unsafe fn e3_consume_gpu(
 const E3B_PATH: E3Path = "e3b-video-processor";
 
 /// Why one E3b frame could not be consumed on the GPU.
-enum E3bFrame {
+pub(crate) enum E3bFrame {
     /// The sample buffer is not a DXGI texture (software decode fallback):
     /// the caller should use the NV12 CPU path for this frame instead.
     NotGpu,
     /// Any other failure — skip the frame; the caller logs it once.
     Hard(String),
+}
+
+impl E3bFrame {
+    /// One-line reason for the log/fallback counter (engine path).
+    pub(crate) fn why(&self) -> String {
+        match self {
+            E3bFrame::NotGpu => "sample buffer is not a DXGI texture".to_string(),
+            E3bFrame::Hard(msg) => msg.clone(),
+        }
+    }
 }
 
 /// Lazily-built video processor for one input size.
@@ -1739,7 +1775,7 @@ struct E3bCore {
 ///
 /// All methods run on the playback thread; no COM interface here crosses
 /// a thread boundary (AGENTS §4).
-struct E3bPipeline {
+pub(crate) struct E3bPipeline {
     /// The video-device view of the D3D11 device: `CreateVideoProcessor*`
     /// lives here, not on `ID3D11Device`.
     video_device: ID3D11VideoDevice,
@@ -1748,6 +1784,14 @@ struct E3bPipeline {
     back_buffer: ID3D11Texture2D,
     frame_rate: (u32, u32),
     out_size: (u32, u32),
+    /// Colour tags parsed from the SPS/VUI (`sequence_header_tags`): the
+    /// matrix + range the video processor must be told
+    /// (`design-p1-color.md` §4.1).
+    colour: ColourTags,
+    /// How the video is fitted into `out_size` (`design-p1-color.md`
+    /// §4.5.1). Defaults to the full-rect behaviour Tier 2 has always had
+    /// (frozen, D1); the engine backend calls [`E3bPipeline::set_fit`].
+    fit: Fit,
     core: Option<E3bCore>,
     /// Input views cached per texture pointer (MF pools a handful).
     views: Vec<(usize, ID3D11VideoProcessorInputView)>,
@@ -1757,12 +1801,13 @@ impl E3bPipeline {
     /// Create the fixed part: video context + video device. A failure here
     /// fails the whole E3b attempt (the caller reopens the reader without
     /// the D3D manager).
-    fn create(
+    pub(crate) fn create(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         back_buffer: &ID3D11Texture2D,
         frame_rate: (u32, u32),
         out_size: (u32, u32),
+        colour: ColourTags,
     ) -> Result<Self, String> {
         let video_ctx = context
             .cast::<ID3D11VideoContext>()
@@ -1776,9 +1821,22 @@ impl E3bPipeline {
             back_buffer: back_buffer.clone(),
             frame_rate,
             out_size,
+            colour,
+            // Full-rect src→dst: exactly what Tier 2 has always done (the
+            // engine backend overrides this via `set_fit` before blitting).
+            fit: Fit::Stretch,
             core: None,
             views: Vec::new(),
         })
+    }
+
+    /// Choose the fit mode (`design-p1-color.md` §4.5.1). Takes effect at
+    /// the next (re)build of the processor core; dropping the core here
+    /// makes that unconditional even if a frame was already blitted.
+    pub(crate) fn set_fit(&mut self, fit: Fit) {
+        self.fit = fit;
+        self.core = None;
+        self.views.clear();
     }
 
     /// (Re)build enumerator + processor for an input texture size.
@@ -1848,30 +1906,21 @@ impl E3bPipeline {
         .map_err(|err| format!("CreateVideoProcessorOutputView: {}", err.message()))?;
         let out_view = out_view
             .ok_or_else(|| "CreateVideoProcessorOutputView returned no object".to_string())?;
-        // Color space: H.264 HD is limited-range BT.709 YCbCr; the BGRA
-        // back buffer takes full-range RGB — the same values the CPU path
-        // writes, so visual parity with the known-good path holds.
+        // Colour space: matrix + range from the SPS/VUI parser for THIS
+        // stream (design-p1-color §4.1) — never assumed BT.709 + limited.
+        // The BGRA back buffer takes full-range RGB in every case.
         let color = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
-            _bitfield: color_space_bits(),
+            _bitfield: color_space_bits(self.colour.matrix, self.colour.range),
         };
         // SAFETY: stream 0 belongs to this processor; the call is void.
         unsafe {
             self.video_ctx
                 .VideoProcessorSetStreamColorSpace(&processor, 0, &color)
         };
-        // Explicit full-input → full-output rects (that is the scaling).
-        let src = RECT {
-            left: 0,
-            top: 0,
-            right: in_w as i32,
-            bottom: in_h as i32,
-        };
-        let dst = RECT {
-            left: 0,
-            top: 0,
-            right: out_w as i32,
-            bottom: out_h as i32,
-        };
+        // Explicit source/destination rects (that is the scaling), from the
+        // pure fit math (`fit.rs`): full frame by default, letterboxed or
+        // cropped per the requested mode (`quality.md` §4.7: never distort).
+        let (src, dst) = fit_rects(self.fit, (in_w, in_h), (out_w, out_h));
         // SAFETY: live processor; rects fit in i32 (video/surface sizes).
         unsafe {
             self.video_ctx
@@ -1922,9 +1971,22 @@ impl E3bPipeline {
                 desc.Width, desc.Height, desc.Format
             );
         }
+        self.blit_texture(&texture)
+    }
+
+    /// Blit one NV12 texture into the back buffer: (re)build the video
+    /// processor for the texture's size, then `VideoProcessorBlt` with the
+    /// explicit colour space and the fit rects. Shared by the Tier 2 sample
+    /// path and the engine's `TransferVideoFrame` destination
+    /// (`design-p1-color.md` §4.5.1); both callers hand over a live NV12
+    /// texture on this thread.
+    pub(crate) fn blit_texture(&mut self, texture: &ID3D11Texture2D) -> Result<(), E3bFrame> {
+        let mut desc: D3D11_TEXTURE2D_DESC = unsafe { std::mem::zeroed() };
+        // SAFETY: live texture; the out-param is initialised.
+        unsafe { texture.GetDesc(&mut desc) };
         if desc.Format != DXGI_FORMAT_NV12 {
             return Err(E3bFrame::Hard(format!(
-                "decoded texture format is {:?}, need DXGI_FORMAT_NV12",
+                "input texture format is {:?}, need DXGI_FORMAT_NV12",
                 desc.Format
             )));
         }
@@ -1973,7 +2035,7 @@ impl E3bPipeline {
                 // matches the texture (NV12, checked above).
                 unsafe {
                     self.video_device.CreateVideoProcessorInputView(
-                        &texture,
+                        texture,
                         &enumerator,
                         &view_desc,
                         Some(&mut view),
@@ -2034,14 +2096,58 @@ impl E3bPipeline {
     }
 }
 
+/// Colour tags for the loaded stream: parse `MF_MT_MPEG_SEQUENCE_HEADER`
+/// (Annex-B / avcC SPS+PPS) with our own SPS/VUI parser
+/// (`design-p1-color.md` §4.1). Media Foundation ignores H.264 VUI colour
+/// flags on build 26200.9711 (`notes-p1-color-601.md` D1) and the canonical
+/// gate asset carries no `colr` box (E1-1), so the bitstream is the only
+/// trustworthy matrix source. Any failure — attribute absent, blob
+/// unreadable, malformed SPS — yields [`ColourTags::default`] (BT.709 +
+/// limited range), identical to the pre-fix hardcode, so a missing blob can
+/// never regress below today's behaviour.
+pub(crate) fn sequence_header_tags(reader: &IMFSourceReader) -> ColourTags {
+    use windows::Win32::Media::MediaFoundation::MF_MT_MPEG_SEQUENCE_HEADER;
+    // SAFETY: documented stream/type indices for a single-video-stream
+    // file; `mt` is a live media type owned by this call's return value.
+    let mt = match unsafe { reader.GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0) } {
+        Ok(mt) => mt,
+        Err(_) => return ColourTags::default(),
+    };
+    // SAFETY: out-param filled on success; the attribute key is documented.
+    let total = match unsafe { mt.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) } {
+        Ok(total) => total as usize,
+        Err(_) => return ColourTags::default(),
+    };
+    // Sequence headers are a few dozen bytes; anything outside a sane
+    // window means the attribute is not what we think it is.
+    if total == 0 || total > 64 * 1024 {
+        return ColourTags::default();
+    }
+    let mut buf = vec![0u8; total];
+    // SAFETY: buffer length == the size MF just reported.
+    match unsafe { mt.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buf, None) } {
+        Ok(()) => colour_tags(&buf),
+        Err(_) => ColourTags::default(),
+    }
+}
+
 /// Bitfield for `D3D11_VIDEO_PROCESSOR_COLOR_SPACE` (LSB-first, d3d11.h;
 /// MS docs verified 2026-11-04):
 /// bit0 Usage=0 (playback), bit1 RGB_Range=0 (full-range RGB output),
-/// bit2 YCbCr_Matrix=1 (BT.709), bit3 YCbCr_xvYCC=0 (conventional),
-/// bits4-5 Nominal_Range=1 (16-235 limited-range YCbCr input) — the exact
-/// shape of HD H.264 content.
-fn color_space_bits() -> u32 {
-    0b0001_0100 // YCbCr_Matrix (0x4) | Nominal_Range=16-235 (0x10)
+/// bit2 YCbCr_Matrix (0 = BT.601, 1 = BT.709), bit3 YCbCr_xvYCC=0
+/// (conventional), bits4-5 Nominal_Range (0 = full range, 1 = 16-235
+/// limited). Matrix and nominal range come from the SPS/VUI parser
+/// (`design-p1-color.md` §4.1) instead of the old hardcoded
+/// "HD H.264 = BT.709 + limited" assumption (F7 / `quality.md` §2).
+fn color_space_bits(matrix: VideoMatrix, range: VideoRange) -> u32 {
+    let mut bits = 0u32; // Usage = playback, RGB_Range = full, xvYCC off
+    if matrix == VideoMatrix::Bt709 {
+        bits |= 0b0100; // YCbCr_Matrix = BT.709
+    }
+    if range == VideoRange::Limited {
+        bits |= 0b1_0000; // Nominal_Range = 16-235
+    }
+    bits
 }
 
 /// Create D3D11 device + context.
@@ -2049,7 +2155,9 @@ fn color_space_bits() -> u32 {
 /// `video_support` adds `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` (E3): MF's
 /// video processor runs on this device and the flag is the documented
 /// switch for video-processing features.
-fn create_d3d11(video_support: bool) -> BackendResult<(ID3D11Device, ID3D11DeviceContext)> {
+pub(crate) fn create_d3d11(
+    video_support: bool,
+) -> BackendResult<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device: Option<ID3D11Device> = None;
     let mut context: Option<ID3D11DeviceContext> = None;
     let levels = [D3D_FEATURE_LEVEL_11_0];
@@ -2083,7 +2191,7 @@ fn create_d3d11(video_support: bool) -> BackendResult<(ID3D11Device, ID3D11Devic
 /// `format` is `B8G8R8A8_UNORM` normally and `B8G8R8X8_UNORM` under E3:
 /// MF tags its RGB32 output as X8 (measured `DXGI_FORMAT(88)`), so matching
 /// it makes the consume `CopyResource` an identical-format copy.
-fn create_swapchain(
+pub(crate) fn create_swapchain(
     device: &ID3D11Device,
     hwnd: isize,
     width: u32,
@@ -2212,11 +2320,16 @@ unsafe fn convert_nv12_to_bgr8(
     video_h: usize,
     out_w: usize,
     out_h: usize,
+    colour: ColourTags,
 ) {
     if video_w == 0 || video_h == 0 || out_w == 0 || out_h == 0 {
         return;
     }
     let uv_plane = src.add(uv_plane_offset);
+    // Matrix + range come from the SPS/VUI parser (design-p1-color §4.1);
+    // this converter used to hardcode BT.601 limited while the GPU path
+    // hardcoded BT.709 limited (F9) — both now read the same ColourTags.
+    let (y_offset, luma_k, kr, kg_r, kg_b, kb) = yuv_to_rgb_coeffs(colour);
 
     for oy in 0..out_h {
         let sy = oy * video_h / out_h;
@@ -2229,19 +2342,14 @@ unsafe fn convert_nv12_to_bgr8(
 
             // SAFETY: sx < video_w, sy < video_h and the caller checked
             // the buffer size, so both planes stay in bounds.
-            let y_val = *src.add(y_row + sx) as i32;
+            let c = *src.add(y_row + sx) as i32 - y_offset;
             let uv_offset = (uv_row + sx / 2) * 2;
-            let u_val = *uv_plane.add(uv_offset) as i32;
-            let v_val = *uv_plane.add(uv_offset + 1) as i32;
+            let d = *uv_plane.add(uv_offset) as i32 - 128;
+            let e = *uv_plane.add(uv_offset + 1) as i32 - 128;
 
-            // YUV → BT.601 BGR (limited range).
-            let c = y_val - 16;
-            let d = u_val - 128;
-            let e = v_val - 128;
-
-            let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255);
-            let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255);
-            let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255);
+            let r = ((luma_k * c + kr * e + 128) >> 8).clamp(0, 255);
+            let g = ((luma_k * c - kg_r * d - kg_b * e + 128) >> 8).clamp(0, 255);
+            let b = ((luma_k * c + kb * d + 128) >> 8).clamp(0, 255);
 
             let off = dst_row + ox * 4;
             *dst.add(off) = b as u8;
@@ -2250,6 +2358,35 @@ unsafe fn convert_nv12_to_bgr8(
             *dst.add(off + 3) = 0xFF;
         }
     }
+}
+
+/// Integer YUV→RGB coefficients for the stream's colour tags, as
+/// `(y_offset, luma_k, kr, kg_r, kg_b, kb)` with the output computed as
+/// `(luma_k * (Y - y_offset) [+/-] w * (Cb/Cr - 128) + 128) >> 8`.
+/// Standard 8-bit forms (ITU-R BT.601 / BT.709):
+///
+/// | matrix | range   | y_offset | luma_k | kr  | kg_r | kg_b | kb  |
+/// |--------|---------|----------|--------|-----|------|------|-----|
+/// | 601    | limited | 16       | 298    | 409 | 100  | 208  | 516 |
+/// | 601    | full    | 0        | 256    | 359 | 88   | 183  | 454 |
+/// | 709    | limited | 16       | 298    | 459 | 55   | 136  | 541 |
+/// | 709    | full    | 0        | 256    | 403 | 48   | 120  | 475 |
+///
+/// The full-range chroma weights are the limited-range ones scaled by
+/// 224/255 (the limited→full chroma amplitude ratio), rounded to nearest —
+/// e.g. 409 · 224/255 = 359.4 → 359.
+fn yuv_to_rgb_coeffs(colour: ColourTags) -> (i32, i32, i32, i32, i32, i32) {
+    let (y_offset, luma_k) = match colour.range {
+        VideoRange::Limited => (16, 298),
+        VideoRange::Full => (0, 256),
+    };
+    let (kr, kg_r, kg_b, kb) = match (colour.matrix, colour.range) {
+        (VideoMatrix::Bt601, VideoRange::Limited) => (409, 100, 208, 516),
+        (VideoMatrix::Bt601, VideoRange::Full) => (359, 88, 183, 454),
+        (VideoMatrix::Bt709, VideoRange::Limited) => (459, 55, 136, 541),
+        (VideoMatrix::Bt709, VideoRange::Full) => (403, 48, 120, 475),
+    };
+    (y_offset, luma_k, kr, kg_r, kg_b, kb)
 }
 
 /// `Path` → `file:///` URL for `MFCreateSourceReaderFromURL`.
@@ -2356,13 +2493,101 @@ mod tests {
     }
 
     #[test]
-    fn color_space_bits_encode_hd_h264() {
-        // BT.709 matrix bit (0x4) + limited-range nominal (0x10), nothing else.
-        assert_eq!(color_space_bits(), 0x14);
-        assert_eq!(color_space_bits() & 0b1, 0); // Usage = playback
-        assert_eq!(color_space_bits() & 0b10, 0); // RGB_Range = full
-        assert_eq!(color_space_bits() >> 2 & 0b1, 1); // YCbCr_Matrix = BT.709
-        assert_eq!(color_space_bits() >> 4 & 0b11, 0b01); // 16-235
+    fn color_space_bits_follow_colour_tags() {
+        // The pre-fix hardcode was 0x14: (BT.709, limited) must keep it —
+        // VUI-less content behaves exactly as before (no regression).
+        assert_eq!(
+            color_space_bits(VideoMatrix::Bt709, VideoRange::Limited),
+            0x14
+        );
+        // The other three combinations, from the SPS/VUI parser.
+        assert_eq!(
+            color_space_bits(VideoMatrix::Bt601, VideoRange::Limited),
+            0x10
+        );
+        assert_eq!(color_space_bits(VideoMatrix::Bt709, VideoRange::Full), 0x04);
+        assert_eq!(color_space_bits(VideoMatrix::Bt601, VideoRange::Full), 0x00);
+        // Field placement (d3d11.h, MS docs verified 2026-11-04).
+        let bits = color_space_bits(VideoMatrix::Bt709, VideoRange::Limited);
+        assert_eq!(bits & 0b1, 0); // Usage = playback
+        assert_eq!(bits & 0b10, 0); // RGB_Range = full
+        assert_eq!(bits >> 2 & 0b1, 1); // YCbCr_Matrix = BT.709
+        assert_eq!(bits >> 3 & 0b1, 0); // YCbCr_xvYCC = conventional
+        assert_eq!(bits >> 4 & 0b11, 0b01); // Nominal_Range = 16-235
+        assert_eq!(
+            color_space_bits(VideoMatrix::Bt601, VideoRange::Full) >> 4 & 0b11,
+            0b00
+        );
+        assert_eq!(
+            color_space_bits(VideoMatrix::Bt601, VideoRange::Full) >> 2 & 0b1,
+            0
+        );
+    }
+
+    /// Run the CPU converter over one 2×2 NV12 frame filled with a single
+    /// YCbCr value and return the first output pixel as BGRA.
+    fn convert_pixel(y: u8, u: u8, v: u8, colour: ColourTags) -> [u8; 4] {
+        // 2×2 NV12: 4 luma bytes + one interleaved UV pair (chroma is
+        // 2×2 subsampled → a single 2-byte row).
+        let nv12 = [y, y, y, y, u, v];
+        let mut out = [0u8; 2 * 2 * 4];
+        // SAFETY: 6-byte input (4 Y + 2 UV) and 16-byte output; `row_pitch`
+        // 8 = 2 pixels × 4 bytes; both planes in bounds for a 2×2 frame.
+        unsafe {
+            convert_nv12_to_bgr8(nv12.as_ptr(), out.as_mut_ptr(), 8, 4, 2, 2, 2, 2, colour);
+        }
+        [out[0], out[1], out[2], out[3]]
+    }
+
+    fn tags(matrix: VideoMatrix, range: VideoRange) -> ColourTags {
+        ColourTags {
+            matrix,
+            range,
+            matrix_coefficients: match matrix {
+                VideoMatrix::Bt709 => Some(1),
+                VideoMatrix::Bt601 => Some(5),
+            },
+        }
+    }
+
+    #[test]
+    fn cpu_converter_applies_stream_matrix_to_yellow_bar() {
+        // Measured SMPTE yellow from `bars.mp4` (notes §9 NV12 row:
+        // Y=162 Cb=44 Cr=142, limited range) — the exact P1 signature.
+        // BT.601 → (192,191,1); BT.709 → (195,181,0). The 601 result must
+        // land within tolerance of the ffmpeg auto (VUI=601) reference
+        // (192,190,0), the 709 result near the forced-709 reference.
+        let bgra601 = convert_pixel(162, 44, 142, tags(VideoMatrix::Bt601, VideoRange::Limited));
+        assert_eq!(bgra601, [1, 191, 192, 255]);
+        let bgra709 = convert_pixel(162, 44, 142, tags(VideoMatrix::Bt709, VideoRange::Limited));
+        assert_eq!(bgra709, [0, 181, 195, 255]);
+        // White is matrix-independent (no chroma): both must agree.
+        let white601 = convert_pixel(180, 128, 128, tags(VideoMatrix::Bt601, VideoRange::Limited));
+        let white709 = convert_pixel(180, 128, 128, tags(VideoMatrix::Bt709, VideoRange::Limited));
+        assert_eq!(white601, [191, 191, 191, 255]);
+        assert_eq!(white709, [191, 191, 191, 255]);
+    }
+
+    #[test]
+    fn cpu_converter_full_range_never_touches_the_limited_offset() {
+        // Full-range white (Y=255): luma_k = 256, y_offset = 0 → exactly
+        // 255 on every channel, in both matrices (limited-range math on a
+        // full-range value would clip at 240-ish instead).
+        assert_eq!(
+            convert_pixel(255, 128, 128, tags(VideoMatrix::Bt601, VideoRange::Full)),
+            [255, 255, 255, 255]
+        );
+        assert_eq!(
+            convert_pixel(255, 128, 128, tags(VideoMatrix::Bt709, VideoRange::Full)),
+            [255, 255, 255, 255]
+        );
+        // Full-range yellow (Y=226, Cb=0, Cr=149 — the full-range encoding
+        // of RGB 255,255,0): must reconstruct (255,255,0) with the
+        // full-range chroma weights (359/88/183/454), not the limited set.
+        assert_eq!(
+            convert_pixel(226, 0, 149, tags(VideoMatrix::Bt601, VideoRange::Full)),
+            [0, 255, 255, 255]
+        );
     }
 
     #[test]

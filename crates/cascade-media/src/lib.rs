@@ -1,6 +1,8 @@
 //! Media backends (design-m2 §2).
 
+mod colour;
 mod engine;
+mod fit;
 mod probe;
 mod source_reader;
 
