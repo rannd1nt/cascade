@@ -117,6 +117,9 @@ pub struct PlaybackStatus {
     pub fps: Option<f32>,
     pub dropped: Option<u64>,
     pub video: Option<VideoSize>,
+    /// Media Engine mode (`"frame-server"` / `"rendering"`), when the
+    /// backend reports one (`design-p1-color.md` §4.4).
+    pub engine: Option<String>,
 }
 
 impl StatusSnapshot {
@@ -790,6 +793,7 @@ fn build_status(snapshot: &StatusSnapshot) -> Status {
                     fps: playback.and_then(|playback| playback.fps),
                     dropped: playback.and_then(|playback| playback.dropped),
                     video: playback.and_then(|playback| playback.video),
+                    engine: playback.and_then(|playback| playback.engine.clone()),
                 }
             })
             .collect(),
@@ -1163,6 +1167,7 @@ mod tests {
                 fps: Some(59.94),
                 dropped: Some(0),
                 video: Some(VideoSize { w: 1920, h: 1080 }),
+                engine: None,
             }),
             host_strategy: "workerw_child".to_string(),
             repaint_level: 1,

@@ -146,6 +146,13 @@ pub struct BackendStats {
     pub dropped_frames: u64,
     pub video_size: (u32, u32),
     pub fps: f32,
+    /// Active presentation mode of the engine backend — `Some("frame-server")`
+    /// (NV12 + our video processor) or `Some("rendering")` (the
+    /// `MF_MEDIA_ENGINE_PLAYBACK_HWND` fallback, wrong colour on BT.601
+    /// content by design, `design-p1-color.md` §4.4). `None` while no
+    /// playback thread runs, so `status` omits the field instead of
+    /// guessing (`ipc.md` §4).
+    pub engine_mode: Option<String>,
 }
 
 /// The only win → media boundary (AGENTS §4). Core stays Win32-free: the

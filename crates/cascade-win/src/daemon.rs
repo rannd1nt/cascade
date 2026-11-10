@@ -332,6 +332,7 @@ fn playback_status(
             w: stats.video_size.0,
             h: stats.video_size.1,
         }),
+        engine: stats.engine_mode,
     })
 }
 

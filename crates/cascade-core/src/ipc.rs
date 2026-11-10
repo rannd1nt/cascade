@@ -395,6 +395,13 @@ pub struct MonitorStatus {
     pub dropped: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video: Option<VideoSize>,
+    /// Active engine mode of the Media Engine backend: `"frame-server"`
+    /// (NV12 transfer + our converter, correct colour) or `"rendering"`
+    /// (HWND path, known-wrong colour on BT.601 content — the documented
+    /// fallback, `design-p1-color.md` §4.4). `None` while no playback
+    /// thread runs (omitted on the wire, `ipc.md` §4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
 }
 
 /// Library entry a monitor is playing (`ipc.md` §4).
@@ -710,6 +717,7 @@ mod tests {
                 fps: None,
                 dropped: None,
                 video: None,
+                engine: None,
             }],
             memory: MemoryStatus {
                 working_set_mb: 141,
@@ -737,6 +745,9 @@ mod tests {
         }
         // Monitors that have no source yet omit the optional fields.
         assert!(!line.contains("hwdec"), "{line}");
+        // The per-monitor `engine` mode is omitted while absent — the
+        // top-level `"engine"` key above is the daemon lifecycle one.
+        assert!(!line.contains(r#""engine":"frame-server""#), "{line}");
 
         let back: Status = serde_json::from_str(&line).expect("decode");
         assert_eq!(back, status, "Status roundtrips");
