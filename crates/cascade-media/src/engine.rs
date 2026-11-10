@@ -40,6 +40,7 @@ use crate::source_reader::{
 };
 use cascade_core::{
     BackendError, BackendResult, BackendStats, Fit, HostSurface, MediaBackend, PlaybackOptions,
+    PresentationMode,
 };
 use windows::core::{implement, IUnknown, Interface, BSTR, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT, RPC_E_CHANGED_MODE};
@@ -527,6 +528,7 @@ fn playback_thread(config: ServerConfig, cmd_rx: Receiver<EngineCmd>) {
 }
 
 /// Active presentation mode of the playback thread (design §4.4).
+#[derive(Debug, PartialEq, Eq)]
 enum Mode {
     /// NV12 `TransferVideoFrame` + our video processor + our swapchain.
     FrameServer,
@@ -610,6 +612,21 @@ struct Server {
     engine_mode_pub: Arc<AtomicU8>,
 }
 
+/// Route to start for **one load** (`design-engine-mode.md` §4), in order:
+/// the dev A/B evidence knob `CASCADE_ENGINE_RENDER=1` (precedent
+/// `CASCADE_GATE=B`) forces rendering regardless of the setting, then the
+/// user's `engine_mode` decides — `efficient` renders directly, `accurate`
+/// takes the frame-server with its own one-way fallback. Pure so the rule is
+/// unit-testable without a GPU; the route is decided here once and never
+/// changes on a running engine (AGENTS §3.15).
+fn start_mode(requested: PresentationMode, forced_by_env: bool) -> Mode {
+    if forced_by_env || requested == PresentationMode::Efficient {
+        Mode::Rendering
+    } else {
+        Mode::FrameServer
+    }
+}
+
 impl Server {
     /// Build the device and start an engine on `config.hwnd`, preferring
     /// frame-server mode and falling back to rendering (design §4.4). Any
@@ -643,10 +660,12 @@ impl Server {
             video_size_pub: config.video_size,
             engine_mode_pub: config.engine_mode,
         };
-        // A/B evidence knob (precedent `CASCADE_GATE=B`): force the
-        // rendering path from spawn to compare colour/perf directly.
+        // Mode selection, once per load (`start_mode`, design-engine-mode
+        // §4): the A/B knob or an `efficient` request starts rendering
+        // directly; `accurate` (default) falls through to the frame-server
+        // with its documented one-way fallback to rendering.
         let forced = std::env::var("CASCADE_ENGINE_RENDER").is_ok_and(|value| value == "1");
-        if forced {
+        if start_mode(server.opts.engine_mode, forced) == Mode::Rendering {
             server.mode = Mode::Rendering;
             server
                 .start_rendering(config.hwnd)
@@ -1767,6 +1786,28 @@ mod tests {
         assert_eq!(
             file_url(Path::new(r"C:\videos\clip.mp4")),
             "file:///C:/videos/clip.mp4"
+        );
+    }
+
+    #[test]
+    fn start_mode_follows_env_then_the_requested_route() {
+        // `design-engine-mode.md` §4 order: the dev A/B knob first, then
+        // the user's setting; `accurate` (the default) is the frame-server.
+        assert_eq!(
+            start_mode(PresentationMode::Accurate, false),
+            Mode::FrameServer
+        );
+        assert_eq!(
+            start_mode(PresentationMode::Efficient, false),
+            Mode::Rendering
+        );
+        assert_eq!(
+            start_mode(PresentationMode::Accurate, true),
+            Mode::Rendering
+        );
+        assert_eq!(
+            start_mode(PresentationMode::Efficient, true),
+            Mode::Rendering
         );
     }
 
