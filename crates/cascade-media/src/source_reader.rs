@@ -2389,7 +2389,16 @@ fn yuv_to_rgb_coeffs(colour: ColourTags) -> (i32, i32, i32, i32, i32, i32) {
     (y_offset, luma_k, kr, kg_r, kg_b, kb)
 }
 
-/// `Path` → `file:///` URL for `MFCreateSourceReaderFromURL`.
+/// `Path` → `file:///` URL for `MFCreateSourceReaderFromURL` (and
+/// `IMFMediaEngine::SetSource`).
+///
+/// ASCII specials are percent-encoded; **non-ASCII travels raw**. Measured
+/// on the target machine (Windows 11 build 26200, 2026-11-10): MF does
+/// NOT decode percent-encoded UTF-8 as UTF-8 — a URL with `%E8%92%BC…`
+/// fails with `0x80070002` ("cannot find the file") while the same URL
+/// with the raw characters (`蒼のワルツ…`, a bare path) opens fine
+/// (`mf-url-variants.ps1`, V1 vs V2/V3). The URL string reaches MF as
+/// UTF-16, so the raw characters survive intact.
 pub(crate) fn file_url(path: &Path) -> String {
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut raw = absolute.to_string_lossy().replace('\\', "/");
@@ -2403,29 +2412,33 @@ pub(crate) fn file_url(path: &Path) -> String {
     } else {
         String::from("file:///")
     };
-    for byte in raw.bytes() {
-        match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~'
-            | b'/'
-            | b':'
-            | b'!'
-            | b'$'
-            | b'&'
-            | b'\''
-            | b'('
-            | b')'
-            | b'*'
-            | b'+'
-            | b','
-            | b';'
-            | b'=' => url.push(byte as char),
-            _ => url.push_str(&format!("%{byte:02X}")),
+    for c in raw.chars() {
+        match c {
+            'A'..='Z'
+            | 'a'..='z'
+            | '0'..='9'
+            | '-'
+            | '_'
+            | '.'
+            | '~'
+            | '/'
+            | ':'
+            | '!'
+            | '$'
+            | '&'
+            | '\''
+            | '('
+            | ')'
+            | '*'
+            | '+'
+            | ','
+            | ';'
+            | '=' => url.push(c),
+            // ASCII outside the safe set (space, `%`, `#`, `?`, …) keeps
+            // being percent-encoded — that part MF does decode correctly.
+            c if c.is_ascii() => url.push_str(&format!("%{:02X}", c as u32)),
+            // Everything else (CJK, accents, …) goes through raw.
+            c => url.push(c),
         }
     }
     url
@@ -2437,9 +2450,37 @@ mod tests {
 
     #[test]
     fn file_url_percent_encodes_spaces() {
+        // canonicalize fails for a path that does not exist; the fallback
+        // must still produce a valid URL.
         assert_eq!(
             file_url(Path::new(r"C:\videos\my clip.mp4")),
             "file:///C:/videos/my%20clip.mp4"
+        );
+    }
+
+    #[test]
+    fn file_url_keeps_plain_paths() {
+        assert_eq!(
+            file_url(Path::new(r"C:\videos\clip.mp4")),
+            "file:///C:/videos/clip.mp4"
+        );
+    }
+
+    #[test]
+    fn file_url_keeps_non_ascii_raw() {
+        // MF does NOT decode percent-encoded UTF-8 (measured 2026-11-10,
+        // Windows 11 build 26200: `%E8%92%BC…` -> 0x80070002, raw `蒼…` ->
+        // S_OK — see the `file_url` doc comment). The GUI (M5) will hand
+        // us arbitrary Unicode paths, so non-ASCII must travel raw while
+        // ASCII specials stay percent-encoded.
+        assert_eq!(
+            file_url(Path::new(r"C:\videos\あ.mp4")),
+            "file:///C:/videos/あ.mp4"
+        );
+        // Mixed: ASCII space encoded, CJK characters raw.
+        assert_eq!(
+            file_url(Path::new(r"C:\videos\蒼のワルツ - Eve MV.mp4")),
+            "file:///C:/videos/蒼のワルツ%20-%20Eve%20MV.mp4"
         );
     }
 
