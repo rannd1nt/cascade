@@ -20,7 +20,7 @@ use cascade_core::ipc::{
 };
 use cascade_core::library::{dedupe_key, LibraryItem};
 use cascade_core::rule_engine::{BatteryAction, PowerProfile};
-use cascade_core::MediaBackend;
+use cascade_core::{MediaBackend, PresentationMode};
 use cascade_media::{MediaEngineBackend, SourceReaderBackend};
 use cascade_win::{console, control, daemon, doctor, dpi, host, install, ipc, registry, state};
 
@@ -801,6 +801,7 @@ fn settings_get(args: &[String]) -> Result<ExitCode, String> {
 fn print_settings(settings: &Settings) {
     println!("power_profile: {}", settings.power_profile.as_str());
     println!("on_battery: {}", settings.on_battery.as_str());
+    println!("engine_mode: {}", settings.engine_mode.as_str());
     println!("pause.fullscreen: {}", settings.pause.fullscreen);
     println!("pause.maximized: {}", settings.pause.maximized);
     println!("pause.display_off: {}", settings.pause.display_off);
@@ -852,6 +853,12 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
     let settings: Settings = serde_json::from_value(data)
         .map_err(|err| format!("engine sent unreadable settings: {err}"))?;
     println!("{key} = {canonical}");
+    // Honest about the apply semantics (`design-engine-mode.md` §3): with a
+    // video playing the daemon restarts itself after this answer; without
+    // one the value simply waits for the next load.
+    if key == "engine_mode" {
+        println!("  daemon restarts to apply it if a video is playing");
+    }
     // A contradictory-but-allowed combination applies and warns (D9).
     if let Some(warning) = settings.conflict_warning() {
         println!("  warning: {warning}");
@@ -877,6 +884,14 @@ fn build_patch(key: &str, value: &str) -> Result<(SettingsPatch, String), String
             })?;
             patch.on_battery = Some(action);
             action.as_str().to_string()
+        }
+        "engine_mode" => {
+            // Requested route, not the running one (design-engine-mode §4):
+            // the CLI never claims which mode the engine ended up in.
+            let mode = PresentationMode::parse(value)
+                .ok_or_else(|| format!("engine_mode expects accurate|efficient, got {value}"))?;
+            patch.engine_mode = Some(mode);
+            mode.as_str().to_string()
         }
         "restore_wallpaper_on_exit" | "tray" => {
             let flag = parse_bool(value)?;
@@ -913,7 +928,7 @@ fn build_patch(key: &str, value: &str) -> Result<(SettingsPatch, String), String
 /// valid so the user never has to open the docs (`design-m4` §3).
 fn unknown_setting_key(key: &str) -> String {
     format!(
-        "unknown setting key '{key}' (valid: power_profile, on_battery, \
+        "unknown setting key '{key}' (valid: power_profile, on_battery, engine_mode, \
          pause.fullscreen, pause.maximized, pause.display_off, pause.session_lock, \
          pause.screensaver, pause.remote_session, restore_wallpaper_on_exit, tray, autostart)"
     )
@@ -1279,6 +1294,7 @@ fn print_help() {
     println!("  cascade clear [--monitor <id>]        back to the colour background");
     println!("  cascade settings get [--json]");
     println!("  cascade settings set <key> <value>    keys: power_profile, on_battery,");
+    println!("                                        engine_mode accurate|efficient,");
     println!("                                        pause.fullscreen, pause.maximized,");
     println!("                                        pause.display_off, pause.session_lock,");
     println!("                                        pause.screensaver, pause.remote_session,");
@@ -1508,6 +1524,14 @@ mod tests {
         assert_eq!(patch.on_battery, Some(BatteryAction::Pause));
         assert_eq!(canonical, "pause");
 
+        let (patch, canonical) = build_patch("engine_mode", "EFFICIENT").expect("valid");
+        assert_eq!(patch.engine_mode, Some(PresentationMode::Efficient));
+        assert_eq!(canonical, "efficient");
+
+        let (patch, canonical) = build_patch("engine_mode", "accurate").expect("valid");
+        assert_eq!(patch.engine_mode, Some(PresentationMode::Accurate));
+        assert_eq!(canonical, "accurate");
+
         // Unknown keys fail with the list of valid ones — never ignored.
         for key in ["video", "pause.nope", "battery"] {
             let err = build_patch(key, "true").expect_err("must reject");
@@ -1519,6 +1543,8 @@ mod tests {
         // Bad values fail too.
         assert!(build_patch("power_profile", "turbo").is_err());
         assert!(build_patch("on_battery", "sometimes").is_err());
+        assert!(build_patch("engine_mode", "fast").is_err());
+        assert!(build_patch("engine_mode", "quality").is_err());
         assert!(build_patch("tray", "yes").is_err());
         assert!(build_patch("pause.fullscreen", "on").is_err());
         // `autostart` is a valid key overall but not a settings patch —
