@@ -83,6 +83,15 @@ idea does not fit one of them, it is a v1.1 idea.
     (`docs/spike-m0.md` §10.4). Any rename re-measures first with a
     path-verified harness. `cascade` (7, the shipped name) is a cold class
     (`docs/spike-m0.md` §10.5–§10.8).
+15. **Never run a second load pipeline in a live daemon.** Every engine load
+    retains ≈50 MB of private bytes until process exit — measured, mechanism
+    identified as *the load itself* (`docs/design-m4.md` §8.3). Therefore any
+    toggle, setting, or event that needs the engine re-created must: persist
+    plain state → answer the client → exit ladder → respawn. Never an
+    in-process reload/rebuild to apply a change. A same-path set is a no-op
+    (no load, no restart); only a fresh process may load. Check this rule
+    before designing *any* new setting that affects the engine, the host, or
+    the media boundary.
 
 ---
 
@@ -296,6 +305,7 @@ Rules:
 | `process::exit()` in an exit path | Skips the repaint ladder |
 | Catch-all `unwrap()` | Panics in a background daemon are user-visible |
 | Copy an undocumented Win32 hack with no fallback | Windows changes; ship two paths |
+| Apply an engine-affecting setting by reloading in-process | ≈50 MB retained per load (§3.15, `design-m4.md` §8.3) — persist, answer, exit ladder, respawn |
 | Hide a limitation in the README | Users find it, then file a bug |
 | Reformat unrelated files in a feature commit | Makes review and bisect useless |
 
