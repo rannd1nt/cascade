@@ -95,13 +95,18 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
 - HDR is detected and reported, not tone-mapped (v1).
 - HEVC / VP9 / AV1 / HDR / 10-bit are rejected in v1 with a clear message — only H.264 8-bit 4:2:0 ≤ 1080p60 is supported.
 - A clip looping has a visible seam; crossfade is not in v1.
-- **Frame-server colour fix costs CPU and RAM (open decision).** The default engine
-  mode presents through a CPU staging bridge between two D3D11 devices (needed so MF
-  honours the video's colour flags). Measured on the target machine 2026-11-10:
-  CPU 33.5% avg (vs 9–10% for the rendering route) and ~225 MB private bytes
-  (`docs/rnd-media-engine-bottleneck.md` §6). Optimisation is planned; if the
-  frame-server ever fails ≥3 times in a row it falls back to rendering mode, which
-  keeps the wallpaper but re-introduces the colour defect.
+- **Frame-server colour fix costs CPU and RAM.** The default engine mode presents
+  through a CPU staging bridge between two D3D11 devices (needed so MF honours the
+  video's colour flags). Measured on the target machine 2026-11-10: CPU 33.5% avg
+  (vs 9–10% for the rendering route) and ~225 MB private bytes
+  (`docs/rnd-media-engine-bottleneck.md` §6). You choose the trade with
+  `cascade settings set engine_mode accurate|efficient` (default `accurate`):
+  `efficient` runs the cheaper rendering route but shows the wrong colour on BT.601
+  content — the pre-fix behaviour, stated here rather than hidden. Changing the mode
+  restarts the daemon while a video plays. Optimisation of the accurate route is
+  planned; independently, if the frame-server ever fails ≥3 times in a row it falls
+  back to rendering mode, which keeps the wallpaper but re-introduces the colour
+  defect (`docs/design-engine-mode.md`).
 - An external drive that is unplugged counts as "missing"; the entry is pruned from the
   library (no relocate flow, by design).
 - The desktop-host API is undocumented and has changed before. Two strategies plus a
