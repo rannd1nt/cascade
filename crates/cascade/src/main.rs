@@ -8,8 +8,10 @@
 // The CLI re-attaches to a console in `console::prepare_stdio`.
 #![windows_subsystem = "windows"]
 
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
+use std::time::{Duration, Instant};
 
 use cascade_core::assess::{codec_key, Recommendation, Severity, Warning};
 use cascade_core::device::{level_name, profile_name};
@@ -163,7 +165,13 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
-    let options = parse_run_options(args)?;
+    // `--detached` (design-m5 §4) never reaches the daemon: it changes how
+    // *this* process spawns the child, not what the child does.
+    let (detached, args) = split_detached_flag(args)?;
+    if detached {
+        return run_detached(&args);
+    }
+    let options = parse_run_options(&args)?;
 
     // A backend is only worth constructing when a source exists
     // (design-m2 §2.2): `--video` wins, otherwise the last successful path
@@ -194,6 +202,123 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             cascade_win::derr!("cascade: {err}");
             Ok(ExitCode::from(1))
         }
+    }
+}
+
+/// `DETACHED_PROCESS` (Win32): the child gets no console of its own, so it
+/// survives this process *and* the terminal that launched it — the whole
+/// point of `run --detached` (design-m5 §4). Value from the process
+/// creation flags:
+/// <https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags>
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+/// How long `run --detached` waits for the child's pipe to answer
+/// (design-m5 §4). A healthy daemon is up well inside this; the loop polls
+/// `status` every [`DETACHED_POLL`].
+const DETACHED_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const DETACHED_POLL: Duration = Duration::from_millis(100);
+
+/// Strip `--detached` from a `run` argv (design-m5 §4). Pure so the flag
+/// handling is unit-testable; the child never sees it and validates the
+/// remaining flags itself.
+fn split_detached_flag(args: &[String]) -> Result<(bool, Vec<String>), String> {
+    let mut detached = false;
+    let mut rest = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg.as_str() {
+            "--detached" if detached => return Err("--detached given twice".to_string()),
+            "--detached" => detached = true,
+            other => rest.push(other.to_string()),
+        }
+    }
+    Ok((detached, rest))
+}
+
+/// The detached child's argv: `run` plus this command's flags. Pure so the
+/// re-entry contract is unit-testable — the child must take the daemon
+/// path (`is_daemon_role`), never the bare double-click flow
+/// (design-m4 §6.2, which may prompt to install) and never the
+/// unknown-command arm of `dispatch` (a flag-only argv would land there).
+fn detached_child_args(args: &[String]) -> Vec<String> {
+    let mut child = Vec::with_capacity(args.len() + 1);
+    child.push("run".to_string());
+    child.extend(args.iter().cloned());
+    child
+}
+
+/// `cascade run --detached` (design-m5 §4): start the daemon without a
+/// console, wait until its pipe answers, print the pid, return — the
+/// caller may close the terminal immediately and the wallpaper keeps
+/// playing. Plain `run` stays foreground for debugging.
+fn run_detached(args: &[String]) -> Result<ExitCode, String> {
+    // Single instance (`ipc.md` §1): refuse *before* spawning a child that
+    // would only print an error and die.
+    if control::find_existing().is_some() {
+        return Err(
+            "Cascade is already running — `cascade status` to inspect, `cascade stop` to end it"
+                .to_string(),
+        );
+    }
+    // Validate the flags here (pure parsing, no backend) so a typo fails
+    // before a process exists.
+    parse_run_options(args)?;
+    // The caller's std handles are inheritable (a pipe when the CLI is
+    // piped, `CONOUT$` in a terminal): without clearing the flag the
+    // spawned daemon would copy them, and a caller reading our stdout
+    // would then wait for an EOF that only arrives when the daemon exits
+    // (measured hang, 2026-11-11, build 26200).
+    console::make_stdio_non_inheritable();
+    let exe = std::env::current_exe().map_err(|err| format!("--detached: {err}"))?;
+    let mut child = std::process::Command::new(exe)
+        .args(detached_child_args(args))
+        // The marker keeps the whole lineage out of the user's console:
+        // `console.rs::detached_lineage` skips `AttachConsole`, so closing
+        // the terminal cannot end the wallpaper engine (`CTRL_CLOSE`).
+        .env(console::DETACHED_MARKER, "1")
+        .creation_flags(DETACHED_PROCESS)
+        // The child must not inherit this terminal's handles: once the
+        // terminal closes they die, and the daemon's `eprintln!` would
+        // panic on the dead handle (AGENTS §3 — a daemon must not panic).
+        // `NUL` handles are permanent — exactly what an autostart start
+        // gets (`console.rs`).
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("--detached: could not start the engine: {err}"))?;
+    let pid = child.id();
+    let deadline = Instant::now() + DETACHED_READY_TIMEOUT;
+    // Assigned by the first failed poll before it is ever read — the
+    // timeout message below can only be reached through that assignment.
+    let mut last_error: String;
+    loop {
+        // A child that already died lost a race or failed to start; its
+        // own diagnostics went to NUL, so the foreground run is the way
+        // to see them (stated in the error below).
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "the engine exited immediately ({status}) — run `cascade run` in the foreground to see why"
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => return Err(format!("--detached: {err}")),
+        }
+        match ipc::request("status", no_data()) {
+            // The pipe answers: the daemon is up and controllable.
+            Ok(_) => {
+                println!("detached: engine running as pid {pid}");
+                return Ok(ExitCode::SUCCESS);
+            }
+            // Not yet (or briefly busy): poll again until the deadline.
+            Err(err) => last_error = err.to_string(),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "--detached: the engine did not come up within 2 s ({last_error}) — run `cascade doctor`"
+            ));
+        }
+        std::thread::sleep(DETACHED_POLL);
     }
 }
 
@@ -599,20 +724,26 @@ fn cmd_playback(paused: bool, args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// What `set` accepted: exactly one file plus an optional monitor target.
-/// Pure syntax — file existence is the daemon's job (`file_missing`,
+/// What `set` accepted: exactly one target plus an optional monitor
+/// target. Pure syntax — file existence is the daemon's job (`file_missing`,
 /// checked before any playback surgery).
 #[derive(Debug)]
 struct SetOptions {
-    /// Exactly one of `path` / `id` reaches the wire (`ipc.md` §3).
+    /// Exactly one of `path` / `id` / `ordinal` reaches the wire
+    /// (`ipc.md` §3): ordinals are resolved to the stable id first
+    /// (`design-m5.md` D1).
     path: Option<PathBuf>,
     id: Option<String>,
+    /// A CLI-only library number (`set 3`), resolved against a fresh
+    /// `library.list` at execution time.
+    ordinal: Option<usize>,
     monitor: Option<String>,
 }
 
 fn parse_set_options(args: &[String]) -> Result<SetOptions, String> {
     let mut file: Option<PathBuf> = None;
     let mut item_id: Option<String> = None;
+    let mut ordinal: Option<usize> = None;
     let mut monitor: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
@@ -644,34 +775,50 @@ fn parse_set_options(args: &[String]) -> Result<SetOptions, String> {
                 return Err(format!("unknown option for set: {other}"));
             }
             other => {
-                if file.is_some() {
+                if file.is_some() || item_id.is_some() || ordinal.is_some() {
                     return Err(format!(
-                        "set takes one video file, got a second argument: {other}"
+                        "set takes one video file or library number, got a second argument: {other}"
                     ));
                 }
-                file = Some(PathBuf::from(other));
+                // A bare decimal number is a library ordinal (`set 3`,
+                // design-m5 D1), never a path: resolve it against a fresh
+                // list at execution time. A file actually named `3` needs
+                // a `.\` prefix or a full path.
+                match parse_ordinal(other) {
+                    Some(n) => ordinal = Some(n),
+                    None => file = Some(PathBuf::from(other)),
+                }
                 index += 1;
             }
         }
     }
-    match (file, item_id) {
-        (None, None) => Err(
-            "set needs a path or a library id: `cascade set <path> [--id <a3f2>] [--monitor <id>]`"
+    let targets = usize::from(file.is_some())
+        + usize::from(item_id.is_some())
+        + usize::from(ordinal.is_some());
+    match targets {
+        0 => Err(
+            "set needs a path, a library number, or an id: `cascade set <path|3> [--id <a3f2>] [--monitor <id>]`"
                 .to_string(),
         ),
-        (Some(_), Some(_)) => {
-            Err("set takes exactly one of a path or --id (a library item), not both".to_string())
-        }
-        (path, id) => Ok(SetOptions { path, id, monitor }),
+        1 => Ok(SetOptions {
+            path: file,
+            id: item_id,
+            ordinal,
+            monitor,
+        }),
+        _ => Err(
+            "set takes exactly one of a path, a library number, or --id (a library item)".to_string(),
+        ),
     }
 }
 
-/// `cascade set <path> | --id <a3f2> [--monitor <id>]` — play a file
-/// directly or a library item (design-m4 S2 path, S3 id). The path is made
-/// absolute here: the daemon's working directory is not the CLI's.
+/// `cascade set <path> | <n> | --id <a3f2> [--monitor <id>]` — play a file
+/// directly or a library item (design-m4 S2 path, S3 id; design-m5 D1 for
+/// the ordinal). The path is made absolute here: the daemon's working
+/// directory is not the CLI's.
 fn cmd_set(args: &[String]) -> Result<ExitCode, String> {
     let options = parse_set_options(args)?;
-    // Exactly one of path / id goes out (`ipc.md` §3).
+    // Exactly one of path / id / ordinal goes out (`ipc.md` §3).
     let (data, label) = if let Some(item_id) = options.id {
         (
             SetData {
@@ -681,8 +828,24 @@ fn cmd_set(args: &[String]) -> Result<ExitCode, String> {
             },
             format!("playing library item {item_id}"),
         )
+    } else if let Some(n) = options.ordinal {
+        // Ordinals are CLI-only: resolve against a *fresh* list at
+        // execution time, then send the stable wire id (design-m5 D1).
+        // The success line names the resolved title and path, so a stale
+        // number is visible immediately.
+        let items = fetch_library()?;
+        let item =
+            resolve_ordinal(&items.items, n).ok_or_else(|| ordinal_error(n, items.items.len()))?;
+        (
+            SetData {
+                path: None,
+                id: Some(item.id.clone()),
+                monitor: options.monitor,
+            },
+            format!("playing: {} ({})", item.title, item.path),
+        )
     } else {
-        let path = options.path.expect("parser guarantees one of the two");
+        let path = options.path.expect("parser guarantees exactly one target");
         let absolute = std::path::absolute(&path)
             .map_err(|err| format!("cannot resolve {}: {err}", path.display()))?;
         (
@@ -975,41 +1138,80 @@ fn parse_volume(value: &str) -> Result<u8, String> {
 
 // --- Library commands (M4 S3, ipc.md §3 / design-m4 §4) ---------------------
 
-/// `cascade library list|add|remove|prune` — every subcommand needs a
-/// daemon (single writer: the main loop, `ipc.md` §3).
+/// `cascade library ls|add|rm|prune` — every subcommand needs a daemon
+/// (single writer: the main loop, `ipc.md` §3). `list`/`remove` stay as
+/// readable aliases (design-m5 §4).
 fn cmd_library(args: &[String]) -> Result<ExitCode, String> {
     match args.first().map(String::as_str) {
-        Some("list") => library_list(&args[1..]),
+        Some("ls") | Some("list") => library_list(&args[1..]),
         Some("add") => library_add(&args[1..]),
-        Some("remove") => library_remove(&args[1..]),
+        Some("rm") | Some("remove") => library_remove(&args[1..]),
         Some("prune") => library_prune(&args[1..]),
-        Some(other) => Err(format!(
-            "library expects list|add|remove|prune, got {other}"
-        )),
-        None => Err("library expects list|add|remove|prune — see `cascade help`".to_string()),
+        Some(other) => Err(format!("library expects ls|add|rm|prune, got {other}")),
+        None => Err("library expects ls|add|rm|prune — see `cascade help`".to_string()),
+    }
+}
+
+/// Fresh `library.list` — ordinals resolve against the live list at
+/// execution time, never a cached one (design-m5 D1).
+fn fetch_library() -> Result<LibraryItemsData, String> {
+    let data = ipc::request("library.list", no_data()).map_err(|err| err.to_string())?;
+    serde_json::from_value(data).map_err(|err| format!("engine sent an unreadable library: {err}"))
+}
+
+/// A CLI ordinal: a pure decimal number (`design-m5.md` D1). Numbers live
+/// only in the CLI; the wire keeps the stable 4-hex id. `0` parses here
+/// and is rejected by [`resolve_ordinal`] with a readable message.
+fn parse_ordinal(token: &str) -> Option<usize> {
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // A number too large for usize is not an ordinal (and not a path
+    // either — it fails the matchers downstream with a clear error).
+    token.parse().ok()
+}
+
+/// Resolve a 1-based ordinal against a freshly fetched list, in list
+/// order — exactly the numbering `library ls` prints.
+fn resolve_ordinal(items: &[LibraryItem], n: usize) -> Option<&LibraryItem> {
+    if n == 0 {
+        return None;
+    }
+    items.get(n - 1)
+}
+
+/// The readable failure for an ordinal that did not resolve — `0` and
+/// "past the end" are different mistakes and say so.
+fn ordinal_error(n: usize, len: usize) -> String {
+    if n == 0 {
+        "library numbers start at 1 — run `cascade library ls`".to_string()
+    } else {
+        format!("no library item {n} — the library has {len} item(s); run `cascade library ls`")
     }
 }
 
 fn library_list(args: &[String]) -> Result<ExitCode, String> {
     if !args.is_empty() {
-        return Err("list takes no arguments".to_string());
+        return Err("ls takes no arguments".to_string());
     }
-    let data = ipc::request("library.list", no_data()).map_err(|err| err.to_string())?;
-    let items: LibraryItemsData = serde_json::from_value(data)
-        .map_err(|err| format!("engine sent an unreadable library: {err}"))?;
+    let items = fetch_library()?;
     if items.items.is_empty() {
         println!("library is empty — add files with `cascade library add <path>`");
         return Ok(ExitCode::SUCCESS);
     }
-    for item in &items.items {
+    // The `ID` column is the ordinal the other commands accept
+    // (design-m5 §4): `set 3`, `library rm 3` — the wire id stays behind
+    // `--id` for scripts.
+    println!("ID  TITLE  RESOLUTION  FPS  LENGTH  CODEC  PATH");
+    for (index, item) in items.items.iter().enumerate() {
         println!(
             "{}  {}  {}x{}  {}  {}  {}  {}",
-            item.id,
+            index + 1,
             item.title,
             item.width,
             item.height,
             item.fps
-                .map(|fps| format!("{fps:.2} fps"))
+                .map(|fps| format!("{fps:.2}"))
                 .unwrap_or_else(|| "-".to_string()),
             item.duration_ms
                 .map(format_duration)
@@ -1066,28 +1268,37 @@ fn library_add(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `cascade library remove <id|path>` — edits the list only; the file on
+/// `cascade library rm <n|id|path>` (alias `remove`) — edits the list
+/// only; the file on
 /// disk is never touched (AGENTS §3.3).
 fn library_remove(args: &[String]) -> Result<ExitCode, String> {
     if args.len() != 1 {
-        return Err("remove needs one id or path: `cascade library remove <id|path>`".to_string());
+        return Err(
+            "rm needs one number, id, or path: `cascade library rm <n|id|path>`".to_string(),
+        );
     }
     let token = args[0].as_str();
-    // The list doubles as the path→id index and the confirmation source.
-    let data = ipc::request("library.list", no_data()).map_err(|err| err.to_string())?;
-    let items: LibraryItemsData = serde_json::from_value(data)
-        .map_err(|err| format!("engine sent an unreadable library: {err}"))?;
-    let item = if is_item_id(token) {
-        items
-            .items
-            .iter()
-            .find(|item| item.id.eq_ignore_ascii_case(token))
+    // The list doubles as the ordinal/id/path index and the confirmation
+    // source (design-m5 D1: resolve fresh, send the stable id).
+    let items = fetch_library()?;
+    // Only a path-shaped token needs absolutising (the daemon's cwd is
+    // not the CLI's); ordinals and ids match as-is.
+    let absolute = if parse_ordinal(token).is_none() && !is_item_id(token) {
+        Some(
+            std::path::absolute(token)
+                .map_err(|err| format!("cannot resolve {token}: {err}"))?
+                .display()
+                .to_string(),
+        )
     } else {
-        let absolute =
-            std::path::absolute(token).map_err(|err| format!("cannot resolve {token}: {err}"))?;
-        find_item_by_path(&items.items, &absolute.display().to_string())
-    }
-    .ok_or_else(|| format!("no library item matches '{token}' — run `cascade library list`"))?;
+        None
+    };
+    let ordinal = parse_ordinal(token);
+    let item = resolve_remove_target(&items.items, token, absolute.as_deref().unwrap_or(""))
+        .ok_or_else(|| match ordinal {
+            Some(n) => ordinal_error(n, items.items.len()),
+            None => format!("no library item matches '{token}' — run `cascade library ls`"),
+        })?;
     let payload = serde_json::to_value(LibraryRemoveData {
         id: item.id.clone(),
     })
@@ -1098,6 +1309,36 @@ fn library_remove(args: &[String]) -> Result<ExitCode, String> {
         item.title, item.path
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve `library rm <token>` against a fetched list (design-m5 D1):
+/// an **in-range ordinal** wins, then a 4-hex id, then a path. Pure so the
+/// precedence is unit-testable; `absolute_path` is only read by the path
+/// branch (the caller computes it for path-shaped tokens only).
+fn resolve_remove_target<'a>(
+    items: &'a [LibraryItem],
+    token: &str,
+    absolute_path: &str,
+) -> Option<&'a LibraryItem> {
+    if let Some(n) = parse_ordinal(token) {
+        if let Some(item) = resolve_ordinal(items, n) {
+            return Some(item);
+        }
+        // A 4-hex id may be all digits ("9182"): an out-of-range number
+        // falls through to the id match instead of failing outright.
+        if is_item_id(token) {
+            return items
+                .iter()
+                .find(|item| item.id.eq_ignore_ascii_case(token));
+        }
+        return None;
+    }
+    if is_item_id(token) {
+        return items
+            .iter()
+            .find(|item| item.id.eq_ignore_ascii_case(token));
+    }
+    find_item_by_path(items, absolute_path)
 }
 
 /// `cascade library prune` — same drop rule as the start-time prune.
@@ -1311,13 +1552,16 @@ fn print_help() {
     println!("cascade {VERSION}");
     println!();
     println!("USAGE:");
-    println!("  cascade [run] [--color RRGGBB] [--repaint 1-4] [--host auto|workerw|layered]");
-    println!("           [--video <path>]   play this file behind the desktop icons");
+    println!("  cascade [run] [--detached] [--color RRGGBB] [--repaint 1-4]");
+    println!("           [--host auto|workerw|layered] [--video <path>]");
+    println!("           play this file behind the desktop icons;");
+    println!("           --detached returns at once — the terminal may be closed");
     println!("  cascade doctor");
     println!("  cascade stop | restore | quit");
     println!("  cascade status [--json]");
     println!("  cascade pause | resume");
-    println!("  cascade set <path> | --id <a3f2> [--monitor <id>]  play a file or library item");
+    println!("  cascade set <path|n> | --id <a3f2> [--monitor <id>]");
+    println!("                                        play a file, a library number, or an id");
     println!("  cascade clear [--monitor <id>]        back to the colour background");
     println!("  cascade settings get [--json]");
     println!("  cascade settings set <key> <value>    keys: power_profile, on_battery,");
@@ -1327,9 +1571,10 @@ fn print_help() {
     println!("                                        pause.display_off, pause.session_lock,");
     println!("                                        pause.screensaver, pause.remote_session,");
     println!("                                        restore_wallpaper_on_exit, tray, autostart");
-    println!("  cascade library list");
+    println!("  cascade library ls                    list with numbers (alias: list)");
     println!("  cascade library add <path>...         files are referenced, never copied");
-    println!("  cascade library remove <id|path>      remove from library (file untouched)");
+    println!("  cascade library rm <n|path>           remove by number (alias: remove;");
+    println!("                                        file untouched — id also accepted)");
     println!("  cascade library prune                 drop entries whose files are gone");
     println!("  cascade assess [<file>] [--monitor <id>] [--json]");
     println!("                                        no file: device + recommendation;");
@@ -1619,15 +1864,166 @@ mod tests {
     fn library_subcommands_are_validated() {
         // No/unknown subcommand fails before any pipe request is made.
         let err = cmd_library(&[]).expect_err("needs a subcommand");
-        assert!(err.contains("list|add|remove|prune"), "unexpected: {err}");
+        assert!(err.contains("ls|add|rm|prune"), "unexpected: {err}");
         let err = cmd_library(&args(&["frobnicate"])).expect_err("unknown");
         assert!(err.contains("frobnicate"), "unexpected: {err}");
         // Argument arity is checked before touching the daemon too.
+        assert!(cmd_library(&args(&["ls", "extra"])).is_err());
         assert!(cmd_library(&args(&["list", "extra"])).is_err());
         assert!(cmd_library(&args(&["prune", "extra"])).is_err());
-        assert!(cmd_library(&args(&["remove"])).is_err());
+        assert!(cmd_library(&args(&["rm"])).is_err());
         assert!(cmd_library(&args(&["remove", "a", "b"])).is_err());
         assert!(cmd_library(&args(&["add"])).is_err());
+    }
+
+    #[test]
+    fn detached_flag_is_stripped_once() {
+        // The child never sees `--detached`; sibling flags pass through.
+        let (detached, rest) =
+            split_detached_flag(&args(&["--video", "clip.mp4", "--detached"])).expect("valid");
+        assert!(detached);
+        assert_eq!(rest, args(&["--video", "clip.mp4"]));
+
+        let (detached, rest) = split_detached_flag(&args(&["--color", "FF0000"])).expect("valid");
+        assert!(!detached, "no flag, no detach");
+        assert_eq!(rest, args(&["--color", "FF0000"]));
+
+        let err =
+            split_detached_flag(&args(&["--detached", "--detached"])).expect_err("one flag only");
+        assert!(err.contains("twice"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn detached_child_reenters_through_run() {
+        // The child always re-enters as `run`: never the bare double-click
+        // flow (design-m4 §6.2 may prompt to install) and never the
+        // unknown-command arm of `dispatch`.
+        assert_eq!(detached_child_args(&[]), args(&["run"]));
+        assert_eq!(
+            detached_child_args(&args(&["--video", "clip.mp4"])),
+            args(&["run", "--video", "clip.mp4"])
+        );
+        let child = detached_child_args(&args(&["--color", "FF0000"]));
+        assert_eq!(child.first().map(String::as_str), Some("run"));
+        assert!(
+            !child.iter().any(|arg| arg == "--detached"),
+            "the flag never reaches the child"
+        );
+        assert!(is_daemon_role(&child), "the child is a daemon role");
+    }
+
+    #[test]
+    fn library_ordinals_are_pure_decimal_numbers() {
+        assert_eq!(parse_ordinal("1"), Some(1));
+        assert_eq!(parse_ordinal("3"), Some(3));
+        assert_eq!(parse_ordinal("0"), Some(0), "parses; resolve rejects it");
+        assert_eq!(parse_ordinal("12"), Some(12));
+        // Never a path, never an id, never a decorated number.
+        assert_eq!(parse_ordinal("clip.mp4"), None);
+        assert_eq!(parse_ordinal("a3f2"), None, "hex ids are not ordinals");
+        assert_eq!(parse_ordinal(" 3"), None, "no trimming");
+        assert_eq!(parse_ordinal("-1"), None);
+        assert_eq!(parse_ordinal(""), None);
+        assert_eq!(parse_ordinal("3x"), None);
+        assert_eq!(
+            parse_ordinal("99999999999999999999999999"),
+            None,
+            "too large for usize"
+        );
+    }
+
+    #[test]
+    fn ordinal_resolution_is_one_based_and_bounded() {
+        let items = vec![
+            item("a1b2", r"C:\v\one.mp4"),
+            item("b2c3", r"C:\v\two.mp4"),
+            item("c3d4", r"C:\v\three.mp4"),
+        ];
+        assert_eq!(resolve_ordinal(&items, 1).expect("first").id, "a1b2");
+        assert_eq!(resolve_ordinal(&items, 3).expect("third").id, "c3d4");
+        assert!(resolve_ordinal(&items, 0).is_none(), "0 is never a row");
+        assert!(resolve_ordinal(&items, 4).is_none(), "past the end");
+        assert!(resolve_ordinal(&[], 1).is_none(), "empty library");
+    }
+
+    #[test]
+    fn set_options_accept_library_numbers() {
+        // A bare number is an ordinal, not a path (design-m5 D1).
+        let options = parse_set_options(&args(&["3"])).expect("number");
+        assert_eq!(options.ordinal, Some(3));
+        assert!(options.path.is_none());
+        assert!(options.id.is_none());
+
+        let options = parse_set_options(&args(&["3", "--monitor", r"\\.\DISPLAY1"]))
+            .expect("number and monitor");
+        assert_eq!(options.ordinal, Some(3));
+        assert_eq!(options.monitor.as_deref(), Some(r"\\.\DISPLAY1"));
+
+        // Exactly one target: number + path, number + id all fail.
+        assert!(parse_set_options(&args(&["3", "clip.mp4"])).is_err());
+        assert!(parse_set_options(&args(&["3", "--id", "a3f2"])).is_err());
+        // `0` parses as a number and is rejected at resolution time with
+        // a readable message, never sent on the wire.
+        assert_eq!(
+            parse_set_options(&args(&["0"])).expect("zero").ordinal,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn remove_target_resolution_precedence() {
+        let items = vec![
+            item("a1b2", r"C:\v\one.mp4"),
+            item("9182", r"C:\v\two.mp4"),
+            item("c3d4", r"C:\v\three.mp4"),
+        ];
+        // In-range ordinal wins — even over an id that looks like one.
+        assert_eq!(
+            resolve_remove_target(&items, "2", "").expect("ordinal").id,
+            "9182"
+        );
+        // Out-of-range digits fall through to the all-digit id match.
+        assert_eq!(
+            resolve_remove_target(&items, "9182", "").expect("id").id,
+            "9182"
+        );
+        // Out-of-range digits with no matching id resolve to nothing.
+        assert!(resolve_remove_target(&items, "77", "").is_none());
+        assert!(resolve_remove_target(&items, "0", "").is_none());
+        // Hex ids and paths keep working (the old names are aliases).
+        assert_eq!(
+            resolve_remove_target(&items, "C3D4", "")
+                .expect("hex id")
+                .id,
+            "c3d4"
+        );
+        assert_eq!(
+            resolve_remove_target(&items, "other.mp4", r"C:\v\three.mp4")
+                .expect("path")
+                .id,
+            "c3d4"
+        );
+        assert!(resolve_remove_target(&items, "missing.mp4", r"C:\v\missing.mp4").is_none());
+    }
+
+    /// A library row for the pure resolvers above.
+    fn item(id: &str, path: &str) -> LibraryItem {
+        LibraryItem::new(
+            id.to_string(),
+            path.to_string(),
+            cascade_core::library::VideoMetadata {
+                width: 1,
+                height: 1,
+                fps: None,
+                duration_ms: None,
+                bitrate_bps: None,
+                codec: "H264".to_string(),
+                profile: None,
+                level: None,
+                hdr: None,
+            },
+            0,
+        )
     }
 
     #[test]
