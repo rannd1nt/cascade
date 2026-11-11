@@ -10,3 +10,20 @@ thiserror = { workspace = true }
 # workspace dependency; already used by cascade-win for state.json.
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Pipe **client** transport (design-m5 D10): `client` is the only module
+# in this crate that touches Win32, kept narrow so `cascade-ui` can talk
+# to the daemon without depending on `cascade-win` (AGENTS §4).
+# MIT OR Apache-2.0 — same family as the existing `windows` 0.62, no
+# GPL/LGPL (AGENTS §3.5, license checked at introduction, §11).
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_RemoteDesktop",
+    # CreateFileW is cfg-gated on this feature in windows-sys 0.61 (its
+    # signature takes SECURITY_ATTRIBUTES) — same reason as cascade-win.
+    "Win32_Security",
+    # ReadFile/WriteFile take an OVERLAPPED pointer from this module.
+    "Win32_System_IO",
+] }

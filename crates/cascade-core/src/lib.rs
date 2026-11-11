@@ -1,12 +1,17 @@
 //! Platform-independent types for Cascade.
 //!
-//! Nothing in this crate may depend on Win32, Media Foundation, or a GUI toolkit.
+//! Nothing in this crate may depend on Media Foundation or a GUI toolkit.
+//! The single Win32 exception is [`client`] — the named-pipe **client**
+//! transport (design-m5 D10): a narrow set of `windows-sys` calls so the
+//! CLI and the GUI can both reach the daemon without depending on
+//! `cascade-win` (AGENTS §4). The pipe server stays in `cascade-win`.
 
 use std::path::Path;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub mod assess;
+pub mod client;
 pub mod device;
 pub mod ipc;
 pub mod library;

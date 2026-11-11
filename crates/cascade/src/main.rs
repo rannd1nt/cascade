@@ -14,6 +14,7 @@ use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use cascade_core::assess::{codec_key, Recommendation, Severity, Warning};
+use cascade_core::client;
 use cascade_core::device::{level_name, profile_name};
 use cascade_core::ipc::{
     no_data, AssessReport, AssessRequest, AutostartStatus, EnabledData, LibraryAddData,
@@ -24,7 +25,7 @@ use cascade_core::library::{dedupe_key, LibraryItem};
 use cascade_core::rule_engine::{BatteryAction, PowerProfile};
 use cascade_core::{MediaBackend, PresentationMode};
 use cascade_media::{MediaEngineBackend, SourceReaderBackend};
-use cascade_win::{console, control, daemon, doctor, dpi, host, install, ipc, registry, state};
+use cascade_win::{console, control, daemon, doctor, dpi, host, install, registry, state};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -304,7 +305,7 @@ fn run_detached(args: &[String]) -> Result<ExitCode, String> {
             Ok(None) => {}
             Err(err) => return Err(format!("--detached: {err}")),
         }
-        match ipc::request("status", no_data()) {
+        match client::request("status", no_data()) {
             // The pipe answers: the daemon is up and controllable.
             Ok(_) => {
                 println!("detached: engine running as pid {pid}");
@@ -568,8 +569,8 @@ fn cmd_status(args: &[String]) -> Result<ExitCode, String> {
 
 /// Request the `status` payload and decode it into the shared type.
 fn ipc_client_status() -> Result<cascade_core::ipc::Status, String> {
-    let data = cascade_win::ipc::request("status", cascade_core::ipc::no_data())
-        .map_err(|err| err.to_string())?;
+    let data =
+        client::request("status", cascade_core::ipc::no_data()).map_err(|err| err.to_string())?;
     serde_json::from_value(data).map_err(|err| format!("engine sent an unreadable status: {err}"))
 }
 
@@ -694,13 +695,13 @@ fn cmd_autostart(args: &[String]) -> Result<ExitCode, String> {
 /// `cascade restore` — repaint through the pipe, with the window message as
 /// the fallback for a daemon that predates `wallpaper.restore`.
 fn cmd_restore() -> Result<ExitCode, String> {
-    match ipc::request("wallpaper.restore", no_data()) {
+    match client::request("wallpaper.restore", no_data()) {
         Ok(_) => {
             println!("restore: requested");
             Ok(ExitCode::SUCCESS)
         }
         // The daemon is not running at all: say so instead of pretending.
-        Err(ipc::ClientError::NotRunning) => Err("Cascade is not running".to_string()),
+        Err(client::ClientError::NotRunning) => Err("Cascade is not running".to_string()),
         // Busy, timeout, an older daemon without the command: the window
         // post has always worked, so fall back to it.
         Err(_) => cmd_signal(control::WM_CASCADE_RESTORE, "restore"),
@@ -719,7 +720,7 @@ fn cmd_playback(paused: bool, args: &[String]) -> Result<ExitCode, String> {
     } else {
         "playback.resume"
     };
-    ipc::request(cmd, no_data()).map_err(|err| err.to_string())?;
+    client::request(cmd, no_data()).map_err(|err| err.to_string())?;
     println!("{label}d");
     Ok(ExitCode::SUCCESS)
 }
@@ -859,7 +860,7 @@ fn cmd_set(args: &[String]) -> Result<ExitCode, String> {
     };
     let payload =
         serde_json::to_value(data).map_err(|err| format!("could not build request: {err}"))?;
-    let data = ipc::request("wallpaper.set", payload).map_err(|err| err.to_string())?;
+    let data = client::request("wallpaper.set", payload).map_err(|err| err.to_string())?;
     println!("{label}");
     // S5 (design-m4 §5.3): the daemon assessed before answering — a
     // rejection (`error`) already surfaced through the Err above; what
@@ -903,7 +904,7 @@ fn cmd_clear(args: &[String]) -> Result<ExitCode, String> {
     let monitor = parse_monitor_option(args)?;
     let payload = serde_json::to_value(MonitorData { monitor })
         .map_err(|err| format!("could not build request: {err}"))?;
-    ipc::request("wallpaper.clear", payload).map_err(|err| err.to_string())?;
+    client::request("wallpaper.clear", payload).map_err(|err| err.to_string())?;
     println!("cleared; the desktop keeps its colour background");
     Ok(ExitCode::SUCCESS)
 }
@@ -915,13 +916,13 @@ fn cmd_quit(args: &[String]) -> Result<ExitCode, String> {
     if !args.is_empty() {
         return Err("quit takes no arguments".to_string());
     }
-    match ipc::request("quit", no_data()) {
+    match client::request("quit", no_data()) {
         Ok(_) => {
             println!("stopping");
             Ok(ExitCode::SUCCESS)
         }
-        Err(ipc::ClientError::NotRunning) => Err("Cascade is not running".to_string()),
-        Err(ipc::ClientError::Busy) => {
+        Err(client::ClientError::NotRunning) => Err("Cascade is not running".to_string()),
+        Err(client::ClientError::Busy) => {
             Err("the engine is busy — retry, or use `cascade stop`".to_string())
         }
         Err(err) => Err(err.to_string()),
@@ -946,7 +947,7 @@ fn settings_get(args: &[String]) -> Result<ExitCode, String> {
             other => return Err(format!("unknown option for settings get: {other}")),
         }
     }
-    let data = ipc::request("settings.get", no_data()).map_err(|err| err.to_string())?;
+    let data = client::request("settings.get", no_data()).map_err(|err| err.to_string())?;
     if json {
         println!(
             "{}",
@@ -1000,7 +1001,7 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
         let enabled = parse_bool(value)?;
         let payload = serde_json::to_value(EnabledData { enabled })
             .map_err(|err| format!("could not build request: {err}"))?;
-        let data = ipc::request("autostart.set", payload).map_err(|err| err.to_string())?;
+        let data = client::request("autostart.set", payload).map_err(|err| err.to_string())?;
         let status: AutostartStatus = serde_json::from_value(data)
             .map_err(|err| format!("engine sent an unreadable autostart status: {err}"))?;
         println!("autostart = {}", if status.enabled { "on" } else { "off" });
@@ -1013,7 +1014,7 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
     let (patch, canonical) = build_patch(key, value)?;
     let payload =
         serde_json::to_value(patch).map_err(|err| format!("could not build request: {err}"))?;
-    let data = ipc::request("settings.set", payload).map_err(|err| err.to_string())?;
+    let data = client::request("settings.set", payload).map_err(|err| err.to_string())?;
     let settings: Settings = serde_json::from_value(data)
         .map_err(|err| format!("engine sent unreadable settings: {err}"))?;
     println!("{key} = {canonical}");
@@ -1155,7 +1156,7 @@ fn cmd_library(args: &[String]) -> Result<ExitCode, String> {
 /// Fresh `library.list` — ordinals resolve against the live list at
 /// execution time, never a cached one (design-m5 D1).
 fn fetch_library() -> Result<LibraryItemsData, String> {
-    let data = ipc::request("library.list", no_data()).map_err(|err| err.to_string())?;
+    let data = client::request("library.list", no_data()).map_err(|err| err.to_string())?;
     serde_json::from_value(data).map_err(|err| format!("engine sent an unreadable library: {err}"))
 }
 
@@ -1240,7 +1241,7 @@ fn library_add(args: &[String]) -> Result<ExitCode, String> {
     }
     let payload = serde_json::to_value(LibraryAddData { paths })
         .map_err(|err| format!("could not build request: {err}"))?;
-    let data = ipc::request("library.add", payload).map_err(|err| err.to_string())?;
+    let data = client::request("library.add", payload).map_err(|err| err.to_string())?;
     let result: LibraryAddResult = serde_json::from_value(data)
         .map_err(|err| format!("engine sent an unreadable add result: {err}"))?;
     for item in &result.added {
@@ -1303,7 +1304,7 @@ fn library_remove(args: &[String]) -> Result<ExitCode, String> {
         id: item.id.clone(),
     })
     .map_err(|err| format!("could not build request: {err}"))?;
-    ipc::request("library.remove", payload).map_err(|err| err.to_string())?;
+    client::request("library.remove", payload).map_err(|err| err.to_string())?;
     println!(
         "removed: {} ({}) — the file itself is untouched",
         item.title, item.path
@@ -1346,7 +1347,7 @@ fn library_prune(args: &[String]) -> Result<ExitCode, String> {
     if !args.is_empty() {
         return Err("prune takes no arguments".to_string());
     }
-    let data = ipc::request("library.prune", no_data()).map_err(|err| err.to_string())?;
+    let data = client::request("library.prune", no_data()).map_err(|err| err.to_string())?;
     let result: LibraryPruneResult = serde_json::from_value(data)
         .map_err(|err| format!("engine sent an unreadable prune result: {err}"))?;
     if result.removed == 0 {
@@ -1430,7 +1431,7 @@ fn cmd_assess(args: &[String]) -> Result<ExitCode, String> {
     }
     let payload = serde_json::to_value(AssessRequest { path, monitor })
         .map_err(|err| format!("could not build request: {err}"))?;
-    let data = ipc::request("assess", payload).map_err(|err| err.to_string())?;
+    let data = client::request("assess", payload).map_err(|err| err.to_string())?;
     if json {
         let text = serde_json::to_string_pretty(&data)
             .map_err(|err| format!("could not print the report: {err}"))?;

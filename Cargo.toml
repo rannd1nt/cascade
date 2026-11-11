@@ -27,6 +27,9 @@ windows = "0.62"
 # Direct dependency only for the `#[implement]` macro, which emits
 # `::windows_core::` paths; same version windows already pulls in.
 windows-core = "0.62"
+# One version for the pipe client (cascade-core, design-m5 D10) and the
+# pipe server (cascade-win). MIT OR Apache-2.0 (AGENTS §11).
+windows-sys = "0.61"
 
 [profile.release]
 opt-level = 2
