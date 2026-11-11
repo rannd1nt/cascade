@@ -27,6 +27,32 @@ cascade.exe --ui          GUI client (only while the window is open)
 cascade.exe <command>     CLI client (one-shot)
 ```
 
+Two standing rules:
+
+- **CLI first.** Every user-facing action must be reachable from the CLI;
+  the tray and the GUI are thin layers over the same daemon paths. A
+  feature that exists only in the GUI does not exist.
+- **The product targets the general Windows 11 population.** This dev
+  machine (build 26200, 1366×768, Intel UHD) is only the development and
+  test object — never design, tune, or patch for it specifically: no
+  hardcoded paths, monitors, resolutions, DPI, or hardware assumptions.
+  Behaviour must hold on a typical Windows 11 machine (per-monitor DPI,
+  100–200 % scaling, multi-monitor, varied GPUs), and every undocumented
+  Windows behaviour gets its recorded build number + fallback (§9).
+- **Assume hardware variety this machine cannot show.** The installed
+  base includes Intel **and** AMD CPUs; integrated GPUs (Intel UHD /
+  Iris Xe, AMD Radeon iGPU) and dedicated GPUs (NVIDIA GTX/RTX, AMD
+  Radeon RX, plus laptop iGPU+dGPU switchable setups); SATA SSD, NVMe
+  and spinning HDDs; 100–200 % DPI scaling; mixed refresh-rate multi-
+  monitor layouts; and machines with no audio device at all. Every
+  design and fix must reason about those variants explicitly —
+  capability probes, documented fallbacks, honest capability reporting
+  — never assume this box's Intel UHD path. Full compatibility
+  verification is impossible here: it is **the final milestone**, run
+  after everything else is done — possibly only after the first beta
+  release ships (see `docs/architecture.md` §12). What was *not* tested
+  must be stated, not hidden (§9, README limitations).
+
 Keep answers and reasoning in the language the user writes in (Indonesian is fine), but
 **all code, comments, commit messages, docs, identifiers, and CLI output are English.**
 
