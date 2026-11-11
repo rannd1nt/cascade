@@ -7,12 +7,11 @@ after a reboot, and never touches your files.
 
 No WebView2. No Electron. No bundled mpv/ffmpeg. One small executable.
 
-> **Status (2026-11-09):** M0–M1 complete (all gates A–F measured, `docs/reliability.md`
-> §11); M2 native player shipping — hardware decode + quality rows re-measured on the
-> current build (`docs/benchmark-m2.md` §11); M3 shipped for session-lock only, the
-> remaining pause collectors are designed in `docs/design-m3b.md`; **M4 (IPC + CLI +
-> library + assessment + install) in progress — S0–S6 done, next S7**
-> (`docs/design-m4.md` §8). The daemon plays H.264 behind the icons, is fully
+> **Status (2026-11-12):** M0–M4 measured complete (S7 evidence:
+> `docs/design-m4.md` §8.7); **M5 started — P1 (CLI foundation) shipped and
+> verified on target**: `run --detached`, ordinal `library ls` / `set <n>` /
+> `library rm <n>`, `stop` (`P1-VERIFY: ALL PASS`, 38 checks —
+> `docs/design-m5.md` §14). The daemon plays H.264 behind the icons, is fully
 > controllable over a named pipe, `cascade install` puts `cascade` on your PATH,
 > and every exit path restores the desktop.
 
@@ -40,6 +39,31 @@ No WebView2. No Electron. No bundled mpv/ffmpeg. One small executable.
 | Windows 10 | A second host code path for no benefit |
 | Marketplace, accounts, cloud, telemetry | Local files only |
 | Hooking or injecting into Explorer | We only create our own window |
+
+---
+
+## Usage
+
+Everything runs through the daemon; the CLI is the primary interface.
+
+```text
+cascade run [--video <path>] [--detached]  # start the engine; --detached returns at once
+cascade stop                               # quit through the repaint ladder
+cascade status [--json]                    # running? playing what?
+cascade pause | resume
+cascade set <n> | <file> | --id <id>       # play a library row (n = the number from `library ls`)
+cascade library ls | add <path> | rm <n> | prune
+cascade settings get | set <key> <value>
+cascade autostart on | off | status
+cascade doctor                             # no daemon needed
+```
+
+`cascade run --detached` returns as soon as the engine answers its pipe
+(`detached: engine running as pid …`) — close the terminal right away, the
+wallpaper keeps playing. The numbers printed by `library ls` are CLI-only
+ordinals: `set <n>` and `rm <n>` resolve them against a fresh list at
+execution time and send stable ids, so a renumbered list cannot corrupt
+anything (`docs/design-m5.md` §4).
 
 ---
 
@@ -127,15 +151,20 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
   PowerShell to wait) or `cmd /c cascade status`. After `cascade install` a generated
   `cascade.cmd` shim makes plain `cascade ...` calls synchronous; the measurements are
   in `docs/design-m4.md` §6.4.
-- **Redirected output through cmd/PowerShell comes out empty — exit codes still
-  work.** When `cmd.exe` or Windows PowerShell starts `cascade ...` with its
-  output redirected (`cascade --help > out.txt`, `cascade --help | findstr ...`),
-  the GUI child's text lands on the parent's hidden console instead of the
-  redirect and is lost (measured, Windows 11 build 26200.9711; every exit code
-  arrives, e.g. the HEVC refusal's `2`). Printing on a real interactive console
-  is unaffected. To capture text, start the exe directly with a redirect you
-  own (`Start-Process -RedirectStandardOutput ...`), which is what the test
-  harness does. Details in `docs/design-m4.md` §6.4.
+- **Redirected output: cmd and pipelines work; PowerShell `> file` does not.**
+  Measured on Windows 11 build 26200.9711: a successful `AttachConsole`
+  *replaces* already-valid standard handles, so before the 2026-11-12 stdio
+  fix any redirect through `cmd` came out empty (`cascade --help > out.txt`
+  → 0 bytes; `docs/design-m4.md` §6.4). After the fix (`console.rs` checks
+  the handles **before** attaching) cmd file and pipe redirects deliver the
+  text — 0 → 22 bytes, `docs/design-m5.md` §14. Still broken: Windows
+  PowerShell 5.1's `> file` to a GUI-subsystem child loses the text and the
+  child panics with `os error 232` (PS closes the pipe early — a PowerShell
+  behaviour, not ours). To capture text from PowerShell use a pipeline
+  (`cascade status | Out-String`), `cmd /c cascade … > out.txt`, or
+  `Start-Process -RedirectStandardOutput …`. Exit codes always arrive either
+  way (e.g. the HEVC refusal's `2`), and printing on a real interactive
+  console is unaffected.
 
 ## Build (from WSL, no Windows toolchain required)
 
