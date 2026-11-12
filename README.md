@@ -8,12 +8,16 @@ after a reboot, and never touches your files.
 No WebView2. No Electron. No bundled mpv/ffmpeg. One small executable.
 
 > **Status (2026-11-12):** M0–M4 measured complete (S7 evidence:
-> `docs/design-m4.md` §8.7); **M5 started — P1 (CLI foundation) shipped and
-> verified on target**: `run --detached`, ordinal `library ls` / `set <n>` /
-> `library rm <n>`, `stop` (`P1-VERIFY: ALL PASS`, 38 checks —
-> `docs/design-m5.md` §14). The daemon plays H.264 behind the icons, is fully
-> controllable over a named pipe, `cascade install` puts `cascade` on your PATH,
-> and every exit path restores the desktop.
+> `docs/design-m4.md` §8.7); **M5 in progress — P1 (CLI foundation) and
+> P2 (GUI MVP) shipped and verified on target**: `run --detached`,
+> ordinal `library ls` / `set <n>` / `library rm <n>`, `stop`
+> (`P1-VERIFY: ALL PASS`, 38 checks), and the GUI (`cascade ui`): add /
+> remove / set a video through the native file dialog, Start-engine when
+> the daemon is down, window geometry persistence, and **0 MB** measured
+> impact on the daemon while the window is open (`docs/design-m5.md`
+> §14). The daemon plays H.264 behind the icons, is fully
+> controllable over a named pipe, `cascade install` puts `cascade` on
+> your PATH, and every exit path restores the desktop.
 
 ---
 
@@ -55,6 +59,7 @@ cascade set <n> | <file> | --id <id>       # play a library row (n = the number 
 cascade library ls | add <path> | rm <n> | prune
 cascade settings get | set <key> <value>
 cascade autostart on | off | status
+cascade ui                                 # open the library window (alias --ui)
 cascade doctor                             # no daemon needed
 ```
 
