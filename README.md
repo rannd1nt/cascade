@@ -70,6 +70,11 @@ ordinals: `set <n>` and `rm <n>` resolve them against a fresh list at
 execution time and send stable ids, so a renumbered list cannot corrupt
 anything (`docs/design-m5.md` §4).
 
+With `tray = true` (the default) the daemon also shows a notification-area
+icon with a small menu — **Open Cascade / Pause / Quit**. Every entry is a
+thin wrapper over the commands above (`ui`, `pause`/`resume`, `stop`);
+`settings set tray false` hides the icon while the daemon keeps running.
+
 ---
 
 ## Measured baseline (M0, mpv harness)
