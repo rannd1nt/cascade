@@ -51,6 +51,7 @@ use crate::registry;
 use crate::repaint;
 use crate::shell::{self, ShellError, ShellSurface};
 use crate::state::{DaemonState, Store};
+use crate::tray::{Tray, TrayAction};
 use crate::wallpaper::WallpaperSnapshot;
 use crate::{derr, dlog};
 
@@ -771,6 +772,57 @@ fn power_step(step: PowerStep<'_>) -> bool {
 
 fn exe_path() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::new())
+}
+
+/// Tray "Open Cascade" (design-m5 §6, P3): spawn the same `cascade ui`
+/// command the CLI runs, with null stdio (AGENTS §1 — the menu only
+/// opens existing CLI paths; there is no console to inherit from).
+fn spawn_ui() {
+    let exe = exe_path();
+    if exe.as_os_str().is_empty() {
+        derr!("tray: open: could not determine the executable path");
+        return;
+    }
+    match std::process::Command::new(&exe)
+        .arg("ui")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => dlog!("tray: opened the UI (pid {})", child.id()),
+        Err(err) => derr!("tray: open failed: {err}"),
+    }
+}
+
+/// Perform one tray menu choice on the main loop (design-m5 §6). Quit
+/// uses the shared quit function — the normal exit ladder runs on the
+/// next loop condition check, repaint first (§4, AGENTS §13).
+fn run_tray_action(
+    action: TrayAction,
+    flags: &mut Flags,
+    settings: &Settings,
+    backend: &mut BackendGuard,
+) {
+    match action {
+        TrayAction::OpenUi => spawn_ui(),
+        TrayAction::TogglePause => {
+            flags.user_paused = !flags.user_paused;
+            dlog!(
+                "playback: {} (tray)",
+                if flags.user_paused {
+                    "paused"
+                } else {
+                    "resumed"
+                }
+            );
+            apply_playback(backend, settings, flags, control::session_locked());
+        }
+        TrayAction::Quit => {
+            dlog!("tray: quit requested");
+            control::request_quit();
+        }
+    }
 }
 
 /// Everything one command drain may touch (design-m4 §2.2). The borrow is
@@ -1762,6 +1814,11 @@ pub fn run(
         derr!("session notifications unavailable (error {code}); pause-on-lock disabled");
     }
 
+    // Tray icon on the control window (design-m5 §6, P3): gated by the
+    // persisted `settings.tray`; a failure logs and continues — the
+    // desktop never depends on a notification-area icon.
+    let mut tray = Tray::new(control.hwnd(), settings.tray);
+
     let snapshot = crate::wallpaper::snapshot();
     dlog!("cascade {} starting", env!("CARGO_PKG_VERSION"));
     // The executable path makes bug reports unambiguous: it shows exactly
@@ -2005,6 +2062,14 @@ pub fn run(
             break;
         }
 
+        // Tray (design-m5 §6, P3), turn 1 of 2: reconcile the icon with
+        // the live `settings.tray` (applies here, without waiting for a
+        // window message) and run a menu choice recorded during the
+        // previous message drain.
+        if let Some(action) = tray.step(settings.tray, flags.user_paused) {
+            run_tray_action(action, &mut flags, &settings, &mut backend_guard);
+        }
+
         // S2b: one collector turn per iteration (design-m4 §2.6) — gate,
         // raw sample through the 3 s hysteresis, reconcile. Placed before
         // the wait so a broadcast dispatched at the end of the previous
@@ -2089,6 +2154,12 @@ pub fn run(
             }
         }
 
+        // Tray (design-m5 §6, P3), turn 2 of 2: a click or a
+        // `TaskbarCreated` broadcast was recorded during the drain above.
+        if let Some(action) = tray.step(settings.tray, flags.user_paused) {
+            run_tray_action(action, &mut flags, &settings, &mut backend_guard);
+        }
+
         if control::take_restore_request() {
             run_restore(
                 &mut host,
@@ -2158,6 +2229,11 @@ pub fn run(
     // function. The desktop must be repainted and the state saved before
     // anything else, including logging.
     dlog!("stopping");
+    // The tray icon goes first (design-m5 §6): the user sees the daemon
+    // leave the notification area immediately, and the control window is
+    // still alive below for NIM_DELETE — including a respawn exit, so the
+    // child's own icon is the only one left.
+    tray.remove();
     // S2b: drop the power subscription while the control window it points
     // at is still alive (design-m4 §2.6). The OS would reclaim it on
     // process exit anyway; doing it here keeps the respawn path symmetric.

@@ -19,6 +19,7 @@ pub mod repaint;
 pub mod shell;
 pub mod state;
 pub mod system;
+pub mod tray;
 pub mod wallpaper;
 pub mod wide;
 

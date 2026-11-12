@@ -23,11 +23,12 @@ use windows_sys::Win32::System::RemoteDesktop::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, FindWindowW, LoadCursorW, PostMessageW, PostQuitMessage,
     RegisterClassExW, IDC_ARROW, PBT_POWERSETTINGCHANGE, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE,
-    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK,
-    WTS_SESSION_UNLOCK,
+    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_LBUTTONUP, WM_POWERBROADCAST, WM_QUERYENDSESSION,
+    WM_RBUTTONUP, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
+use crate::tray;
 use crate::wide;
 
 pub const CONTROL_CLASS: &str = "CascadeDaemon";
@@ -42,6 +43,12 @@ pub const WM_CASCADE_RESTORE: u32 = WM_APP + 1;
 /// `MsgWaitForMultipleObjectsEx` return instead of waiting for the next
 /// watchdog tick.
 pub const WM_APP_PIPE: u32 = WM_APP + 2;
+
+/// Notify-icon callback from the shell (design-m5 §6, P3): `wParam` is
+/// the icon id, `lParam` the mouse message. Legacy semantics — no
+/// `NIM_SETVERSION`. The window procedure only records a menu request;
+/// the main loop shows the menu.
+pub const WM_APP_TRAY: u32 = WM_APP + 3;
 
 /// Ask a running daemon to stop gracefully (repaint, then exit).
 pub const WM_CASCADE_STOP: u32 = WM_CLOSE;
@@ -274,6 +281,23 @@ unsafe extern "system" fn control_wndproc(
         // command itself rides the channel; returning 0 just unblocks the
         // main loop's wait so it can drain the channel now.
         WM_APP_PIPE => 0,
+        // Tray click (design-m5 §6, P3): record only — the main loop
+        // builds the menu and performs the action, the same rule as the
+        // session-lock and power flags above.
+        WM_APP_TRAY => {
+            match lparam as u32 {
+                WM_LBUTTONUP | WM_RBUTTONUP => tray::request_menu(),
+                _ => {}
+            }
+            0
+        }
+        // Explorer restarted (broadcast, design-m5 §6): the shell dropped
+        // the tray icon; the main loop re-adds it. The id is registered
+        // by `tray::Tray::new` — 0 (not registered yet) never matches.
+        msg if msg == tray::taskbar_created_id() && msg != 0 => {
+            tray::request_reload();
+            0
+        }
         _ => {
             // SAFETY: default handling.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -315,5 +339,15 @@ mod tests {
         assert_ne!(WM_APP_PIPE, WM_CASCADE_STOP);
         // Const values must be asserted in a const block (clippy).
         const { assert!(WM_APP_PIPE >= WM_APP, "must stay in the app range") };
+    }
+
+    #[test]
+    fn tray_callback_message_does_not_collide() {
+        // P3 (design-m5 §6): the shell's callback must be its own app
+        // message, distinct from every other control-window message.
+        assert_ne!(WM_APP_TRAY, WM_APP_PIPE);
+        assert_ne!(WM_APP_TRAY, WM_CASCADE_RESTORE);
+        assert_ne!(WM_APP_TRAY, WM_CASCADE_STOP);
+        const { assert!(WM_APP_TRAY > WM_APP_PIPE, "newest app message") };
     }
 }
