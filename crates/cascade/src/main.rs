@@ -38,7 +38,7 @@ fn main() -> ExitCode {
     let result = if args.is_empty() {
         bare_main()
     } else {
-        console::prepare_stdio(is_daemon_role(&args));
+        console::prepare_stdio(is_daemon_role(&args) || is_gui_role(&args));
         dispatch(&args)
     };
     match result {
@@ -125,6 +125,14 @@ fn is_daemon_role(args: &[String]) -> bool {
     )
 }
 
+/// `ui` / `--ui` open a GUI window (design-m5 D11c). Like the daemon it
+/// must never *create* a console — a windowed app double-clicked from a
+/// shortcut would flash one — while a terminal launch still attaches and
+/// prints errors there (same `prepare_stdio` strategy as the daemon).
+fn is_gui_role(args: &[String]) -> bool {
+    matches!(args.first().map(String::as_str), Some("ui") | Some("--ui"))
+}
+
 fn dispatch(args: &[String]) -> Result<ExitCode, String> {
     match args.first().map(String::as_str) {
         None => cmd_run(&[]),
@@ -154,8 +162,11 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Some("ui") | Some("--ui") => {
-            println!("The library window is not implemented yet (milestone M5).");
-            println!("Use `cascade run` for the engine and `cascade doctor` for diagnostics.");
+            // The library window (design-m5 P2): a separate process that
+            // talks to the daemon only over the pipe. D7 (a second
+            // instance focuses the first) is deferred to P4 — today a
+            // second launch simply opens a second window.
+            cascade_ui::run()?;
             Ok(ExitCode::SUCCESS)
         }
         Some(other) => {
@@ -1585,7 +1596,9 @@ fn print_help() {
         "  cascade install                    copy this exe to %LOCALAPPDATA%\\Cascade + PATH"
     );
     println!("  cascade uninstall [--purge]        remove the install (--purge also drops state)");
-    println!("  cascade ui");
+    println!("  cascade ui                          open the library window");
+    println!("                                      (alias: --ui; needs a running engine");
+    println!("                                      or offers to start it)");
     println!();
     println!("  run is the default. --autostart is accepted for the Run key.");
     println!("  Without --video, the last successfully played path replays.");
@@ -1606,10 +1619,24 @@ mod tests {
         assert!(is_daemon_role(&args(&["--autostart"])));
         assert!(!is_daemon_role(&args(&["status"])));
         assert!(!is_daemon_role(&args(&["doctor"])));
+        assert!(!is_daemon_role(&args(&["ui"])));
         // Run options only count after `run`; a bare flag is a CLI typo.
         assert!(!is_daemon_role(&args(&["--repaint", "2"])));
         assert!(!is_daemon_role(&args(&["--color", "FF0000"])));
         assert!(!is_daemon_role(&args(&["--video", "clip.mp4"])));
+    }
+
+    #[test]
+    fn gui_role_is_exactly_the_two_ui_spellings() {
+        assert!(is_gui_role(&args(&["ui"])));
+        assert!(is_gui_role(&args(&["--ui"])));
+        // `ui` with arguments stays the GUI role; the window itself takes
+        // none (design-m5 §5) — anything else must keep its own stdio.
+        assert!(is_gui_role(&args(&["ui", "extra"])));
+        assert!(!is_gui_role(&args(&["status"])));
+        assert!(!is_gui_role(&args(&["run"])));
+        assert!(!is_gui_role(&args(&["uix"])));
+        assert!(!is_gui_role(&[]));
     }
 
     #[test]

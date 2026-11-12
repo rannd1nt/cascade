@@ -4,6 +4,7 @@ members = [
     "crates/cascade-core",
     "crates/cascade-win",
     "crates/cascade-media",
+    "crates/cascade-ui",
     "crates/cascade",
 ]
 
@@ -17,6 +18,13 @@ rust-version = "1.80"
 cascade-core = { path = "crates/cascade-core" }
 cascade-win = { path = "crates/cascade-win" }
 cascade-media = { path = "crates/cascade-media" }
+cascade-ui = { path = "crates/cascade-ui" }
+# design-m5 D11 (AGENTS §11 license check): first GUI framework. MIT OR
+# Apache-2.0, no GPL/LGPL. glow renderer (D5) + bundled fonts only; the
+# default wgpu/wayland/x11/accesskit/clipboard features are not wanted.
+# "persistence" restores the window size across launches (design-m5 D4)
+# into %APPDATA%\Cascade\data\app.ron — inside our own data directory.
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

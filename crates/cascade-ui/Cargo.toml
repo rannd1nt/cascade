@@ -1,0 +1,23 @@
+[package]
+name = "cascade-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# eframe 0.37's MSRV outranks the workspace's 1.80 (design-m5 D11a).
+rust-version = "1.95"
+
+[dependencies]
+cascade-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# design-m5 D11a: the GUI framework (glow renderer + bundled fonts).
+eframe = { workspace = true }
+# design-m5 D11b: IFileOpenDialog straight from the workspace's windows
+# crate — no rfd, no custom file browser (architecture §9, AGENTS §2).
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    # GetActiveWindow: dialog owner (lives in Input, not Messaging).
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
