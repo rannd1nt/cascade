@@ -12,6 +12,7 @@ pub mod install;
 pub mod ipc;
 pub mod library;
 pub mod monitor;
+pub mod offline;
 pub mod power;
 pub mod present;
 pub mod registry;

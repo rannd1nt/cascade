@@ -92,10 +92,17 @@ pub fn path() -> Option<PathBuf> {
 /// Load the persisted settings. A missing file is the normal first run and
 /// yields the defaults; a corrupt one is logged and ignored (never blocks).
 pub fn load() -> Settings {
-    let Some(path) = path() else {
-        return Settings::default();
-    };
-    let text = match fs::read_to_string(&path) {
+    match path() {
+        Some(path) => load_at(&path),
+        None => Settings::default(),
+    }
+}
+
+/// Load from an explicit path — the offline CLI (`design-m5b.md` §3) and
+/// tests use this so neither touches the real profile. Same rules as
+/// [`load`]: missing file = first run, corrupt file = logged defaults.
+pub(crate) fn load_at(path: &Path) -> Settings {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(_) => return Settings::default(), // missing file: first run
     };
@@ -107,7 +114,13 @@ pub fn load() -> Settings {
 /// `settings set`, it only costs durability (the failure is logged).
 pub fn save(settings: &Settings) -> Result<(), String> {
     let path = path().ok_or_else(|| "no writable application data directory".to_string())?;
-    write(&path, settings)
+    save_at(&path, settings)
+}
+
+/// Save to an explicit path (offline CLI + tests); same atomic write as
+/// [`save`].
+pub(crate) fn save_at(path: &Path, settings: &Settings) -> Result<(), String> {
+    write(path, settings)
 }
 
 /// Decode settings from TOML text (missing tables/keys fall back to the

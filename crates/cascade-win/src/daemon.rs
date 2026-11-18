@@ -15,11 +15,10 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use cascade_core::assess::{assess, recommend, Assessment};
-use cascade_core::device::{DeviceProfile, MonitorProfile};
+use cascade_core::device::DeviceProfile;
 use cascade_core::ipc::{
-    no_data, AssessReport, DeviceSummary, ItemAssessment, LibraryAddResult, LibraryItemsData,
-    LibraryPruneResult, LibraryRef, MonitorSummary, RejectedPath, Response, SetReport, Settings,
-    VideoSize,
+    no_data, AssessReport, DeviceSummary, LibraryItemsData, LibraryPruneResult, LibraryRef,
+    MonitorSummary, Response, SetReport, Settings, VideoSize,
 };
 use cascade_core::library::{Library, LibraryItem, VideoMetadata};
 use cascade_core::rule_engine::{BatteryAction, RuleEngine, SessionState};
@@ -44,8 +43,9 @@ use crate::host::{self, Host, HostOptions};
 use crate::ipc::{
     Command, PipeChannels, PipeServer, PlaybackStatus, ServerMsg, StatusSnapshot, QUIT_FLUSH_WAIT,
 };
-use crate::library::LibraryStore;
+use crate::library::{file_proof, LibraryStore};
 use crate::monitor::{self, MonitorInfo};
+use crate::offline;
 use crate::power;
 use crate::registry;
 use crate::repaint;
@@ -996,7 +996,10 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
             }
         }
         Command::LibraryAdd { id, paths } => {
-            let result = library_add(ctx, paths);
+            // The core lives in `offline::library_add_into` so the daemon
+            // and the offline CLI share one implementation (design-m5b §3.4);
+            // the daemon keeps its best-effort persist.
+            let result = offline::library_add_into(ctx.library, ctx.probe, paths);
             persist_library(ctx);
             match serde_json::to_value(result) {
                 Ok(value) => pending.responses.push(Response::ok(id, value)),
@@ -1057,7 +1060,7 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
             // descriptor probe-once, run the pure metric engine. An
             // `error` severity here is a diagnosis, not a refusal.
             let device = crate::device::collect();
-            let target = match pick_monitor(&device, monitor.as_deref()) {
+            let target = match crate::device::pick_monitor(&device, monitor.as_deref()) {
                 Ok(target) => target.clone(),
                 Err(message) => {
                     pending.responses.push(Response::err(
@@ -1125,23 +1128,6 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
     }
 }
 
-/// The D13 staleness proof for one file: modification time in Unix
-/// seconds and byte size. Either side can fail to read (unreadable
-/// metadata, pre-epoch mtime) — `None` on that side means "cannot prove
-/// freshness", and [`LibraryItem::proof_matches`] then treats the entry
-/// as stale instead of guessing.
-fn file_proof(path: &Path) -> (Option<u64>, Option<u64>) {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return (None, None);
-    };
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|since| since.as_secs());
-    (mtime, Some(meta.len()))
-}
-
 /// D13: the descriptor for a path — reuse the library's stored metadata
 /// while its `mtime`+`size` proof still matches the file on disk, else
 /// probe the container (the SourceReader dies inside that call; plain
@@ -1207,142 +1193,12 @@ fn device_summary(device: &DeviceProfile) -> DeviceSummary {
     }
 }
 
-/// The monitor an assessment targets: the requested id, else the primary,
-/// else the first row. A named monitor that does not exist gets the same
-/// `not_found` wording `set` uses (design-m4 §5.4: assess per monitor).
-fn pick_monitor<'a>(
-    device: &'a DeviceProfile,
-    requested: Option<&str>,
-) -> Result<&'a MonitorProfile, String> {
-    if let Some(id) = requested {
-        return device
-            .monitors
-            .iter()
-            .find(|monitor| monitor.id == id)
-            .ok_or_else(|| format!("no monitor {id}; run `cascade status` to list them"));
-    }
-    device
-        .monitors
-        .iter()
-        .find(|monitor| monitor.primary)
-        .or_else(|| device.monitors.first())
-        .ok_or_else(|| "no display is attached to this session".to_string())
-}
-
-/// `library.add` (design-m4 §4): canonicalise each path, check it is a
-/// file, probe its metadata, dedupe by canonical path. Rejections are
-/// per-path — one bad file never fails the batch, and nothing is ever
-/// copied or modified (AGENTS §3.3).
-///
-/// D13 probe-once: an already-stored entry whose `mtime`+`size` proof
-/// still matches is reused without touching Media Foundation at all; a
-/// replaced file at the same path is re-probed here. Every accepted item
-/// also gets its assessment (step 5 of design-m4 §5.3) so the M5 badge
-/// data exists from the moment the item enters the library — errors in
-/// it never block an add (the library is paths only).
-fn library_add(ctx: &mut Loop, paths: Vec<String>) -> LibraryAddResult {
-    let mut result = LibraryAddResult {
-        added: Vec::new(),
-        rejected: Vec::new(),
-        assessments: Vec::new(),
-    };
-    let seed = clock_seed();
-    for (index, raw) in paths.into_iter().enumerate() {
-        // Canonicalise for storage and dedupe; a failure here almost
-        // always means the file does not exist (or is unreachable).
-        let canonical = match std::fs::canonicalize(&raw) {
-            Ok(path) => path,
-            Err(err) => {
-                result.rejected.push(RejectedPath {
-                    path: raw,
-                    reason: format!("file not found: {err}"),
-                });
-                continue;
-            }
-        };
-        if !canonical.is_file() {
-            result.rejected.push(RejectedPath {
-                path: raw,
-                reason: "not a file".to_string(),
-            });
-            continue;
-        }
-        let display = cascade_core::library::display_path(&canonical.to_string_lossy());
-        let (mtime, size) = file_proof(&canonical);
-        let cached = ctx
-            .library
-            .find_by_path(&display)
-            .filter(|entry| entry.proof_matches(mtime, size))
-            .map(LibraryItem::metadata);
-        let meta = match cached {
-            Some(meta) => meta,
-            None => match (ctx.probe)(Path::new(&canonical)) {
-                Ok(meta) => meta,
-                Err(reason) => {
-                    result.rejected.push(RejectedPath {
-                        path: display,
-                        reason,
-                    });
-                    continue;
-                }
-            },
-        };
-        let id = ctx.library.generate_id(seed.wrapping_add(index as u64));
-        let mut item = LibraryItem::new(id, display, meta, clock_seed());
-        if let (Some(mtime), Some(size)) = (mtime, size) {
-            item = item.with_proof(mtime, size);
-        }
-        // `Added` and `Updated` (a re-add refreshes metadata) both land in
-        // `added` — the existing entry is what the caller gets back.
-        let item = match ctx.library.add(item) {
-            cascade_core::library::AddOutcome::Added(item)
-            | cascade_core::library::AddOutcome::Updated(item) => item,
-        };
-        result.added.push(item);
-    }
-    // One device collection per batch, only when something got in: the
-    // primary monitor is the badge's default target (the GUI passes the
-    // assigned one later, design-m4 §5.4).
-    if !result.added.is_empty() {
-        let device = crate::device::collect();
-        if let Ok(target) = pick_monitor(&device, None) {
-            let target = target.clone();
-            let entries: Vec<(String, String, VideoMetadata)> = result
-                .added
-                .iter()
-                .map(|item| (item.id.clone(), item.path.clone(), item.metadata()))
-                .collect();
-            for (id, path, meta) in entries {
-                let assessment = assess(&meta, &device, &target, Fit::Contain);
-                result.assessments.push(ItemAssessment {
-                    id,
-                    path,
-                    warnings: assessment.warnings,
-                    recommendation: assessment.recommendation,
-                });
-            }
-        }
-    }
-    result
-}
-
 /// Persist after any successful mutation; a read-only profile dir costs
 /// durability, never the running daemon (same rule as `config::save`).
 fn persist_library(ctx: &Loop) {
     if let Err(err) = ctx.lib_store.save(ctx.library) {
         derr!("library: {err}");
     }
-}
-
-/// Seed for id generation and `added_at`: wall-clock nanoseconds folded
-/// with the process id so two daemons (in different sessions) do not
-/// march in lockstep.
-fn clock_seed() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    nanos ^ (u64::from(std::process::id()) << 32)
 }
 
 /// `wallpaper.set` (design-m4 S2). Order matters: validate the monitor,
@@ -1452,7 +1308,7 @@ fn set_wallpaper(
         recommendation: None,
     };
     let device = crate::device::collect();
-    if let Ok(target) = pick_monitor(&device, monitor.as_deref()) {
+    if let Ok(target) = crate::device::pick_monitor(&device, monitor.as_deref()) {
         let target = target.clone();
         match descriptor_for(ctx, &path) {
             Ok((meta, refreshed)) => {

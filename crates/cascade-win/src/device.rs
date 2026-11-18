@@ -68,6 +68,30 @@ pub fn collect() -> DeviceProfile {
     }
 }
 
+/// The monitor an assessment targets: the requested id, else the primary,
+/// else the first row. A named monitor that does not exist gets the same
+/// `not_found` wording `set` uses (design-m4 §5.4: assess per monitor).
+/// Shared by the daemon and the offline `library.add` (design-m5b §3.4 —
+/// moved here from `daemon.rs` so both paths pick the same monitor).
+pub fn pick_monitor<'a>(
+    device: &'a DeviceProfile,
+    requested: Option<&str>,
+) -> Result<&'a MonitorProfile, String> {
+    if let Some(id) = requested {
+        return device
+            .monitors
+            .iter()
+            .find(|monitor| monitor.id == id)
+            .ok_or_else(|| format!("no monitor {id}; run `cascade status` to list them"));
+    }
+    device
+        .monitors
+        .iter()
+        .find(|monitor| monitor.primary)
+        .or_else(|| device.monitors.first())
+        .ok_or_else(|| "no display is attached to this session".to_string())
+}
+
 // --- monitors -----------------------------------------------------------------
 
 /// DXGI per-output extras, keyed by device name (`\\.\DISPLAY1`).

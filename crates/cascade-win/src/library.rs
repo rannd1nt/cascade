@@ -4,8 +4,11 @@
 //! Follows the `state.rs` pattern exactly: best-effort, atomic (tmp +
 //! rename), a corrupt or unknown-version file decodes to an **empty
 //! library** and never blocks the daemon. The file holds the list only —
-//! no user media is ever touched (AGENTS §3.3), and only the daemon main
-//! loop writes it (`ipc.md` §3 concurrency rule).
+//! no user media is ever touched (AGENTS §3.3).
+//!
+//! Writers: the daemon main loop (`ipc.md` §3) **or** the offline CLI /
+//! battery listener when no full daemon exists — the routing guard in
+//! `design-m5b.md` §3 makes those mutually exclusive (pipe wins).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -96,6 +99,34 @@ impl LibraryStore {
             format!("replace {}: {err}", path.display())
         })
     }
+
+    /// Test seam: a store rooted at an explicit directory, so offline
+    /// tests never touch the real profile (`design-m5b.md` §3.6).
+    #[cfg(test)]
+    pub(crate) fn open_in(dir: &Path) -> Self {
+        Self {
+            path: Some(dir.join("library.json")),
+        }
+    }
+}
+
+/// The D13 staleness proof for one file: modification time in Unix
+/// seconds and byte size. Either side can fail to read (unreadable
+/// metadata, pre-epoch mtime) — `None` on that side means "cannot prove
+/// freshness", and [`LibraryItem::proof_matches`] then treats the entry
+/// as stale instead of guessing. Shared by the daemon's descriptor
+/// refresh and the offline `library.add` (moved from `daemon.rs`,
+/// `design-m5b.md` §3.4).
+pub fn file_proof(path: &Path) -> (Option<u64>, Option<u64>) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return (None, None);
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs());
+    (mtime, Some(meta.len()))
 }
 
 #[cfg(test)]
