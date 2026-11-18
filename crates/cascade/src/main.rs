@@ -25,7 +25,7 @@ use cascade_core::library::{dedupe_key, LibraryItem};
 use cascade_core::rule_engine::{BatteryAction, PowerProfile};
 use cascade_core::{MediaBackend, PresentationMode};
 use cascade_media::{MediaEngineBackend, SourceReaderBackend};
-use cascade_win::{console, control, daemon, doctor, dpi, host, install, registry, state};
+use cascade_win::{console, control, daemon, doctor, dpi, host, install, offline, registry, state};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -940,6 +940,108 @@ fn cmd_quit(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
+// --- Routing guard (design-m5b §3.1) ----------------------------------------
+/// What the window probe says about our processes, relative to the retry
+/// budget (`design-m5b.md` §3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Guard {
+    /// `control::find_existing()` found no Cascade control window.
+    Absent,
+    /// Our control window exists and the budget still has room: a daemon is
+    /// booting (or hung).
+    Present,
+    /// Our control window exists but the budget is spent: the pipe never
+    /// came up inside it.
+    Unanswered,
+}
+
+/// The decision for one attempt (`design-m5b.md` §3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// The pipe route decides: either a daemon payload or an honest error.
+    Daemon,
+    /// No pipe while our control window exists: retry inside the budget.
+    Retry,
+    /// Two probes found nothing of ours: the direct-file route.
+    Offline,
+    /// The window stayed and the budget ran out: never write behind a
+    /// possibly-live daemon.
+    Hung,
+}
+
+/// The answer to one routed request: the daemon's payload, or the positive
+/// verdict that nothing of ours is running (`design-m5b.md` §3.1).
+enum Routed {
+    Daemon(serde_json::Value),
+    Offline,
+}
+
+/// Retry cadence while a control window exists without a pipe: every 150 ms
+/// up to 1.5 s in total (`design-m5b.md` §3.1).
+const GUARD_RETRY: Duration = Duration::from_millis(150);
+const GUARD_BUDGET: Duration = Duration::from_millis(1_500);
+/// The confirm delay after a first negative verdict: the daemon's boot window
+/// between pipe creation and control window is ~100 ms, so a second probe
+/// 200 ms later settles it (AGENTS §3.17 — no watcher, no auto-spawn).
+const GUARD_CONFIRM: Duration = Duration::from_millis(200);
+const GUARD_HUNG: &str = "a Cascade process is present but not answering — wait a moment and retry";
+
+/// The routing decision for a single attempt. Pure: the loop in
+/// [`request_routed`] performs the sleeps and re-probes; this truth table is
+/// unit-tested.
+fn route(result: &Result<serde_json::Value, client::ClientError>, guard: Guard) -> Route {
+    match result {
+        Ok(_) => Route::Daemon,
+        Err(client::ClientError::NotRunning) => match guard {
+            Guard::Absent => Route::Offline,
+            Guard::Present => Route::Retry,
+            Guard::Unanswered => Route::Hung,
+        },
+        // Any other failure means a process of ours owns the pipe (busy,
+        // wedged, version skew): surface it unchanged — the pipe always
+        // wins, so the file route is never reached behind it.
+        Err(_) => Route::Daemon,
+    }
+}
+
+/// One request, routed (`design-m5b.md` §3.1): the pipe first, and the
+/// direct file route only after a positive double verdict — two probes,
+/// 200 ms apart, with no control window either time.
+fn request_routed(cmd: &str, data: &serde_json::Value) -> Result<Routed, String> {
+    let deadline = Instant::now() + GUARD_BUDGET;
+    let mut confirming = false;
+    loop {
+        let result = client::request(cmd, data.clone());
+        let guard = if control::find_existing().is_none() {
+            Guard::Absent
+        } else if Instant::now() >= deadline {
+            Guard::Unanswered
+        } else {
+            Guard::Present
+        };
+        match route(&result, guard) {
+            Route::Daemon => match result {
+                Ok(value) => return Ok(Routed::Daemon(value)),
+                Err(err) => return Err(err.to_string()),
+            },
+            Route::Retry => {
+                // Never sleep past the budget; the next probe then reports
+                // `Guard::Unanswered` if the window is still there.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(GUARD_RETRY.min(remaining));
+            }
+            Route::Offline => {
+                if confirming {
+                    return Ok(Routed::Offline);
+                }
+                confirming = true;
+                std::thread::sleep(GUARD_CONFIRM);
+            }
+            Route::Hung => return Err(GUARD_HUNG.to_string()),
+        }
+    }
+}
+
 /// `cascade settings get|set` (`ipc.md` §5).
 fn cmd_settings(args: &[String]) -> Result<ExitCode, String> {
     match args.first().map(String::as_str) {
@@ -958,7 +1060,13 @@ fn settings_get(args: &[String]) -> Result<ExitCode, String> {
             other => return Err(format!("unknown option for settings get: {other}")),
         }
     }
-    let data = client::request("settings.get", no_data()).map_err(|err| err.to_string())?;
+    let data = match request_routed("settings.get", &no_data())? {
+        Routed::Daemon(data) => data,
+        // The same file and the same Run-key fill the daemon applies at its
+        // wire edge (design-m5b §3.3): same shape, so scripts cannot tell.
+        Routed::Offline => serde_json::to_value(offline::settings_get())
+            .map_err(|err| format!("could not format settings: {err}"))?,
+    };
     if json {
         println!(
             "{}",
@@ -1012,9 +1120,29 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
         let enabled = parse_bool(value)?;
         let payload = serde_json::to_value(EnabledData { enabled })
             .map_err(|err| format!("could not build request: {err}"))?;
-        let data = client::request("autostart.set", payload).map_err(|err| err.to_string())?;
-        let status: AutostartStatus = serde_json::from_value(data)
-            .map_err(|err| format!("engine sent an unreadable autostart status: {err}"))?;
+        let status: AutostartStatus = match request_routed("autostart.set", &payload)? {
+            Routed::Daemon(data) => serde_json::from_value(data)
+                .map_err(|err| format!("engine sent an unreadable autostart status: {err}"))?,
+            // The Run key is the oracle (design-m4 D10) and this write is
+            // already direct: the same registry calls `cascade autostart
+            // on|off` makes, so the status view is identical (design-m5b §3.2).
+            Routed::Offline => {
+                let exe = std::env::current_exe()
+                    .map_err(|err| format!("cannot resolve the current executable: {err}"))?;
+                if enabled {
+                    registry::autostart_enable(&exe)
+                        .map_err(|code| format!("could not write the Run key (error {code})"))?;
+                } else {
+                    registry::autostart_disable()
+                        .map_err(|code| format!("could not remove the Run value (error {code})"))?;
+                }
+                let state = registry::autostart_state(&exe);
+                AutostartStatus {
+                    enabled: state.registered,
+                    windows_disabled: state.windows_disabled,
+                }
+            }
+        };
         println!("autostart = {}", if status.enabled { "on" } else { "off" });
         if status.windows_disabled {
             println!("  warning: disabled in Settings > Apps > Startup");
@@ -1025,26 +1153,39 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
     let (patch, canonical) = build_patch(key, value)?;
     let payload =
         serde_json::to_value(patch).map_err(|err| format!("could not build request: {err}"))?;
-    let data = client::request("settings.set", payload).map_err(|err| err.to_string())?;
-    let settings: Settings = serde_json::from_value(data)
-        .map_err(|err| format!("engine sent unreadable settings: {err}"))?;
+    let (settings, offline_route) = match request_routed("settings.set", &payload)? {
+        Routed::Daemon(data) => (
+            serde_json::from_value::<Settings>(data)
+                .map_err(|err| format!("engine sent unreadable settings: {err}"))?,
+            false,
+        ),
+        // Apply and persist in this process; with no live engine nothing
+        // applies in-process, and a failed save is an error here so the CLI
+        // never echoes a change that did not stick (design-m5b §3.3).
+        Routed::Offline => (offline::settings_apply(patch)?, true),
+    };
     println!("{key} = {canonical}");
-    // Honest about the apply semantics (`design-engine-mode.md` §3): with a
-    // video playing the daemon restarts itself after this answer; without
-    // one the value simply waits for the next load.
-    if key == "engine_mode" {
-        println!("  daemon restarts to apply it if a video is playing");
-    }
-    // Volume is the opposite case (`design-volume.md` §3): a live property
-    // change, applied without a restart.
-    if key == "volume" {
-        println!("  applied to the playing video immediately (no restart)");
+    for note in set_notes(key, offline_route) {
+        println!("  {note}");
     }
     // A contradictory-but-allowed combination applies and warns (D9).
     if let Some(warning) = settings.conflict_warning() {
         println!("  warning: {warning}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The apply-semantics note after `settings set`: the daemon route says how
+/// a live engine applies the value, the offline route says there is no live
+/// engine yet (`design-m5b.md` §3.3 — honest echoes, same shape).
+fn set_notes(key: &str, offline_route: bool) -> Vec<&'static str> {
+    match (key, offline_route) {
+        ("engine_mode", false) => vec!["daemon restarts to apply it if a video is playing"],
+        ("engine_mode", true) => vec!["applied at the next start (no daemon running)"],
+        ("volume", false) => vec!["applied to the playing video immediately (no restart)"],
+        ("volume", true) => vec!["applied at the next load (no daemon running)"],
+        _ => vec![],
+    }
 }
 
 /// Validate one `settings set <key> <value>` pair and build the patch. The
@@ -1165,9 +1306,13 @@ fn cmd_library(args: &[String]) -> Result<ExitCode, String> {
 }
 
 /// Fresh `library.list` — ordinals resolve against the live list at
-/// execution time, never a cached one (design-m5 D1).
+/// execution time, never a cached one (design-m5 D1). Routed: with no
+/// daemon the stored file answers (design-m5b §3.3).
 fn fetch_library() -> Result<LibraryItemsData, String> {
-    let data = client::request("library.list", no_data()).map_err(|err| err.to_string())?;
+    let data = match request_routed("library.list", &no_data())? {
+        Routed::Daemon(data) => data,
+        Routed::Offline => return Ok(offline::library_list()),
+    };
     serde_json::from_value(data).map_err(|err| format!("engine sent an unreadable library: {err}"))
 }
 
@@ -1250,11 +1395,20 @@ fn library_add(args: &[String]) -> Result<ExitCode, String> {
             std::path::absolute(arg).map_err(|err| format!("cannot resolve {arg}: {err}"))?;
         paths.push(absolute.display().to_string());
     }
-    let payload = serde_json::to_value(LibraryAddData { paths })
-        .map_err(|err| format!("could not build request: {err}"))?;
-    let data = client::request("library.add", payload).map_err(|err| err.to_string())?;
-    let result: LibraryAddResult = serde_json::from_value(data)
-        .map_err(|err| format!("engine sent an unreadable add result: {err}"))?;
+    let payload = serde_json::to_value(LibraryAddData {
+        paths: paths.clone(),
+    })
+    .map_err(|err| format!("could not build request: {err}"))?;
+    let result: LibraryAddResult = match request_routed("library.add", &payload)? {
+        Routed::Daemon(data) => serde_json::from_value(data)
+            .map_err(|err| format!("engine sent an unreadable add result: {err}"))?,
+        // The same shared core with the same probe (design-m5b §3.3): the
+        // added/rejected/assessments output cannot drift from the daemon's.
+        Routed::Offline => {
+            let probe: daemon::ProbeFn = Box::new(cascade_media::probe);
+            offline::library_add(paths, &probe)?
+        }
+    };
     for item in &result.added {
         println!("added: {} ({})", item.title, item.path);
         // Badge data computed at the moment the item entered the library
@@ -1315,7 +1469,20 @@ fn library_remove(args: &[String]) -> Result<ExitCode, String> {
         id: item.id.clone(),
     })
     .map_err(|err| format!("could not build request: {err}"))?;
-    client::request("library.remove", payload).map_err(|err| err.to_string())?;
+    match request_routed("library.remove", &payload)? {
+        Routed::Daemon(_) => {}
+        // The same fresh-store remove as the daemon's arm; `None` means the
+        // id vanished between the list and this call (a race), reported
+        // with the daemon's exact wording.
+        Routed::Offline => {
+            offline::library_remove(&item.id)?.ok_or_else(|| {
+                format!(
+                    "no library item with id '{}' — run `cascade library list`",
+                    item.id
+                )
+            })?;
+        }
+    }
     println!(
         "removed: {} ({}) — the file itself is untouched",
         item.title, item.path
@@ -1358,9 +1525,15 @@ fn library_prune(args: &[String]) -> Result<ExitCode, String> {
     if !args.is_empty() {
         return Err("prune takes no arguments".to_string());
     }
-    let data = client::request("library.prune", no_data()).map_err(|err| err.to_string())?;
-    let result: LibraryPruneResult = serde_json::from_value(data)
-        .map_err(|err| format!("engine sent an unreadable prune result: {err}"))?;
+    let result: LibraryPruneResult = match request_routed("library.prune", &no_data())? {
+        Routed::Daemon(data) => serde_json::from_value(data)
+            .map_err(|err| format!("engine sent an unreadable prune result: {err}"))?,
+        // The daemon's exact drop rule against a freshly loaded store
+        // (design-m5b §3.3).
+        Routed::Offline => LibraryPruneResult {
+            removed: offline::library_prune()?,
+        },
+    };
     if result.removed == 0 {
         println!("nothing to prune — every library file exists");
     } else {
@@ -1607,6 +1780,59 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- routing guard (design-m5b §3.1) --------------------------------
+
+    #[test]
+    fn route_truth_table_covers_every_attempt() {
+        let ok: Result<serde_json::Value, client::ClientError> =
+            Ok(serde_json::json!({"settings": {}}));
+        let not_running: Result<serde_json::Value, client::ClientError> =
+            Err(client::ClientError::NotRunning);
+        let busy: Result<serde_json::Value, client::ClientError> = Err(client::ClientError::Busy);
+        let timeout: Result<serde_json::Value, client::ClientError> =
+            Err(client::ClientError::Timeout);
+
+        // A daemon answered, or the failure is not NotRunning (busy, wedged,
+        // version skew): the pipe route decides whatever the probe says —
+        // the file route is never reached behind a live process.
+        for guard in [Guard::Absent, Guard::Present, Guard::Unanswered] {
+            assert_eq!(route(&ok, guard), Route::Daemon, "ok + {guard:?}");
+            assert_eq!(route(&busy, guard), Route::Daemon, "busy + {guard:?}");
+            assert_eq!(route(&timeout, guard), Route::Daemon, "timeout + {guard:?}");
+        }
+
+        // NotRunning: the window probe alone picks the branch.
+        assert_eq!(route(&not_running, Guard::Absent), Route::Offline);
+        assert_eq!(route(&not_running, Guard::Present), Route::Retry);
+        assert_eq!(route(&not_running, Guard::Unanswered), Route::Hung);
+    }
+
+    #[test]
+    fn offline_set_notes_are_honest_about_the_missing_engine() {
+        // Daemon route: unchanged wording (design-engine-mode §3,
+        // design-volume §3).
+        assert_eq!(
+            set_notes("engine_mode", false),
+            vec!["daemon restarts to apply it if a video is playing"]
+        );
+        assert_eq!(
+            set_notes("volume", false),
+            vec!["applied to the playing video immediately (no restart)"]
+        );
+        // Offline route: same shape, honest apply semantics (design-m5b §3.3).
+        assert_eq!(
+            set_notes("engine_mode", true),
+            vec!["applied at the next start (no daemon running)"]
+        );
+        assert_eq!(
+            set_notes("volume", true),
+            vec!["applied at the next load (no daemon running)"]
+        );
+        // Every other key carries no note on either route.
+        assert!(set_notes("tray", false).is_empty());
+        assert!(set_notes("on_battery", true).is_empty());
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
