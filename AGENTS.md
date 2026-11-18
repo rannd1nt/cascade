@@ -120,6 +120,23 @@ idea does not fit one of them, it is a v1.1 idea.
     (no load, no restart); only a fresh process may load. Check this rule
     before designing *any* new setting that affects the engine, the host, or
     the media boundary.
+16. **`on_battery=stop` is a full stop, not a coloured pause.** On a confirmed
+    battery source with `on_battery=stop`, the daemon must run its exit ladder
+    (desktop restored to the *real* wallpaper — never a teal host window) and
+    hand over to the listener: a fresh process with **zero compute** — no
+    engine, no host windows, no timers in steady state — that serves the tray
+    and the pipe honestly and hands back to a full daemon when AC returns
+    (`docs/design-m5b.md` §4). Never an in-process unload that keeps ≈90 MB
+    retained (§3.15), never an in-process rebuild on AC return. A manual
+    `cascade run` overrides the rule for that session; the override ends at
+    the next confirmed AC cycle.
+17. **The CLI has two routes: the pipe, or direct file access — never a
+    watcher, never an auto-start.** `settings`/`library` commands talk to
+    whichever of our processes answers the pipe; direct file access is allowed
+    only after a positive, double-probed "no Cascade process of ours is
+    running" verdict. Never add a file watcher on `config.toml`/`library.json`,
+    never start the daemon from a read command, and never write a file behind
+    a possibly-live daemon (`docs/design-m5b.md` §3).
 
 ---
 
