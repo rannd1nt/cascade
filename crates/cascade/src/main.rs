@@ -25,7 +25,9 @@ use cascade_core::library::{dedupe_key, LibraryItem};
 use cascade_core::rule_engine::{BatteryAction, PowerProfile};
 use cascade_core::{MediaBackend, PresentationMode};
 use cascade_media::{MediaEngineBackend, SourceReaderBackend};
-use cascade_win::{console, control, daemon, doctor, dpi, host, install, offline, registry, state};
+use cascade_win::{
+    console, control, daemon, doctor, dpi, host, install, listener, offline, registry, state,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -115,13 +117,13 @@ fn bare_main() -> Result<ExitCode, String> {
     }
 }
 
-/// `run` and `--autostart` start the long-lived daemon; everything else is
-/// a one-shot CLI command that must print. The bare form is decided in
-/// [`bare_main`] before this is reached.
+/// `run`, `--autostart`, and `--listen` start the long-lived roles;
+/// everything else is a one-shot CLI command that must print. The bare form
+/// is decided in [`bare_main`] before this is reached.
 fn is_daemon_role(args: &[String]) -> bool {
     matches!(
         args.first().map(String::as_str),
-        None | Some("run") | Some("--autostart")
+        None | Some("run") | Some("--autostart") | Some("--listen")
     )
 }
 
@@ -138,6 +140,9 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         None => cmd_run(&[]),
         Some("run") => cmd_run(&args[1..]),
         Some("--autostart") => cmd_run(&args[1..]),
+        // Pw2-S1 (`design-m5b.md` §6): the listener as a manual entry —
+        // the automatic entry rules arrive with Pw2-S2 (§4.3).
+        Some("--listen") => cmd_listen(&args[1..]),
         Some("doctor") => cmd_doctor(),
         Some("stop") => cmd_signal(control::WM_CASCADE_STOP, "stop"),
         Some("restore") => cmd_restore(),
@@ -211,6 +216,26 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         Err(err) => {
             // Best effort: a console close may already have invalidated the
             // handles, and a panic here would be reported as a crash.
+            cascade_win::derr!("cascade: {err}");
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
+/// `cascade --listen` (`design-m5b.md` §4.2, Pw2-S1): run the battery
+/// listener — control pipe and window only. Structural skip-load: this
+/// branch returns before `build_backend` is ever called, so no backend, no
+/// factory, and no Media Foundation session can exist in this process.
+fn cmd_listen(args: &[String]) -> Result<ExitCode, String> {
+    if let Some(extra) = args.first() {
+        return Err(format!("unknown `--listen` argument: {extra}"));
+    }
+    match listener::run() {
+        Ok(daemon::RunExit::Exit) => Ok(ExitCode::SUCCESS),
+        // The listener never respawns in Pw2-S1 (transitions arrive with
+        // Pw2-S2); the arm exists so the shape matches `cmd_run`.
+        Ok(daemon::RunExit::Respawn) => respawn_child(),
+        Err(err) => {
             cascade_win::derr!("cascade: {err}");
             Ok(ExitCode::from(1))
         }

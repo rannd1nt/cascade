@@ -126,6 +126,19 @@ pub enum ServerMsg {
     Response(Response),
 }
 
+/// Which role the pipe thread serves (`design-m5b.md` §4.5).
+///
+/// [`PipeRole::Daemon`] is today's behaviour byte for byte: `ping`/`status`
+/// from the snapshot, mutating commands forwarded to the main loop, the
+/// flush-ack handshake for `quit`. [`PipeRole::Listener`] answers in place —
+/// the listener has no engine and no command loop, so only the commands it
+/// can answer honestly are served (`design-m5b.md` §4.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeRole {
+    Daemon,
+    Listener,
+}
+
 /// Mutating commands the pipe thread hands to the main loop. Each carries
 /// its request id so the response can be matched — and stale responses
 /// from a submit that timed out dropped — on the shared channel.
@@ -259,10 +272,11 @@ impl PipeServer {
 
     /// Move the handle into a server thread. The thread is process-scoped:
     /// it blocks in `ConnectNamedPipe`/`ReadFile`, is never joined, and
-    /// dies with the process (design-m4 §2.3, S1 note). Returns the spawn
+    /// dies with the process (design-m4 §2.3, S1 note). `role` selects the
+    /// dispatch behaviour (`design-m5b.md` §4.5). Returns the spawn
     /// result so the caller can log a failure and keep running without a
     /// control channel — the desktop must stay up regardless.
-    pub fn serve(self, channels: PipeChannels) -> Result<(), u32> {
+    pub fn serve(self, channels: PipeChannels, role: PipeRole) -> Result<(), u32> {
         // HANDLE is a raw pointer and therefore not `Send`; the value is
         // carried as an integer and cast back inside the thread — the only
         // code that ever dereferences it.
@@ -272,7 +286,7 @@ impl PipeServer {
         let started = Instant::now();
         match std::thread::Builder::new()
             .name("cascade-ipc".to_string())
-            .spawn(move || serve_loop(handle_addr as HANDLE, channels, started))
+            .spawn(move || serve_loop(handle_addr as HANDLE, channels, started, role))
         {
             Ok(_) => Ok(()),
             Err(err) => {
@@ -292,7 +306,7 @@ impl Drop for PipeServer {
     }
 }
 
-fn serve_loop(handle: HANDLE, channels: PipeChannels, started: Instant) {
+fn serve_loop(handle: HANDLE, channels: PipeChannels, started: Instant, role: PipeRole) {
     let mut latest: Option<Arc<StatusSnapshot>> = None;
     loop {
         // Keep the queue bounded while no client is connected: the newest
@@ -316,7 +330,7 @@ fn serve_loop(handle: HANDLE, channels: PipeChannels, started: Instant) {
 
         // Serve this connection until the client disconnects, then accept
         // the next one.
-        serve_connection(handle, &channels, &mut latest, started);
+        serve_connection(handle, &channels, &mut latest, started, role);
 
         // SAFETY: we own the connected instance; disconnect resets it for
         // the next accept.
@@ -329,6 +343,7 @@ fn serve_connection(
     channels: &PipeChannels,
     latest: &mut Option<Arc<StatusSnapshot>>,
     started: Instant,
+    role: PipeRole,
 ) {
     let mut buf = [0u8; BUFFER_BYTES as usize];
     let mut pending: Vec<u8> = Vec::new();
@@ -354,7 +369,7 @@ fn serve_connection(
         while let Some(pos) = pending.iter().position(|&byte| byte == b'\n') {
             let line = String::from_utf8_lossy(&pending[..pos]).into_owned();
             pending.drain(..=pos);
-            if !dispatch_line(handle, &line, channels, latest, started) {
+            if !dispatch_line(handle, &line, channels, latest, started, role) {
                 return; // connection closed on a write failure
             }
         }
@@ -383,6 +398,7 @@ fn dispatch_line(
     channels: &PipeChannels,
     latest: &mut Option<Arc<StatusSnapshot>>,
     started: Instant,
+    role: PipeRole,
 ) -> bool {
     let request = match ipc::decode_request(line) {
         Ok(request) => request,
@@ -393,6 +409,13 @@ fn dispatch_line(
             return write_response(handle, &response);
         }
     };
+
+    // The listener answers in place (`design-m5b.md` §4.5): no command loop
+    // exists on the other side of its channel. Envelope errors above stay
+    // shared — both roles see the same protocol edge.
+    if role == PipeRole::Listener {
+        return dispatch_listener(handle, &request, channels, latest, started);
+    }
 
     let response = match request.cmd.as_str() {
         "ping" => Response::ok(
@@ -638,6 +661,83 @@ fn dispatch_line(
     written
 }
 
+/// The listener's command set (`design-m5b.md` §4.5): `ping`, `status`, and
+/// `quit` are answered right here on the pipe thread — there is no engine
+/// and no main-loop command channel to forward to. Everything else gets the
+/// honest "no engine is running" answer (the `settings`/`library` file ops
+/// join in Pw2-S2, `design-m5b.md` §6). Returns `false` when the connection
+/// must close (write failed).
+fn dispatch_listener(
+    handle: HANDLE,
+    request: &ipc::Request,
+    channels: &PipeChannels,
+    latest: &mut Option<Arc<StatusSnapshot>>,
+    started: Instant,
+) -> bool {
+    let response = match request.cmd.as_str() {
+        "ping" => Response::ok(
+            request.id,
+            serde_json::to_value(Ping {
+                pong: true,
+                version: PROTOCOL_VERSION,
+                uptime_ms: started.elapsed().as_millis() as u64,
+            })
+            .unwrap_or_else(|_| no_data()),
+        ),
+        "status" => {
+            // Same drain as the daemon arm: the snapshot this thread was
+            // given is the freshest one published.
+            drain(channels, latest);
+            match serde_json::to_value(listener_status(&snapshot_or_boot(latest))) {
+                Ok(value) => Response::ok(request.id, value),
+                Err(err) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::Internal,
+                    format!("could not build status: {err}"),
+                ),
+            }
+        }
+        // `design-m5b.md` §4.5: ok → flush ack → exit, no respawn. The
+        // client has its answer before the main loop is asked to stop —
+        // the same handshake as the daemon's `quit` (design-m4 §2.3); the
+        // ack itself only reaches a loop that waits for it (the listener's
+        // main loop reads it on the wake below).
+        "quit" => {
+            let response = Response::ok(request.id, no_data());
+            let written = write_response(handle, &response);
+            if response.ok {
+                let _ = channels.flush_acked.send(());
+                // Wake the main loop out of `GetMessageW` so it collects
+                // the ack and exits now instead of on the next message.
+                if let Some(hwnd) = control::find_existing() {
+                    control::post(hwnd, WM_APP_PIPE);
+                }
+            }
+            return written;
+        }
+        // Engine-only commands (`design-m5b.md` §4.5): honest text, exact
+        // wording — the CLI prints it verbatim.
+        _ => Response::err(
+            request.id,
+            ipc::ErrorCode::BadRequest,
+            "Cascade is listening (battery mode) — no engine is running; `cascade run` starts it now"
+                .to_string(),
+        ),
+    };
+    write_response(handle, &response)
+}
+
+/// The listener's `status` (`design-m5b.md` D6): `build_status` fills
+/// `engine:"running"` for the daemon — the listener has no engine and says
+/// so. The rest of D6 comes from the snapshot itself (`mode:"listening"`,
+/// `host.strategy:"none"`, monitors without playback, own process counters,
+/// autostart from the Run key).
+fn listener_status(snapshot: &StatusSnapshot) -> Status {
+    let mut status = build_status(snapshot);
+    status.engine = "stopped".to_string();
+    status
+}
+
 /// Hand a mutating command to the main loop and wait for its response
 /// (design-m4 §2.2: 2 s cap, then `busy`). Returns the response to write.
 fn forward(
@@ -865,6 +965,29 @@ mod tests {
             !snapshot.settings.autostart,
             "autostart is filled from the registry at the wire edge"
         );
+    }
+
+    #[test]
+    fn listener_status_reports_no_engine_per_d6() {
+        // design-m5b D6: the listener tells the truth about what it is —
+        // `engine:"stopped"`, `mode:"listening"`, no host, no playback,
+        // monitors listed by identity only.
+        let snapshot = StatusSnapshot {
+            mode: "listening".to_string(),
+            paused_reasons: Vec::new(),
+            monitors: Vec::new(),
+            playback: None,
+            host_strategy: "none".to_string(),
+            repaint_level: 0,
+            settings: Settings::default(),
+        };
+        let status = listener_status(&snapshot);
+        assert_eq!(status.engine, "stopped");
+        assert_eq!(status.mode, "listening");
+        assert_eq!(status.host.strategy, "none");
+        assert_eq!(status.host.repaint_level, 0);
+        assert!(status.monitors.is_empty());
+        assert!(status.paused_reasons.is_empty());
     }
 
     #[test]

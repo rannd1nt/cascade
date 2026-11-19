@@ -41,7 +41,8 @@ use crate::config;
 use crate::control::{self, ControlWindow};
 use crate::host::{self, Host, HostOptions};
 use crate::ipc::{
-    Command, PipeChannels, PipeServer, PlaybackStatus, ServerMsg, StatusSnapshot, QUIT_FLUSH_WAIT,
+    Command, PipeChannels, PipeRole, PipeServer, PlaybackStatus, ServerMsg, StatusSnapshot,
+    QUIT_FLUSH_WAIT,
 };
 use crate::library::{file_proof, LibraryStore};
 use crate::monitor::{self, MonitorInfo};
@@ -194,10 +195,10 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
 }
 
 /// Signals [`EXIT_DONE`] when dropped so a waiting console-control handler
-/// can return. Created at the top of [`run`]; every exit path — `Ok`, `Err`
-/// from an early `?`, and panic unwinding — drops it, which is why the
-/// repaint and state save are never cut short.
-struct ExitSignal;
+/// can return. Created at the top of [`run`] and [`crate::listener::run`];
+/// every exit path — `Ok`, `Err` from an early `?`, and panic unwinding —
+/// drops it, which is why the repaint and state save are never cut short.
+pub(crate) struct ExitSignal;
 
 impl Drop for ExitSignal {
     fn drop(&mut self) {
@@ -207,7 +208,7 @@ impl Drop for ExitSignal {
     }
 }
 
-fn install_panic_hook() {
+pub(crate) fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         derr!("cascade: panic: {info}");
         // Best effort: never panic inside the panic hook.
@@ -1581,6 +1582,40 @@ fn create_respawn_pipe() -> Result<PipeServer, DaemonError> {
     }
 }
 
+/// Create the session pipe — the primary single-instance lock (`ipc.md` §1):
+/// the first instance creates it with `FILE_FLAG_FIRST_PIPE_INSTANCE`, a
+/// second one fails here. The control window check stays as the fallback
+/// for an older instance that has no pipe yet. On any failure `pipe` drops
+/// and closes the handle, so nothing is left behind.
+///
+/// Shared by the full daemon ([`run`]) and the battery listener
+/// (`listener::run`, design-m5b §4.2): one name, one lock — a listener and
+/// a daemon can never coexist, and each takes over from the other only
+/// through a clean exit.
+///
+/// A respawn child (design-m2 §4) spawns while its parent still owns
+/// the pipe, so contention is expected, not a second daemon: retry
+/// until the parent's exit ladder finishes instead of failing fast.
+pub(crate) fn create_session_pipe() -> Result<PipeServer, DaemonError> {
+    let pipe = if std::env::var_os("CASCADE_RESPAWN").is_some() {
+        create_respawn_pipe()?
+    } else {
+        match PipeServer::create() {
+            Ok(pipe) => pipe,
+            Err(code) => {
+                if let Some(existing) = control::find_existing() {
+                    return Err(DaemonError::AlreadyRunning(existing as usize));
+                }
+                return Err(DaemonError::Pipe(code));
+            }
+        }
+    };
+    if let Some(existing) = control::find_existing() {
+        return Err(DaemonError::AlreadyRunning(existing as usize));
+    }
+    Ok(pipe)
+}
+
 /// Run the daemon until asked to stop. Always repaints the desktop before
 /// returning, including on the restore path.
 pub fn run(
@@ -1604,31 +1639,7 @@ pub fn run(
         session_loads: 0,
     };
 
-    // The pipe is the primary single-instance lock (`ipc.md` §1): the first
-    // daemon creates it with `FILE_FLAG_FIRST_PIPE_INSTANCE`, a second one
-    // fails here. The control window check stays as the fallback for an
-    // older daemon that has no pipe yet. On any failure `pipe` drops and
-    // closes the handle, so nothing is left behind.
-    //
-    // A respawn child (design-m2 §4) spawns while its parent still owns
-    // the pipe, so contention is expected, not a second daemon: retry
-    // until the parent's exit ladder finishes instead of failing fast.
-    let pipe = if std::env::var_os("CASCADE_RESPAWN").is_some() {
-        create_respawn_pipe()?
-    } else {
-        match PipeServer::create() {
-            Ok(pipe) => pipe,
-            Err(code) => {
-                if let Some(existing) = control::find_existing() {
-                    return Err(DaemonError::AlreadyRunning(existing as usize));
-                }
-                return Err(DaemonError::Pipe(code));
-            }
-        }
-    };
-    if let Some(existing) = control::find_existing() {
-        return Err(DaemonError::AlreadyRunning(existing as usize));
-    }
+    let pipe = create_session_pipe()?;
 
     install_panic_hook();
 
@@ -1820,11 +1831,14 @@ pub fn run(
         derr!("ipc: message channel rejected the first send; status stays at boot");
     }
     let mut published = Some(first);
-    if let Err(code) = pipe.serve(PipeChannels {
-        messages: msg_rx,
-        commands: cmd_tx,
-        flush_acked: flush_tx,
-    }) {
+    if let Err(code) = pipe.serve(
+        PipeChannels {
+            messages: msg_rx,
+            commands: cmd_tx,
+            flush_acked: flush_tx,
+        },
+        PipeRole::Daemon,
+    ) {
         // The desktop must stay up regardless: log and continue without a
         // control channel (the control-window fallback still detects a
         // second daemon).
