@@ -30,7 +30,8 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, LoadImageW, PostMessageW,
     RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION,
-    IMAGE_ICON, LR_DEFAULTSIZE, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+    IMAGE_ICON, LR_DEFAULTSIZE, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WM_NULL,
 };
 
 use crate::control::WM_APP_TRAY;
@@ -87,11 +88,15 @@ pub fn taskbar_created_id() -> u32 {
 pub enum TrayMode {
     /// The full daemon: Open / Pause / Quit (design-m5 §6).
     Full,
-    /// The battery listener: only what it can honestly do. Pw2-S2 shows
-    /// `Quit`; the disabled header and `Start now` (T6, MD1) arrive with
-    /// Pw2-S3.
+    /// The battery listener: only what it can honestly do
+    /// (`design-m5b.md` §4.7): the MD1 header, `Start now` (T6), and
+    /// `Quit`.
     Listening,
 }
+
+/// The listening menu's disabled header (MD1, decided Pw2-S3 and recorded
+/// in `design-m5b.md` §7): what the process is and why no engine runs.
+const LISTENING_HEADER: &str = "Cascade — on battery (engine off)";
 
 /// What one menu choice means for the main loop (pure; unit-tested).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,12 +110,17 @@ pub enum TrayAction {
     /// The shared quit function (design-m5 §4): the normal exit ladder,
     /// repaint first — never `process::exit` (AGENTS §13).
     Quit,
+    /// Listening menu only: start the full daemon now (T6,
+    /// `design-m5b.md` §4.4) — the listener hands the session over even
+    /// though the source is still battery.
+    StartNow,
 }
 
 /// Menu entry ids; `TrackPopupMenu(TPM_RETURNCMD)` returns them verbatim.
 const MENU_OPEN: u32 = 1;
 const MENU_TOGGLE: u32 = 2;
 const MENU_QUIT: u32 = 3;
+const MENU_START: u32 = 4;
 
 /// Map a `TrackPopupMenu` command id to an action. Pure so the D8 menu
 /// contract is unit-testable without a shell.
@@ -119,6 +129,7 @@ fn menu_action(cmd: u32) -> Option<TrayAction> {
         MENU_OPEN => Some(TrayAction::OpenUi),
         MENU_TOGGLE => Some(TrayAction::TogglePause),
         MENU_QUIT => Some(TrayAction::Quit),
+        MENU_START => Some(TrayAction::StartNow),
         // 0 = the menu was dismissed without a choice; anything else is
         // an id this build never created.
         _ => None,
@@ -312,8 +323,9 @@ fn load_icon() -> HICON {
 ///
 /// Each mode offers only what that role can honestly do
 /// (`design-m5b.md` §4.7): the listener has no engine, so `Open`/`Pause`
-/// would be dead entries. Pw2-S2 ships `Quit` alone; the disabled header
-/// and `Start now` (T6, MD1) join in Pw2-S3.
+/// would be dead entries. The listening menu ships the MD1 header (§7,
+/// decided Pw2-S3: `Cascade — on battery (engine off)`), `Start now`
+/// (T6), and `Quit`.
 fn show_menu(hwnd: HWND, mode: TrayMode, paused: bool) -> Option<TrayAction> {
     // SAFETY: a valid menu handle when non-null.
     let menu: HMENU = unsafe { CreatePopupMenu() };
@@ -324,12 +336,20 @@ fn show_menu(hwnd: HWND, mode: TrayMode, paused: bool) -> Option<TrayAction> {
     let open = wide::to_wide("Open Cascade");
     let pause = wide::to_wide(pause_label(paused));
     let quit = wide::to_wide("Quit");
+    let header = wide::to_wide(LISTENING_HEADER);
+    let start = wide::to_wide("Start now");
     // SAFETY: `menu` is live for this block, the labels are
     // NUL-terminated, and every out-parameter is a valid pointer.
     let cmd = unsafe {
         if mode == TrayMode::Full {
             AppendMenuW(menu, MF_STRING, MENU_OPEN as usize, open.as_ptr());
             AppendMenuW(menu, MF_STRING, MENU_TOGGLE as usize, pause.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+        } else {
+            // Disabled header (MD1): a label, not a command — its id is 0
+            // and `MF_GRAYED` keeps `TrackPopupMenu` from ever returning it.
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, header.as_ptr());
+            AppendMenuW(menu, MF_STRING, MENU_START as usize, start.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         }
         AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit.as_ptr());
@@ -370,13 +390,20 @@ mod tests {
         assert_eq!(menu_action(MENU_OPEN), Some(TrayAction::OpenUi));
         assert_eq!(menu_action(MENU_TOGGLE), Some(TrayAction::TogglePause));
         assert_eq!(menu_action(MENU_QUIT), Some(TrayAction::Quit));
+        // Pw2-S3: the listening menu's T6 entry.
+        assert_eq!(menu_action(MENU_START), Some(TrayAction::StartNow));
         // 0 = dismissed; an id this build never created is ignored.
         assert_eq!(menu_action(0), None);
         assert_eq!(menu_action(99), None);
         // Distinct ids: `TrackPopupMenu` returns them verbatim.
         assert_ne!(MENU_OPEN, MENU_TOGGLE);
         assert_ne!(MENU_OPEN, MENU_QUIT);
+        assert_ne!(MENU_START, MENU_OPEN);
+        assert_ne!(MENU_START, MENU_TOGGLE);
+        assert_ne!(MENU_START, MENU_QUIT);
         assert_ne!(MENU_TOGGLE, MENU_QUIT);
+        // The disabled header (MD1) is a label, id 0 — never a command.
+        assert_eq!(LISTENING_HEADER, "Cascade — on battery (engine off)");
     }
 
     #[test]

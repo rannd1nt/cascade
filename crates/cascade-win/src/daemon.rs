@@ -71,6 +71,12 @@ pub struct DaemonOptions {
     /// `--video <path>` (design-m2 §2.2). Not `Copy` any more: a `PathBuf`
     /// rides along. `None` means "replay the persisted path, if any".
     pub video: Option<PathBuf>,
+    /// The D1 session override (`design-m5b.md` §4.3): a manual start on
+    /// battery with `on_battery=stop` stays FULL for this session — the
+    /// stop rule only governs automatic paths. Set by the binary's entry
+    /// rules (or the T6 `CASCADE_SESSION_OVERRIDE` child); cleared inside
+    /// the loop when AC is confirmed (T10) or when the process exits.
+    pub session_override: bool,
 }
 
 impl Default for DaemonOptions {
@@ -81,6 +87,7 @@ impl Default for DaemonOptions {
             shell_timeout: Duration::from_secs(60),
             host_mode: host::HostModePreference::Auto,
             video: None,
+            session_override: false,
         }
     }
 }
@@ -95,6 +102,13 @@ struct Flags {
     /// Runtime-only, and it stays `false` while the collector is gated
     /// off (D8: `on_battery == off` means no read, no subscription).
     on_battery: bool,
+    /// The D1 session override carried into the loop
+    /// (`design-m5b.md` §4.3): while set, `power_step`'s `Unload` arm is
+    /// held (T9 — playback uninterrupted) and the pause oracle treats
+    /// `on_battery=stop` as if it were `continue` (the stop rule only
+    /// governs automatic paths). Cleared when the collector settles on AC
+    /// (T10) or at process exit.
+    session_override: bool,
 }
 
 /// Builds a media backend on demand — the first `wallpaper.set` on a
@@ -594,7 +608,16 @@ fn session_state(settings: &Settings, flags: &Flags, session_locked: bool) -> Se
         user_paused: flags.user_paused,
         power_profile: settings.power_profile,
         pause_settings: settings.pause,
-        battery_action: settings.on_battery,
+        // D1 (`design-m5b.md` §4.3): the stop rule only governs automatic
+        // paths. With the session override held, `on_battery=stop` must
+        // not pause the engine this manual start deliberately began (T9:
+        // playback uninterrupted). Every other action — `pause`,
+        // `continue`, `off` — stays exactly as the user set it.
+        battery_action: if flags.session_override && settings.on_battery == BatteryAction::Stop {
+            BatteryAction::Continue
+        } else {
+            settings.on_battery
+        },
         // The collector's confirmed state (S2b); `false` while the gate is
         // off, which is exactly what D8 promises: no read at the default.
         on_battery: flags.on_battery,
@@ -752,6 +775,16 @@ fn power_step(step: PowerStep<'_>) -> bool {
             flags.on_battery = confirmed;
             changed = true;
         }
+        // T10 (`design-m5b.md` §4.3): the source settled on AC with no
+        // candidate pending — the session override ends here, so the *next*
+        // battery cycle applies the normal stop rules (T2) again. Checked
+        // on the settled state rather than on a transition, so an override
+        // created moments before the first hysteresis promotion still
+        // clears (an entry read of "battery" that turned out stale).
+        if flags.session_override && !hysteresis.confirmed() && !hysteresis.has_pending() {
+            flags.session_override = false;
+            dlog!("power: session override cleared (AC confirmed)");
+        }
     }
 
     // 3. Reconcile the engine with the confirmed state. Both "must go"
@@ -764,6 +797,15 @@ fn power_step(step: PowerStep<'_>) -> bool {
         backend.loaded,
         state.video.is_some(),
     ) {
+        // T9 (`design-m5b.md` §4.4): a manual session start on battery
+        // stays full — the stop rule governs automatic paths only. Logged
+        // on the transition into battery, never per tick (the arm would
+        // otherwise match every wake for the whole session).
+        power::Reconcile::Unload if flags.session_override => {
+            if changed {
+                dlog!("power: on battery with the session override; staying full (T9)");
+            }
+        }
         power::Reconcile::Reload | power::Reconcile::Unload => return true,
         power::Reconcile::Nothing => {}
     }
@@ -824,6 +866,12 @@ fn run_tray_action(
         TrayAction::Quit => {
             dlog!("tray: quit requested");
             control::request_quit();
+        }
+        // `StartNow` exists on the listening menu only (`TrayMode::Full`
+        // never builds that entry); ignore defensively instead of
+        // guessing a behaviour for a choice this mode cannot produce.
+        TrayAction::StartNow => {
+            dlog!("tray: Start now is a listening-menu action; ignored");
         }
     }
 }
@@ -1669,7 +1717,12 @@ pub fn run(
     // `config.toml` decodes to the documented defaults and never blocks.
     let mut settings = config::load();
     // Runtime-only flags: a manual pause lives for this session only.
-    let mut flags = Flags::default();
+    // D1 (`design-m5b.md` §4.3): the entry rule's session override rides
+    // into the loop; T9 holds the stop arm, T10 clears it on confirmed AC.
+    let mut flags = Flags {
+        session_override: opts.session_override,
+        ..Flags::default()
+    };
 
     let control = ControlWindow::create().map_err(DaemonError::Control)?;
     CONTROL_HWND.store(control.hwnd() as isize, Ordering::Release);
@@ -1838,6 +1891,9 @@ pub fn run(
             messages: msg_rx,
             commands: cmd_tx,
             flush_acked: flush_tx,
+            // The daemon forwards `library.add` to its main loop, whose
+            // context owns the probe (`design-m5b.md` §4.5).
+            probe: None,
         },
         PipeRole::Daemon,
     ) {

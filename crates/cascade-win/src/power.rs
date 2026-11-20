@@ -185,6 +185,11 @@ pub fn take_raw() -> Option<bool> {
     }
 }
 
+/// Sentinel error [`register`] returns when the M9 forced-failure hook is
+/// set (`design-m5b.md` §4.10 M9 / B7): a fake code no Win32 call would
+/// ever produce, so the log line is obviously a test.
+pub const REGISTER_FAIL_SENTINEL: u32 = 0xDEAD_0001;
+
 /// Subscribe `hwnd` to AC↔DC power-source changes. Returns the
 /// registration handle for [`unregister`].
 ///
@@ -194,6 +199,14 @@ pub fn take_raw() -> Option<bool> {
 /// keep pumping messages — the OS delivers `WM_POWERBROADCAST` to it
 /// until [`unregister`] runs or the window is destroyed.
 pub unsafe fn register(hwnd: HWND) -> Result<isize, u32> {
+    // M9 forced-failure hook (design-m5b §4.10, precedent `CASCADE_GATE`):
+    // dev-only manual verification of the T8 fail-open path — the listener
+    // refuses to become a listener and the full daemon runs with the
+    // collector off. Never set in production; no product behaviour depends
+    // on this variable.
+    if std::env::var_os("CASCADE_TEST_REGISTER_FAIL").is_some() {
+        return Err(REGISTER_FAIL_SENTINEL);
+    }
     // SAFETY: required by the signature above; the GUID is a const that
     // outlives the call; the flags value is the documented window-handle
     // variant.

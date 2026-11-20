@@ -12,19 +12,45 @@ use std::ffi::OsString;
 
 use crate::dlog;
 
+/// Session-override marker for a transition child (`design-m5b.md` §4.4
+/// T6, micro-decision MD6 in §7). The child keeps `CASCADE_RESPAWN=1` — it
+/// needs the pipe-retry window while this process still owns the session
+/// pipe — but the entry rules must treat it as a **manual session start**
+/// (D1), not as an automatic transition: on battery with `on_battery=stop`
+/// it lands FULL with the session override instead of looping back into
+/// the listener.
+pub const SESSION_OVERRIDE_ENV: &str = "CASCADE_SESSION_OVERRIDE";
+
 /// Spawn this binary as a child with `CASCADE_RESPAWN=1`. Returns the
 /// child's pid. A failed spawn leaves the desktop as it is (the listener
 /// never touched it; the daemon already ran its exit ladder) — the caller
 /// logs the error and decides whether to retry.
 pub fn spawn_child(args: Vec<OsString>) -> Result<u32, String> {
+    spawn_with(args, false)
+}
+
+/// Spawn the full child for the listener's tray **Start now** (T6): the
+/// same argv re-exec as [`spawn_child`] plus [`SESSION_OVERRIDE_ENV`], so
+/// the child lands FULL with the D1 session override even while the source
+/// is still battery (`design-m5b.md` §4.4).
+pub fn spawn_start_now_child() -> Result<u32, String> {
+    spawn_with(respawn_args(), true)
+}
+
+fn spawn_with(args: Vec<OsString>, session_override: bool) -> Result<u32, String> {
     let exe = std::env::current_exe().map_err(|err| format!("respawn: {err}"))?;
-    match std::process::Command::new(exe)
-        .args(args)
-        .env("CASCADE_RESPAWN", "1")
-        .spawn()
-    {
+    let mut command = std::process::Command::new(exe);
+    command.args(args).env("CASCADE_RESPAWN", "1");
+    if session_override {
+        command.env(SESSION_OVERRIDE_ENV, "1");
+    }
+    match command.spawn() {
         Ok(child) => {
-            dlog!("cascade: respawned as pid {}", child.id());
+            if session_override {
+                dlog!("listener: start now; full daemon is pid {}", child.id());
+            } else {
+                dlog!("cascade: respawned as pid {}", child.id());
+            }
             Ok(child.id())
         }
         Err(err) => Err(format!("respawn: {err}")),

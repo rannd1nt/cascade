@@ -12,6 +12,7 @@
 //! exit path — including a crash — leaves the real wallpaper standing
 //! (§4.4 T11).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::control::{self, ControlWindow};
-use crate::daemon::{self, DaemonError, RunExit};
+use crate::daemon::{self, DaemonError, ProbeFn, RunExit};
 use crate::ipc::{PipeChannels, PipeRole, ServerMsg, StatusSnapshot};
 use crate::monitor::{self, MonitorInfo};
 use crate::offline;
@@ -56,17 +57,43 @@ const WATCHDOG_TIMER: usize = 2;
 const WATCHDOG_INTERVAL_SECS: u64 = 2;
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(WATCHDOG_INTERVAL_SECS);
 
+/// A `settings.set` lifted the stop rule while this listener was serving
+/// the pipe (T4, `design-m5b.md` §4.4). The pipe thread records the
+/// request here and posts a wake; the message loop consumes it on the next
+/// iteration and hands off exactly like a confirmed AC. One process, one
+/// pipe thread — a plain process-wide flag is the whole mechanism.
+static START_REQUEST: AtomicBool = AtomicBool::new(false);
+
+/// Record a T4 hand-off request from the pipe thread (`pub(crate)` — the
+/// listener's `settings.set` arm in `ipc.rs` is the only caller). Wake-only:
+/// the post makes the main loop consume this now instead of at the next
+/// 2 s watchdog tick; a stale post without the flag changes nothing.
+pub(crate) fn request_full_start() {
+    START_REQUEST.store(true, Ordering::Release);
+    if let Some(hwnd) = control::find_existing() {
+        control::post(hwnd, control::WM_APP_PIPE);
+    }
+}
+
+/// Consume a pending T4 request (one-shot).
+fn take_full_start() -> bool {
+    START_REQUEST.swap(false, Ordering::AcqRel)
+}
+
 /// Run the listener until asked to stop (`design-m5b.md` §4.5). Returns
-/// only when the control window closed (`cascade stop`, window teardown),
-/// the pipe answered a `quit`, the tray chose Quit, or T3 handed the
-/// desktop back to a fresh full daemon — always as [`RunExit::Exit`]: the
-/// listener never asks the CLI to re-exec it (MD4, §7 — verified
-/// 2026-11-19, recorded in §9; T3 spawns its own child below).
+/// [`RunExit::Exit`] when the control window closed (`cascade stop`,
+/// window teardown), the pipe answered a `quit`, the tray chose Quit, or T3
+/// handed the desktop back to a fresh full daemon — the listener never
+/// asks the CLI to re-exec it (MD4, §7 — verified 2026-11-19, recorded in
+/// §9; T3 spawns its own child below). Returns `Ok(None)` on the T8
+/// fail-open: the power subscription could not be established, so listener
+/// mode must never begin and the caller falls through to the full daemon
+/// (`design-m5b.md` §4.8).
 ///
 /// Structural skip-load (`design-m5b.md` §4.3): the binary enters here
 /// *before* `build_backend`, so no backend, factory call, or Media
 /// Foundation session can exist in this process.
-pub fn run() -> Result<RunExit, DaemonError> {
+pub fn run(probe: ProbeFn) -> Result<Option<RunExit>, DaemonError> {
     // Declared first, therefore dropped last on every exit path — the same
     // guard as `daemon::run` (`design-m5b.md` §4.9).
     let _exit = daemon::ExitSignal;
@@ -84,7 +111,25 @@ pub fn run() -> Result<RunExit, DaemonError> {
     // Entry order of §4.2: register → seed → drain, so a broadcast
     // recorded between the registration and the seed is picked up by the
     // drain instead of being missed (R6).
-    let mut power_state = ListenerPower::new(hwnd);
+    let mut power_state = match ListenerPower::new(hwnd) {
+        Ok(state) => state,
+        Err(code) => {
+            // T8 fail-open (`design-m5b.md` §4.8): without a live source
+            // subscription this process could never transition back — so
+            // listener mode must not begin at all. The pipe and window
+            // created above are dropped on this return (the named pipe
+            // instance releases; `ControlWindow`'s `Drop` destroys the
+            // window and drains the `WM_QUIT` its wndproc posts — without
+            // that the fall-through hit its own single-instance probe,
+            // §9), and `cmd_run` falls through to the full daemon, whose
+            // own collector logs the same registration failure and stays
+            // off. A process racing us in the release window gets an
+            // honest `AlreadyRunning` — never two daemons.
+            power::log_register_failure(code);
+            derr!("listener: power registration failed; starting the full daemon instead (T8)");
+            return Ok(None);
+        }
+    };
 
     let settings = offline::settings_get();
     let tray_want = settings.tray;
@@ -110,6 +155,10 @@ pub fn run() -> Result<RunExit, DaemonError> {
             messages: msg_rx,
             commands: cmd_tx,
             flush_acked: flush_tx,
+            // The listener answers `library.*` in place (§4.5), so the
+            // metadata probe rides the channel half; the daemon forwards
+            // to its main loop instead and passes `None`.
+            probe: Some(probe),
         },
         PipeRole::Listener,
     ) {
@@ -135,6 +184,14 @@ pub fn run() -> Result<RunExit, DaemonError> {
     let mut hand_off = power_state.turn(hwnd, false);
     let mut msg = MSG::default();
     loop {
+        // T4 (`design-m5b.md` §4.4): a `settings.set` lifted the stop rule
+        // while the pipe thread served it — hand off exactly like a
+        // confirmed AC. Consumed at the top so a request recorded during
+        // the previous drain is acted on before this thread sleeps again.
+        if take_full_start() {
+            dlog!("listener: on_battery is no longer stop; starting the full daemon (T4)");
+            hand_off = true;
+        }
         // T3 (`design-m5b.md` §4.4): confirmed AC → start the full child
         // and leave. A failed spawn keeps the listener running (§4.8) —
         // the latch inside `turn` makes the next attempt happen on the
@@ -181,10 +238,21 @@ pub fn run() -> Result<RunExit, DaemonError> {
 
         // Tray turn (design-m5 §6): reconcile the icon with the live
         // `settings.tray` and run a menu choice recorded during this
-        // message drain. Only `Quit` is on the listening menu (§4.7).
+        // message drain. The listening menu offers `Start now` (T6) and
+        // `Quit` (§4.7).
         if let Some(action) = tray.step(tray_want, false) {
-            if action == TrayAction::Quit {
-                control::request_quit();
+            match action {
+                TrayAction::Quit => control::request_quit(),
+                // T6 (`design-m5b.md` §4.4): hand the session over even
+                // though the source is still battery. The spawn runs as
+                // the arm's guard — a failed spawn (§4.8) simply doesn't
+                // match, so the listener keeps running and the user can
+                // choose the entry again.
+                TrayAction::StartNow if spawn_start_now_child() => break,
+                // `TrayMode::Listening` builds no entry that maps to the
+                // full daemon's actions (§4.7); ignore defensively instead
+                // of guessing a behaviour.
+                _ => {}
             }
         }
 
@@ -200,7 +268,7 @@ pub fn run() -> Result<RunExit, DaemonError> {
     tray.remove();
     power_state.shutdown(hwnd);
     dlog!("listener: exiting");
-    Ok(RunExit::Exit)
+    Ok(Some(RunExit::Exit))
 }
 
 /// Start the full child for T3 / T6 (`design-m5b.md` §4.4). The argv is
@@ -218,6 +286,24 @@ fn spawn_full_child() -> bool {
             dlog!("listener: confirmed AC; full daemon is pid {pid}");
             true
         }
+        Err(err) => {
+            derr!("listener: could not start the full daemon ({err}); still listening");
+            false
+        }
+    }
+}
+
+/// T6 (`design-m5b.md` §4.4): the tray's **Start now** — hand the session
+/// over even though the source is still battery. The child carries
+/// `CASCADE_SESSION_OVERRIDE` (MD6 §7) so it lands FULL with the D1
+/// override instead of looping back into the listener, and it retries the
+/// session pipe this process still owns (5 s deadline). A failed spawn
+/// keeps the listener running (§4.8) — the user can simply choose the
+/// entry again.
+fn spawn_start_now_child() -> bool {
+    match respawn::spawn_start_now_child() {
+        // The pid is logged by the spawn helper itself.
+        Ok(_) => true,
         Err(err) => {
             derr!("listener: could not start the full daemon ({err}); still listening");
             false
@@ -248,23 +334,17 @@ struct ListenerPower {
 
 impl ListenerPower {
     /// Register → seed → drain, in that order (`design-m5b.md` §4.2).
-    fn new(hwnd: HWND) -> Self {
-        let registration = match
-            // SAFETY: `hwnd` is our own control window, alive on this
-            // thread for the whole run; the OS keeps posting
-            // `WM_POWERBROADCAST` to it until [`ListenerPower::shutdown`].
-            unsafe { power::register(hwnd) }
-        {
-            Ok(handle) => Some(handle),
-            // §4.8 T8: today this degrades the listener — one `derr!`, no
-            // retry, and no live source updates. The full fail-open (never
-            // enter listener mode at all) lands with Pw2-S3 together with
-            // the forced-failure test hook (M9).
-            Err(code) => {
-                power::log_register_failure(code);
-                None
-            }
-        };
+    /// Returns the raw registration error when the subscription could not
+    /// be established — the caller turns that into the T8 fail-open
+    /// (`design-m5b.md` §4.8) instead of degrading into a listener that
+    /// could never transition back.
+    fn new(hwnd: HWND) -> Result<Self, u32> {
+        // SAFETY: `hwnd` is our own control window, alive on this thread
+        // for the whole run; the OS keeps posting `WM_POWERBROADCAST` to
+        // it until [`ListenerPower::shutdown`]. T8: a failure returns
+        // before any seed or watchdog exists — no listener state may run
+        // without a live subscription (`design-m5b.md` §4.8).
+        let registration = Some(unsafe { power::register(hwnd) }?);
         let mut hysteresis = Hysteresis::default();
         // We only exist because the source *is* battery: publish it
         // directly rather than waiting out a candidate window. A candidate
@@ -298,13 +378,13 @@ impl ListenerPower {
             // listener that stranded in §9.
             derr!("listener: source watchdog SetTimer failed; broadcasts only");
         }
-        Self {
+        Ok(Self {
             registration,
             hysteresis,
             timer_armed: false,
             watchdog_armed,
             acted_on_ac: false,
-        }
+        })
     }
 
     /// One power turn per message wake. Returns `true` when a confirmed AC
@@ -465,6 +545,11 @@ mod tests {
         // The watchdog exists to be frequent enough to beat a stranded
         // broadcast; keep the cadence inside the AGENTS §13 1–2 s band.
         const { assert!(WATCHDOG_INTERVAL_SECS >= 1, "watchdog slower than 1 s") };
-        const { assert!(WATCHDOG_INTERVAL_SECS <= 2, "watchdog faster than AGENTS allows") };
+        const {
+            assert!(
+                WATCHDOG_INTERVAL_SECS <= 2,
+                "watchdog faster than AGENTS allows"
+            )
+        };
     }
 }

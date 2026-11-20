@@ -24,9 +24,10 @@ use std::time::{Duration, Instant};
 use cascade_core::client::server_name;
 use cascade_core::ipc::{
     self, encode_line, no_data, AssessRequest, AutostartStatus, EnabledData, LibraryAddData,
-    LibraryRef, LibraryRemoveData, MonitorData, Ping, Response, SetData, Settings, SettingsPatch,
-    Status, VideoSize, MAX_LINE_BYTES,
+    LibraryPruneResult, LibraryRef, LibraryRemoveData, MonitorData, Ping, Response, SetData,
+    Settings, SettingsPatch, Status, VideoSize, MAX_LINE_BYTES,
 };
+use cascade_core::rule_engine::BatteryAction;
 use cascade_core::PROTOCOL_VERSION;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -39,8 +40,11 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::control::{self, WM_APP_PIPE};
+use crate::daemon::ProbeFn;
 use crate::derr;
+use crate::listener;
 use crate::monitor::{self, MonitorInfo};
+use crate::offline;
 use crate::registry;
 use crate::wide;
 
@@ -232,6 +236,11 @@ pub struct PipeChannels {
     pub messages: Receiver<ServerMsg>,
     pub commands: Sender<Command>,
     pub flush_acked: Sender<()>,
+    /// The metadata probe for `library.add` (`design-m5b.md` §4.5). The
+    /// listener answers `library.*` in place on this thread, so the probe
+    /// rides along; the daemon forwards to its main loop and passes `None`
+    /// (its probe lives in the main-loop context).
+    pub probe: Option<ProbeFn>,
 }
 
 /// The server half: created on the main thread (it *is* the single-instance
@@ -454,45 +463,8 @@ fn dispatch_line(
                 ),
             }
         }
-        "autostart.get" => match serde_json::to_value(autostart_status()) {
-            Ok(value) => Response::ok(request.id, value),
-            Err(err) => Response::err(
-                request.id,
-                ipc::ErrorCode::Internal,
-                format!("could not build autostart status: {err}"),
-            ),
-        },
-        "autostart.set" => match serde_json::from_value::<EnabledData>(request.data.clone()) {
-            Ok(data) => {
-                // Registry work is cheap and the Run key is the oracle
-                // (design-m4 D10): handled right here, no main loop.
-                let result = if data.enabled {
-                    registry::autostart_enable(&exe_path())
-                } else {
-                    registry::autostart_disable()
-                };
-                match result {
-                    Ok(()) => match serde_json::to_value(autostart_status()) {
-                        Ok(value) => Response::ok(request.id, value),
-                        Err(err) => Response::err(
-                            request.id,
-                            ipc::ErrorCode::Internal,
-                            format!("could not build autostart status: {err}"),
-                        ),
-                    },
-                    Err(code) => Response::err(
-                        request.id,
-                        ipc::ErrorCode::Internal,
-                        format!("could not update the Run key (Win32 error {code}); check Settings > Apps > Startup"),
-                    ),
-                }
-            }
-            Err(err) => Response::err(
-                request.id,
-                ipc::ErrorCode::BadRequest,
-                format!("autostart.set needs {{\"enabled\":true}} or {{\"enabled\":false}}: {err}"),
-            ),
-        },
+        "autostart.get" => autostart_get(request.id),
+        "autostart.set" => autostart_set(request.id, &request),
         "playback.pause" => forward(
             channels,
             latest,
@@ -661,11 +633,10 @@ fn dispatch_line(
     written
 }
 
-/// The listener's command set (`design-m5b.md` §4.5): `ping`, `status`, and
-/// `quit` are answered right here on the pipe thread — there is no engine
-/// and no main-loop command channel to forward to. Everything else gets the
-/// honest "no engine is running" answer (the `settings`/`library` file ops
-/// and T4 join in Pw2-S3, `design-m5b.md` §6). Returns `false` when the
+/// The listener's command set (`design-m5b.md` §4.5): `ping`, `status`,
+/// `quit`, the `settings.*`/`autostart.*`/`library.*` file ops (Pw2-S3,
+/// answered in place with the `offline::*` core), and the honest "no engine
+/// is running" answer for everything else. Returns `false` when the
 /// connection must close (write failed).
 fn dispatch_listener(
     handle: HANDLE,
@@ -697,6 +668,141 @@ fn dispatch_listener(
                 ),
             }
         }
+        // `design-m5b.md` §4.5: file ops, answered in place with the same
+        // `offline::*` core the Pw1 CLI uses — byte-identical payload to
+        // the daemon's arms, so scripts cannot tell which role answered.
+        "settings.get" => match serde_json::to_value(offline::settings_get()) {
+            Ok(value) => Response::ok(request.id, value),
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::Internal,
+                format!("could not build settings: {err}"),
+            ),
+        },
+        "settings.set" => match serde_json::from_value::<SettingsPatch>(request.data.clone()) {
+            Ok(patch) => match offline::settings_apply(patch) {
+                Ok(settings) => {
+                    // T4 (`design-m5b.md` §4.4): lifting the stop rule
+                    // hands the session over to a full daemon — record the
+                    // request, wake the main loop, and answer the client
+                    // with the persisted settings first.
+                    let lift_stop = settings.on_battery != BatteryAction::Stop;
+                    let response = match serde_json::to_value(settings) {
+                        Ok(value) => Response::ok(request.id, value),
+                        Err(err) => Response::err(
+                            request.id,
+                            ipc::ErrorCode::Internal,
+                            format!("could not build settings: {err}"),
+                        ),
+                    };
+                    if lift_stop {
+                        listener::request_full_start();
+                    }
+                    response
+                }
+                Err(err) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::Internal,
+                    format!("could not apply settings: {err}"),
+                ),
+            },
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::BadRequest,
+                format!("unreadable settings patch: {err}"),
+            ),
+        },
+        "autostart.get" => autostart_get(request.id),
+        "autostart.set" => autostart_set(request.id, request),
+        "library.list" => match serde_json::to_value(offline::library_list()) {
+            Ok(value) => Response::ok(request.id, value),
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::Internal,
+                format!("could not build the library list: {err}"),
+            ),
+        },
+        "library.add" => match serde_json::from_value::<LibraryAddData>(request.data.clone()) {
+            // Same validation and wording as the daemon's arm (§4.5).
+            Ok(data) if data.paths.is_empty() => Response::err(
+                request.id,
+                ipc::ErrorCode::BadRequest,
+                "library.add needs at least one path: {\"paths\":[\"C:\\\\videos\\\\clip.mp4\"]}",
+            ),
+            Ok(data) => match channels.probe.as_ref() {
+                // The probe rides the channel half precisely for this arm.
+                Some(probe) => match offline::library_add(data.paths, probe) {
+                    Ok(result) => match serde_json::to_value(result) {
+                        Ok(value) => Response::ok(request.id, value),
+                        Err(err) => Response::err(
+                            request.id,
+                            ipc::ErrorCode::Internal,
+                            format!("could not build the add result: {err}"),
+                        ),
+                    },
+                    Err(err) => Response::err(
+                        request.id,
+                        ipc::ErrorCode::Internal,
+                        format!("could not add to the library: {err}"),
+                    ),
+                },
+                // Unreachable in a listener (the entry rule always passes
+                // a probe); honest instead of a panic if that ever changes.
+                None => Response::err(
+                    request.id,
+                    ipc::ErrorCode::Internal,
+                    "no metadata probe available in this process",
+                ),
+            },
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::BadRequest,
+                format!("library.add needs {{\"paths\":[...]}}: {err}"),
+            ),
+        },
+        "library.remove" => match serde_json::from_value::<LibraryRemoveData>(request.data.clone())
+        {
+            Ok(data) if data.id.is_empty() => Response::err(
+                request.id,
+                ipc::ErrorCode::BadRequest,
+                "library.remove needs {\"id\":\"a3f2\"}",
+            ),
+            Ok(data) => match offline::library_remove(&data.id) {
+                // Payload identical to the daemon: `ok`, no data.
+                Ok(Some(_)) => Response::ok(request.id, no_data()),
+                // Same wording as the daemon's `NotFound` (§4.5).
+                Ok(None) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::NotFound,
+                    format!("no library item with id '{}' — run `cascade library list`", data.id),
+                ),
+                Err(err) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::Internal,
+                    format!("could not remove the library item: {err}"),
+                ),
+            },
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::BadRequest,
+                format!("library.remove needs {{\"id\":\"a3f2\"}}: {err}"),
+            ),
+        },
+        "library.prune" => match offline::library_prune() {
+            Ok(removed) => match serde_json::to_value(LibraryPruneResult { removed }) {
+                Ok(value) => Response::ok(request.id, value),
+                Err(err) => Response::err(
+                    request.id,
+                    ipc::ErrorCode::Internal,
+                    format!("could not build the prune result: {err}"),
+                ),
+            },
+            Err(err) => Response::err(
+                request.id,
+                ipc::ErrorCode::Internal,
+                format!("could not prune the library: {err}"),
+            ),
+        },
         // `design-m5b.md` §4.5: ok → flush ack → exit, no respawn. The
         // client has its answer before the main loop is asked to stop —
         // the same handshake as the daemon's `quit` (design-m4 §2.3); the
@@ -843,6 +949,48 @@ fn autostart_status() -> AutostartStatus {
     AutostartStatus {
         enabled: state.registered,
         windows_disabled: state.windows_disabled,
+    }
+}
+
+/// `autostart.get` — shared by the daemon dispatch and the listener
+/// dispatch (`design-m5b.md` §4.5: the Run key, handled on the pipe
+/// thread in both roles, no main loop).
+fn autostart_get(id: u64) -> Response {
+    match serde_json::to_value(autostart_status()) {
+        Ok(value) => Response::ok(id, value),
+        Err(err) => Response::err(
+            id,
+            ipc::ErrorCode::Internal,
+            format!("could not build autostart status: {err}"),
+        ),
+    }
+}
+
+/// `autostart.set` — shared by both dispatch halves. Registry work is
+/// cheap and the Run key is the oracle (design-m4 D10): handled right
+/// here, no main loop in either role.
+fn autostart_set(id: u64, request: &ipc::Request) -> Response {
+    match serde_json::from_value::<EnabledData>(request.data.clone()) {
+        Ok(data) => {
+            let result = if data.enabled {
+                registry::autostart_enable(&exe_path())
+            } else {
+                registry::autostart_disable()
+            };
+            match result {
+                Ok(()) => autostart_get(id),
+                Err(code) => Response::err(
+                    id,
+                    ipc::ErrorCode::Internal,
+                    format!("could not update the Run key (Win32 error {code}); check Settings > Apps > Startup"),
+                ),
+            }
+        }
+        Err(err) => Response::err(
+            id,
+            ipc::ErrorCode::BadRequest,
+            format!("autostart.set needs {{\"enabled\":true}} or {{\"enabled\":false}}: {err}"),
+        ),
     }
 }
 
@@ -1111,6 +1259,7 @@ mod tests {
             messages: msg_rx,
             commands: std::sync::mpsc::channel().0,
             flush_acked: std::sync::mpsc::channel().0,
+            probe: None,
         };
         msg_tx
             .send(ServerMsg::Response(Response::ok(99, no_data())))

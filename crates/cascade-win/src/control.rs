@@ -21,11 +21,11 @@ use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, FindWindowW, LoadCursorW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, IDC_ARROW, PBT_POWERSETTINGCHANGE, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_LBUTTONUP, WM_POWERBROADCAST, WM_QUERYENDSESSION,
-    WM_RBUTTONUP, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
-    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, LoadCursorW, PeekMessageW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, IDC_ARROW, MSG, PBT_POWERSETTINGCHANGE,
+    PM_REMOVE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_LBUTTONUP,
+    WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use crate::tray;
@@ -218,6 +218,37 @@ impl ControlWindow {
     /// Request a graceful stop. The daemon repaints before exiting.
     pub fn request_close(&self) -> bool {
         post(self.hwnd, WM_CLOSE)
+    }
+}
+
+/// The window dies with its owner. Required by the T8 fall-through
+/// (`design-m5b.md` §4.8): the listener and the full daemon that replaces
+/// it run in the *same* process, so a window left alive by a plain drop
+/// would make the successor's single-instance probe refuse to start
+/// (`Cascade is already running (control window 0x…)` — seen on target,
+/// §9). The wndproc answers `WM_DESTROY` with `PostQuitMessage(0)` and
+/// `QUIT_REQUESTED = true`: correct for a stop exit, poison for the
+/// successor — its first `GetMessageW` would return the stale `WM_QUIT`
+/// and its loop would see a quit it never asked for. Both are undone here.
+impl Drop for ControlWindow {
+    fn drop(&mut self) {
+        // SAFETY: `hwnd` was created by `create()` on this thread, and the
+        // value never leaves that thread (daemon/listener main loop owns it
+        // end to end); `DestroyWindow` dispatches `WM_DESTROY` to our own
+        // wndproc synchronously. A foreign-thread window would fail the
+        // call and leak — no product path creates one.
+        unsafe { DestroyWindow(self.hwnd) };
+        // Drain the thread queue: the `WM_QUIT` posted by `WM_DESTROY`
+        // above plus anything still addressed to dead windows, so the
+        // fall-through daemon never consumes it. Null filter = every
+        // message; at this point the only window on this thread was ours
+        // (the listener never builds host windows; a exiting daemon's
+        // ladder has already torn its host windows down), and nothing
+        // reads messages after this drop except the successor's own loop.
+        let mut msg = MSG::default();
+        // SAFETY: `msg` is a valid out-parameter; filters mean "any".
+        while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {}
+        QUIT_REQUESTED.store(false, Ordering::Release);
     }
 }
 

@@ -19,7 +19,7 @@ use cascade_core::device::{level_name, profile_name};
 use cascade_core::ipc::{
     no_data, AssessReport, AssessRequest, AutostartStatus, EnabledData, LibraryAddData,
     LibraryAddResult, LibraryItemsData, LibraryPruneResult, LibraryRemoveData, MonitorData,
-    PausePatch, SetData, SetReport, Settings, SettingsPatch,
+    PausePatch, SetData, SetReport, Settings, SettingsPatch, Status,
 };
 use cascade_core::library::{dedupe_key, LibraryItem};
 use cascade_core::rule_engine::{BatteryAction, PowerProfile};
@@ -215,39 +215,82 @@ fn should_listenable(
         && (role == StartRole::Autostart || respawn_env)
 }
 
+/// The D1 session override (`design-m5b.md` §4.3): start as the full
+/// daemon even though the stop rule says battery. True for a fresh manual
+/// start on battery — `run` fresh, T5 after the pre-quit — and for the T6
+/// `Start now` child (`CASCADE_SESSION_OVERRIDE`, MD6 §7). Never for an
+/// automatic start (that becomes the listener instead), and never for a
+/// transition child landing on AC. Pure; unit-tested next to
+/// [`should_listenable`].
+fn session_override_rule(
+    role: StartRole,
+    override_env: bool,
+    on_battery: BatteryAction,
+    source_now: Option<bool>,
+) -> bool {
+    override_env
+        || (role == StartRole::Manual
+            && on_battery == BatteryAction::Stop
+            && source_now == Some(true))
+}
+
 fn cmd_run(role: StartRole, args: &[String]) -> Result<ExitCode, String> {
     // `--detached` (design-m5 §4) never reaches the daemon: it changes how
     // *this* process spawns the child, not what the child does.
     let (detached, args) = split_detached_flag(args)?;
     if detached {
-        return run_detached(&args);
+        return run_detached(role, &args);
     }
-    let options = parse_run_options(&args)?;
+    let mut options = parse_run_options(&args)?;
+
+    // Everything the entry rules need, read once here — from disk /
+    // hardware, never from a backend, so the listener branch stays a
+    // structural skip-load (R4).
+    let respawn_env = std::env::var_os("CASCADE_RESPAWN").is_some();
+    let override_env = std::env::var_os(respawn::SESSION_OVERRIDE_ENV).is_some();
+    let on_battery_setting = offline::settings_get().on_battery;
+    let source_now = cascade_win::power::read_source();
+
+    // T5 (`design-m5b.md` §4.6): a fresh manual `run` takes the session
+    // from a running listener — `status` says `listening` → `quit` → poll
+    // for the pipe release — before this process starts the full daemon.
+    // A respawn child skips it: T2/T3/T6 land after the listener released
+    // the pipe itself. A full daemon's `mode` is never `listening`, so its
+    // existing `AlreadyRunning` behaviour is unchanged.
+    if role == StartRole::Manual && !respawn_env {
+        pre_quit_listener()?;
+    }
 
     // Entry rules (`design-m5b.md` §4.3), evaluated here — before
-    // `build_backend` — so the skip-load is structural (R4). Everything
-    // the rule needs is read from disk / hardware, never from a backend.
-    if should_listenable(
-        role,
-        std::env::var_os("CASCADE_RESPAWN").is_some(),
-        offline::settings_get().on_battery,
-        cascade_win::power::read_source(),
-    ) {
-        match listener::run() {
+    // `build_backend`. MD6 (§7): the T6 `Start now` child carries
+    // `CASCADE_SESSION_OVERRIDE`, so it must land FULL instead of closing
+    // the loop back into a listener.
+    if !override_env && should_listenable(role, respawn_env, on_battery_setting, source_now) {
+        match listener::run(Box::new(cascade_media::probe)) {
             // The listener ran and stopped on its own (quit, `cascade
-            // stop`, or a T3 hand-off that already spawned its child).
-            Ok(daemon::RunExit::Exit) => return Ok(ExitCode::SUCCESS),
-            // The listener never asks the CLI to re-exec it: T3 spawns
-            // the full child itself while it still owns the pipe.
-            Ok(daemon::RunExit::Respawn) => {
+            // stop`, or a T3/T6 hand-off that already spawned its child).
+            Ok(Some(daemon::RunExit::Exit)) => return Ok(ExitCode::SUCCESS),
+            // The listener never asks the CLI to re-exec it: T3/T6 spawn
+            // the full child themselves while they still own the pipe.
+            Ok(Some(daemon::RunExit::Respawn)) => {
                 return respawn::respawn_child().map(|_| ExitCode::SUCCESS)
             }
+            // T8 fail-open (`design-m5b.md` §4.8): listener mode never
+            // began — fall through to the full daemon below with the same
+            // entry data; its collector logs the failure and stays off.
+            Ok(None) => {}
             Err(err) => {
                 cascade_win::derr!("cascade: {err}");
                 return Ok(ExitCode::from(1));
             }
         }
     }
+
+    // D1 (`design-m5b.md` §4.3): a manual start on battery with the stop
+    // rule stays full for this session — T9 holds the stop arm, T10
+    // clears the override once AC is confirmed.
+    options.session_override =
+        session_override_rule(role, override_env, on_battery_setting, source_now);
 
     // A backend is only worth constructing when a source exists
     // (design-m2 §2.2): `--video` wins, otherwise the last successful path
@@ -289,15 +332,67 @@ fn cmd_listen(args: &[String]) -> Result<ExitCode, String> {
     if let Some(extra) = args.first() {
         return Err(format!("unknown `--listen` argument: {extra}"));
     }
-    match listener::run() {
-        Ok(daemon::RunExit::Exit) => Ok(ExitCode::SUCCESS),
-        // The listener never respawns in Pw2-S1 (transitions arrive with
-        // Pw2-S2); the arm exists so the shape matches `cmd_run`.
-        Ok(daemon::RunExit::Respawn) => respawn::respawn_child().map(|_| ExitCode::SUCCESS),
+    match listener::run(Box::new(cascade_media::probe)) {
+        Ok(Some(daemon::RunExit::Exit)) => Ok(ExitCode::SUCCESS),
+        // The listener only ever ends with `Exit` (T3/T6 spawn their own
+        // child); the arm exists so the shape matches `cmd_run`.
+        Ok(Some(daemon::RunExit::Respawn)) => respawn::respawn_child().map(|_| ExitCode::SUCCESS),
+        // T8 fail-open (`design-m5b.md` §4.8): listener mode never began —
+        // an explicit `--listen` must not brick the session either, so it
+        // falls through to the same full-daemon start `cmd_run` would make.
+        Ok(None) => cmd_run(StartRole::Manual, &[]),
         Err(err) => {
             cascade_win::derr!("cascade: {err}");
             Ok(ExitCode::from(1))
         }
+    }
+}
+
+/// How long T5 waits for the listener to release the session pipe after
+/// `quit` (`design-m5b.md` §4.6): 3 s, polled every 100 ms. A healthy
+/// listener exits well inside this (flush ack → exit ladder → drops).
+const PRE_QUIT_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
+const PRE_QUIT_POLL: Duration = Duration::from_millis(100);
+
+/// T5 (`design-m5b.md` §4.6): hand a fresh manual `cascade run` (or
+/// `run --detached`) the session from a running battery listener —
+/// `status` says `listening` → `quit` → poll for the pipe release →
+/// proceed. A full daemon's `mode` is never `listening`, so this is a
+/// no-op against one and its `AlreadyRunning` behaviour is unchanged.
+/// A listener that refuses to die surfaces as an error instead of ever
+/// starting a second instance (AGENTS §3 — single instance, `ipc.md` §1).
+fn pre_quit_listener() -> Result<(), String> {
+    let listening = client::request("status", no_data())
+        .ok()
+        .and_then(|value| serde_json::from_value::<Status>(value).ok())
+        .is_some_and(|status| status.mode == "listening");
+    if !listening {
+        return Ok(());
+    }
+    client::request("quit", no_data()).map_err(|err| {
+        format!("could not stop the battery listener ({err}) — `cascade stop`, then retry")
+    })?;
+    // Poll for *both* releases: the pipe instance (what blocks the next
+    // `create_session_pipe`) and the control window (what `run_detached`
+    // probes). The listener's serve thread closes the pipe and its main
+    // loop drops the window in an unspecified order, so either may go
+    // first — wait for the pair, not one of them.
+    let deadline = Instant::now() + PRE_QUIT_RELEASE_TIMEOUT;
+    loop {
+        let pipe_gone = matches!(
+            client::request("status", no_data()),
+            Err(client::ClientError::NotRunning)
+        );
+        if pipe_gone && control::find_existing().is_none() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "the battery listener still holds the session 3 s after `quit` — `cascade stop`, then retry"
+                    .to_string(),
+            );
+        }
+        std::thread::sleep(PRE_QUIT_POLL);
     }
 }
 
@@ -346,7 +441,13 @@ fn detached_child_args(args: &[String]) -> Vec<String> {
 /// console, wait until its pipe answers, print the pid, return — the
 /// caller may close the terminal immediately and the wallpaper keeps
 /// playing. Plain `run` stays foreground for debugging.
-fn run_detached(args: &[String]) -> Result<ExitCode, String> {
+fn run_detached(role: StartRole, args: &[String]) -> Result<ExitCode, String> {
+    // T5 (`design-m5b.md` §4.6): the same hand-over as a foreground manual
+    // `run` — quit a listening session first, so `--detached` starts the
+    // full daemon instead of hitting the listener's `AlreadyRunning`.
+    if role == StartRole::Manual && std::env::var_os("CASCADE_RESPAWN").is_none() {
+        pre_quit_listener()?;
+    }
     // Single instance (`ipc.md` §1): refuse *before* spawning a child that
     // would only print an error and die.
     if control::find_existing().is_some() {
@@ -1194,19 +1295,27 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
     let (patch, canonical) = build_patch(key, value)?;
     let payload =
         serde_json::to_value(patch).map_err(|err| format!("could not build request: {err}"))?;
-    let (settings, offline_route) = match request_routed("settings.set", &payload)? {
+    let (settings, route) = match request_routed("settings.set", &payload)? {
         Routed::Daemon(data) => (
             serde_json::from_value::<Settings>(data)
                 .map_err(|err| format!("engine sent unreadable settings: {err}"))?,
-            false,
+            // MD2 (`design-m5b.md` §7): the battery listener persists the
+            // value too but has no engine to restart — one `status`
+            // roundtrip tells the two pipe roles apart, so the echo is
+            // honest on both.
+            if matches!(key, "engine_mode" | "volume") && listener_serving() {
+                SetRoute::Listening
+            } else {
+                SetRoute::Daemon
+            },
         ),
         // Apply and persist in this process; with no live engine nothing
         // applies in-process, and a failed save is an error here so the CLI
         // never echoes a change that did not stick (design-m5b §3.3).
-        Routed::Offline => (offline::settings_apply(patch)?, true),
+        Routed::Offline => (offline::settings_apply(patch)?, SetRoute::Offline),
     };
     println!("{key} = {canonical}");
-    for note in set_notes(key, offline_route) {
+    for note in set_notes(key, route) {
         println!("  {note}");
     }
     // A contradictory-but-allowed combination applies and warns (D9).
@@ -1216,15 +1325,52 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The apply-semantics note after `settings set`: the daemon route says how
-/// a live engine applies the value, the offline route says there is no live
-/// engine yet (`design-m5b.md` §3.3 — honest echoes, same shape).
-fn set_notes(key: &str, offline_route: bool) -> Vec<&'static str> {
-    match (key, offline_route) {
-        ("engine_mode", false) => vec!["daemon restarts to apply it if a video is playing"],
-        ("engine_mode", true) => vec!["applied at the next start (no daemon running)"],
-        ("volume", false) => vec!["applied to the playing video immediately (no restart)"],
-        ("volume", true) => vec!["applied at the next load (no daemon running)"],
+/// Which path answered `settings set` — the echo note must describe *that*
+/// path's apply semantics (`design-m5b.md` §3.3 offline parity, §4.5
+/// listener command set, MD2 in §7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetRoute {
+    /// A full daemon applied it to the running engine.
+    Daemon,
+    /// The battery listener persisted it; no engine exists (MD2).
+    Listening,
+    /// No Cascade process was running; the file was written directly.
+    Offline,
+}
+
+/// True when the session pipe is currently served by the battery listener
+/// (MD2, `design-m5b.md` §7): one `status` roundtrip, `mode:"listening"`.
+/// Any failure answers `false` — the daemon-route note stays the default,
+/// so a transient error never invents a route.
+fn listener_serving() -> bool {
+    client::request("status", no_data())
+        .ok()
+        .and_then(|value| serde_json::from_value::<Status>(value).ok())
+        .is_some_and(|status| status.mode == "listening")
+}
+
+/// The apply-semantics note after `settings set`: each route says how *it*
+/// applies the value — a live engine, a listener with no engine to
+/// restart, or no process at all (`design-m5b.md` §3.3 / §4.5, MD2 §7 —
+/// honest echoes, same shape).
+fn set_notes(key: &str, route: SetRoute) -> Vec<&'static str> {
+    match (key, route) {
+        ("engine_mode", SetRoute::Daemon) => {
+            vec!["daemon restarts to apply it if a video is playing"]
+        }
+        ("engine_mode", SetRoute::Listening) => {
+            vec!["applied at the next start (no engine to restart)"]
+        }
+        ("engine_mode", SetRoute::Offline) => {
+            vec!["applied at the next start (no daemon running)"]
+        }
+        ("volume", SetRoute::Daemon) => {
+            vec!["applied to the playing video immediately (no restart)"]
+        }
+        ("volume", SetRoute::Listening) => {
+            vec!["applied at the next load (no engine to restart)"]
+        }
+        ("volume", SetRoute::Offline) => vec!["applied at the next load (no daemon running)"],
         _ => vec![],
     }
 }
@@ -1854,25 +2000,36 @@ mod tests {
         // Daemon route: unchanged wording (design-engine-mode §3,
         // design-volume §3).
         assert_eq!(
-            set_notes("engine_mode", false),
+            set_notes("engine_mode", SetRoute::Daemon),
             vec!["daemon restarts to apply it if a video is playing"]
         );
         assert_eq!(
-            set_notes("volume", false),
+            set_notes("volume", SetRoute::Daemon),
             vec!["applied to the playing video immediately (no restart)"]
+        );
+        // Listening route (MD2, §7): the listener persists but there is no
+        // engine to restart or load into.
+        assert_eq!(
+            set_notes("engine_mode", SetRoute::Listening),
+            vec!["applied at the next start (no engine to restart)"]
+        );
+        assert_eq!(
+            set_notes("volume", SetRoute::Listening),
+            vec!["applied at the next load (no engine to restart)"]
         );
         // Offline route: same shape, honest apply semantics (design-m5b §3.3).
         assert_eq!(
-            set_notes("engine_mode", true),
+            set_notes("engine_mode", SetRoute::Offline),
             vec!["applied at the next start (no daemon running)"]
         );
         assert_eq!(
-            set_notes("volume", true),
+            set_notes("volume", SetRoute::Offline),
             vec!["applied at the next load (no daemon running)"]
         );
-        // Every other key carries no note on either route.
-        assert!(set_notes("tray", false).is_empty());
-        assert!(set_notes("on_battery", true).is_empty());
+        // Every other key carries no note on any route.
+        assert!(set_notes("tray", SetRoute::Daemon).is_empty());
+        assert!(set_notes("on_battery", SetRoute::Offline).is_empty());
+        assert!(set_notes("on_battery", SetRoute::Listening).is_empty());
     }
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -1957,7 +2114,8 @@ mod tests {
         assert!(should_listenable(Autostart, false, stop, battery));
         // autostart + AC → FULL.
         assert!(!should_listenable(Autostart, false, stop, ac));
-        // `run` fresh + battery + stop → FULL (the D1 override is S3).
+        // `run` fresh + battery + stop → FULL with the D1 session
+        // override (`session_override_rule` below).
         assert!(!should_listenable(Manual, false, stop, battery));
         // `run` fresh + AC → FULL, no override.
         assert!(!should_listenable(Manual, false, stop, ac));
@@ -1978,6 +2136,45 @@ mod tests {
             assert!(!should_listenable(Autostart, false, action, battery));
             assert!(!should_listenable(Manual, true, action, battery));
         }
+    }
+
+    #[test]
+    fn session_override_rule_truth_table_matches_design_m5b_4_3_d1() {
+        use StartRole::{Autostart, Manual};
+        let stop = BatteryAction::Stop;
+        let battery = Some(true);
+        let ac = Some(false);
+
+        // fresh manual + battery + stop → override (D1; also T5's landing
+        // after the pre-quit, since the listener is gone by then).
+        assert!(session_override_rule(Manual, false, stop, battery));
+        // fresh manual + AC → no override.
+        assert!(!session_override_rule(Manual, false, stop, ac));
+        // unknown source counts as AC (fail-open): no override.
+        assert!(!session_override_rule(Manual, false, stop, None));
+        // automatic starts never take the override — they become the
+        // listener instead (§4.3), so there is no full session to hold.
+        assert!(!session_override_rule(Autostart, false, stop, battery));
+        // other actions on a manual start need no override: the stop rule
+        // is not what would end them.
+        assert!(!session_override_rule(
+            Manual,
+            false,
+            BatteryAction::Continue,
+            battery
+        ));
+        assert!(!session_override_rule(
+            Manual,
+            false,
+            BatteryAction::Pause,
+            battery
+        ));
+        // T6 `Start now` child (MD6 §7): the env marker forces the
+        // override regardless of role or source — it must land FULL, never
+        // loop back into a listener.
+        assert!(session_override_rule(Manual, true, stop, battery));
+        assert!(session_override_rule(Manual, true, stop, ac));
+        assert!(session_override_rule(Autostart, true, stop, battery));
     }
 
     #[test]
