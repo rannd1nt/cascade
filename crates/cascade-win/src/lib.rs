@@ -18,6 +18,7 @@ pub mod power;
 pub mod present;
 pub mod registry;
 pub mod repaint;
+pub mod respawn;
 pub mod shell;
 pub mod state;
 pub mod system;

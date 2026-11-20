@@ -665,8 +665,8 @@ fn dispatch_line(
 /// `quit` are answered right here on the pipe thread — there is no engine
 /// and no main-loop command channel to forward to. Everything else gets the
 /// honest "no engine is running" answer (the `settings`/`library` file ops
-/// join in Pw2-S2, `design-m5b.md` §6). Returns `false` when the connection
-/// must close (write failed).
+/// and T4 join in Pw2-S3, `design-m5b.md` §6). Returns `false` when the
+/// connection must close (write failed).
 fn dispatch_listener(
     handle: HANDLE,
     request: &ipc::Request,

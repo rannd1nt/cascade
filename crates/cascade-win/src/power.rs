@@ -83,6 +83,25 @@ impl Hysteresis {
         self.confirmed
     }
 
+    /// True while a raw candidate is waiting out its stability window.
+    /// The listener arms its one-shot `SetTimer` only in this state
+    /// (`design-m5b.md` §4.2 — steady state has zero timers).
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Publish `raw` as the confirmed state with no stability window
+    /// (`design-m5b.md` §4.2). The listener uses this instead of
+    /// [`observe`](Self::observe): it only exists *because* the source is
+    /// already on battery, so there is nothing to wait for — and a seeded
+    /// candidate would leave `confirmed` on AC for the first 3 s, a window
+    /// in which a real AC event would read as "already AC", cancel the
+    /// candidate, and strand the listener with no transition back.
+    pub fn seed(&mut self, raw: bool) {
+        self.confirmed = raw;
+        self.pending = None;
+    }
+
     /// Drop everything: the collector was disabled (D8) or the daemon is
     /// resetting. The next enable seeds a fresh state from the hardware.
     pub fn reset(&mut self) {
@@ -97,11 +116,19 @@ impl Hysteresis {
 /// window. `Reload` never loads in this process: the daemon respawns so
 /// the child gets flat memory (design-m4 §8.3 — a second load pipeline
 /// would retain ~50 MB until process exit).
+///
+/// The consumer of [`Reconcile::Unload`] changed in `design-m5b.md` §4.4
+/// (T2): `power_step` maps it to the existing `power_respawn` exit ladder
+/// — repaint the real wallpaper, respawn, and let the child land in the
+/// battery listener — instead of an in-place unload. The pure meaning is
+/// untouched: "the engine must go away".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reconcile {
     /// Nothing to do; the rules may still need a re-evaluate.
     Nothing,
-    /// `on_battery=stop` on battery with a loaded engine: unload it.
+    /// `on_battery=stop` on battery with a loaded engine: it must go away.
+    /// Consumed by `power_step` as an exit-ladder + respawn (`design-m5b.md`
+    /// §4.4 T2), never as an in-place unload.
     Unload,
     /// The video should be present but the engine is unloaded: respawn.
     Reload,
@@ -114,7 +141,11 @@ pub enum Reconcile {
 ///
 /// The pair `has_video && !loaded` occurs in exactly one legitimate
 /// situation — an `on_battery=stop` unload — so `Reload` can never fight
-/// a failed load or a cleared wallpaper into a respawn loop.
+/// a failed load or a cleared wallpaper into a respawn loop: every load
+/// failure clears `state.video` before the next tick (`daemon.rs` startup
+/// load, `wallpaper.set`, `wallpaper.clear`), and `design-m5b.md` §4.4 T2
+/// makes the unload leave the process instead of flipping `loaded` in
+/// place.
 pub fn reconcile(
     on_battery: bool,
     action: BatteryAction,
@@ -227,8 +258,22 @@ pub unsafe fn record_broadcast(lparam: LPARAM) {
     // (GUID_ACDC_POWER_SOURCE carries a SYSTEM_POWER_CONDITION DWORD) and
     // read_unaligned tolerates the byte offset.
     let value = unsafe { (setting.Data.as_ptr() as *const u32).read_unaligned() };
-    if let Some(sample) = source_from_dword(value) {
-        record_raw(sample);
+    // Log every payload before parsing: a *dropped* value is invisible
+    // downstream, and §9 evidence (build 26200.9711) shows the OS can
+    // deliver a stale or surprising value at a plug — the raw number is
+    // what makes that diagnosable from a redirected stdout.
+    match source_from_dword(value) {
+        Some(sample) => {
+            dlog!(
+                "power: broadcast value={value} sample {}",
+                if sample { "battery" } else { "AC" }
+            );
+            record_raw(sample);
+        }
+        None => dlog!(
+            "power: broadcast value={value} ignored (DataLength={})",
+            setting.DataLength
+        ),
     }
 }
 
@@ -331,6 +376,54 @@ mod tests {
             "the new true candidate needs its own 3 s (from +2 s)"
         );
         assert!(hysteresis.tick(at(t0, 5_000)));
+    }
+
+    #[test]
+    fn hysteresis_seed_publishes_immediately_with_no_window() {
+        // design-m5b §4.2: the listener seeds from `read_source()` — it
+        // exists because the source is already battery, so a candidate
+        // would leave `confirmed` on AC for 3 s and swallow a real AC
+        // event inside that window (it would read as "already AC").
+        let t0 = Instant::now();
+        let mut hysteresis = Hysteresis::default();
+        hysteresis.seed(true);
+        assert!(hysteresis.confirmed(), "published without waiting");
+        assert!(!hysteresis.has_pending(), "a seed is not a candidate");
+        assert!(hysteresis.tick(t0), "the seeded state survives a tick");
+        // A real AC event now has a full 3 s window of its own: `tick`
+        // returns the *confirmed* state, which stays battery until the
+        // window elapses.
+        hysteresis.observe(false, t0);
+        assert!(hysteresis.has_pending());
+        assert!(
+            hysteresis.tick(at(t0, 2_999)),
+            "battery is still confirmed at 2.999 s"
+        );
+        assert!(
+            !hysteresis.tick(at(t0, 3_000)),
+            "AC is confirmed once the window elapsed"
+        );
+    }
+
+    #[test]
+    fn has_pending_tracks_only_the_candidate_window() {
+        let t0 = Instant::now();
+        let mut hysteresis = Hysteresis::default();
+        assert!(!hysteresis.has_pending());
+        hysteresis.observe(true, t0);
+        assert!(hysteresis.has_pending(), "a new candidate is pending");
+        // The source flaps back: the candidate dies with its window.
+        hysteresis.observe(false, at(t0, 500));
+        assert!(
+            !hysteresis.has_pending(),
+            "cancelled by the confirmed value"
+        );
+        // Promoting clears the candidate too.
+        hysteresis.observe(true, t0);
+        hysteresis.tick(at(t0, 3_000));
+        assert!(!hysteresis.has_pending(), "promoted, nothing pending");
+        hysteresis.reset();
+        assert!(!hysteresis.has_pending());
     }
 
     #[test]

@@ -26,7 +26,8 @@ use cascade_core::rule_engine::{BatteryAction, PowerProfile};
 use cascade_core::{MediaBackend, PresentationMode};
 use cascade_media::{MediaEngineBackend, SourceReaderBackend};
 use cascade_win::{
-    console, control, daemon, doctor, dpi, host, install, listener, offline, registry, state,
+    console, control, daemon, doctor, dpi, host, install, listener, offline, registry, respawn,
+    state,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -93,11 +94,11 @@ fn bare_main() -> Result<ExitCode, String> {
         // never allocate a console for the long-lived role).
         BareAction::RespawnRun => {
             console::prepare_stdio(true);
-            cmd_run(&[])
+            cmd_run(StartRole::Manual, &[])
         }
         BareAction::Run => {
             console::prepare_stdio(false);
-            cmd_run(&[])
+            cmd_run(StartRole::Manual, &[])
         }
         BareAction::Usage => {
             console::prepare_stdio(false);
@@ -137,9 +138,9 @@ fn is_gui_role(args: &[String]) -> bool {
 
 fn dispatch(args: &[String]) -> Result<ExitCode, String> {
     match args.first().map(String::as_str) {
-        None => cmd_run(&[]),
-        Some("run") => cmd_run(&args[1..]),
-        Some("--autostart") => cmd_run(&args[1..]),
+        None => cmd_run(StartRole::Manual, &[]),
+        Some("run") => cmd_run(StartRole::Manual, &args[1..]),
+        Some("--autostart") => cmd_run(StartRole::Autostart, &args[1..]),
         // Pw2-S1 (`design-m5b.md` §6): the listener as a manual entry —
         // the automatic entry rules arrive with Pw2-S2 (§4.3).
         Some("--listen") => cmd_listen(&args[1..]),
@@ -181,7 +182,40 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
-fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
+/// How this process was started, as far as the entry rules care
+/// (`design-m5b.md` §4.3). Only `--autostart` counts as an automatic
+/// start: a typed `run` is a deliberate action and therefore gets the
+/// session override (D1) instead of the listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartRole {
+    /// `cascade run`, `cascade` bare, or a `--detached` child — manual.
+    Manual,
+    /// `--autostart` (the Run key at logon, `design-m5.md` §4).
+    Autostart,
+}
+
+/// The entry rule (`design-m5b.md` §4.3): start as the battery listener
+/// instead of the full daemon. Evaluated in [`cmd_run`] **before**
+/// `build_backend`, so the listener branch is a structural skip-load
+/// (R4): no backend, no factory call, no Media Foundation session exists
+/// on that path.
+///
+/// Pure — the power source is read by the caller (`power::read_source()`)
+/// and `None` means "no honest answer", which counts as AC (fail-open,
+/// §4.8): an unknown source must never start a listener that could then
+/// never transition back.
+fn should_listenable(
+    role: StartRole,
+    respawn_env: bool,
+    on_battery: BatteryAction,
+    source_now: Option<bool>,
+) -> bool {
+    on_battery == BatteryAction::Stop
+        && source_now.unwrap_or(false)
+        && (role == StartRole::Autostart || respawn_env)
+}
+
+fn cmd_run(role: StartRole, args: &[String]) -> Result<ExitCode, String> {
     // `--detached` (design-m5 §4) never reaches the daemon: it changes how
     // *this* process spawns the child, not what the child does.
     let (detached, args) = split_detached_flag(args)?;
@@ -189,6 +223,31 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         return run_detached(&args);
     }
     let options = parse_run_options(&args)?;
+
+    // Entry rules (`design-m5b.md` §4.3), evaluated here — before
+    // `build_backend` — so the skip-load is structural (R4). Everything
+    // the rule needs is read from disk / hardware, never from a backend.
+    if should_listenable(
+        role,
+        std::env::var_os("CASCADE_RESPAWN").is_some(),
+        offline::settings_get().on_battery,
+        cascade_win::power::read_source(),
+    ) {
+        match listener::run() {
+            // The listener ran and stopped on its own (quit, `cascade
+            // stop`, or a T3 hand-off that already spawned its child).
+            Ok(daemon::RunExit::Exit) => return Ok(ExitCode::SUCCESS),
+            // The listener never asks the CLI to re-exec it: T3 spawns
+            // the full child itself while it still owns the pipe.
+            Ok(daemon::RunExit::Respawn) => {
+                return respawn::respawn_child().map(|_| ExitCode::SUCCESS)
+            }
+            Err(err) => {
+                cascade_win::derr!("cascade: {err}");
+                return Ok(ExitCode::from(1));
+            }
+        }
+    }
 
     // A backend is only worth constructing when a source exists
     // (design-m2 §2.2): `--video` wins, otherwise the last successful path
@@ -212,7 +271,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         // A different-file `wallpaper.set` was answered: the exit ladder
         // has repainted and `state.json` holds the new path; re-exec so
         // the child loads it with flat memory (design-m2 §4).
-        Ok(daemon::RunExit::Respawn) => respawn_child(),
+        Ok(daemon::RunExit::Respawn) => respawn::respawn_child().map(|_| ExitCode::SUCCESS),
         Err(err) => {
             // Best effort: a console close may already have invalidated the
             // handles, and a panic here would be reported as a crash.
@@ -234,7 +293,7 @@ fn cmd_listen(args: &[String]) -> Result<ExitCode, String> {
         Ok(daemon::RunExit::Exit) => Ok(ExitCode::SUCCESS),
         // The listener never respawns in Pw2-S1 (transitions arrive with
         // Pw2-S2); the arm exists so the shape matches `cmd_run`.
-        Ok(daemon::RunExit::Respawn) => respawn_child(),
+        Ok(daemon::RunExit::Respawn) => respawn::respawn_child().map(|_| ExitCode::SUCCESS),
         Err(err) => {
             cascade_win::derr!("cascade: {err}");
             Ok(ExitCode::from(1))
@@ -357,49 +416,6 @@ fn run_detached(args: &[String]) -> Result<ExitCode, String> {
         }
         std::thread::sleep(DETACHED_POLL);
     }
-}
-
-/// Re-exec this binary after a respawn-triggering `wallpaper.set`
-/// (design-m2 §4). The child inherits everything except `--video` (it
-/// must read the new path from `state.json`, not the flag that started
-/// this process) and sets `CASCADE_RESPAWN` so it retries the session
-/// pipe until this process exits. A failed spawn leaves a repainted
-/// desktop and a correct `state.json` — the next start loads the new
-/// file anyway; the error still surfaces as a non-zero exit.
-fn respawn_child() -> Result<ExitCode, String> {
-    let exe = std::env::current_exe().map_err(|err| format!("respawn: {err}"))?;
-    match std::process::Command::new(exe)
-        .args(respawn_args())
-        .env("CASCADE_RESPAWN", "1")
-        .spawn()
-    {
-        Ok(child) => {
-            cascade_win::dlog!("cascade: respawned as pid {}", child.id());
-            Ok(ExitCode::SUCCESS)
-        }
-        Err(err) => Err(format!("respawn: {err}")),
-    }
-}
-
-/// The respawn argv: this process's arguments minus `--video` and its
-/// value. Pure so the filter is unit-testable without touching argv.
-fn respawn_args() -> Vec<std::ffi::OsString> {
-    filter_video_flag(std::env::args_os().skip(1).collect())
-}
-
-fn filter_video_flag(raw: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
-    let mut out = Vec::with_capacity(raw.len());
-    let mut skip_next = false;
-    for arg in raw {
-        if skip_next {
-            skip_next = false;
-        } else if arg == "--video" {
-            skip_next = true;
-        } else {
-            out.push(arg);
-        }
-    }
-    out
 }
 
 /// Parse `run`/`--autostart` options. Kept free of side effects so the
@@ -1931,24 +1947,37 @@ mod tests {
     }
 
     #[test]
-    fn respawn_filter_drops_video_flag_and_keeps_everything_else() {
-        // `--video` and its value go; the child reads `state.json` instead
-        // (design-m2 §4). Position anywhere, other options untouched.
-        let raw = |list: &[&str]| -> Vec<std::ffi::OsString> {
-            list.iter().map(std::ffi::OsString::from).collect()
-        };
-        assert_eq!(
-            filter_video_flag(raw(&["run", "--video", r"C:\a.mp4", "--repaint", "2"])),
-            raw(&["run", "--repaint", "2"])
-        );
-        assert_eq!(
-            filter_video_flag(raw(&["run", "--color", "FF0000", "--video", r"C:\b.mp4"])),
-            raw(&["run", "--color", "FF0000"])
-        );
-        assert_eq!(filter_video_flag(raw(&["run"])), raw(&["run"]));
-        assert_eq!(filter_video_flag(raw(&[])), raw(&[]));
-        // A trailing `--video` with no value loses nothing else.
-        assert_eq!(filter_video_flag(raw(&["run", "--video"])), raw(&["run"]));
+    fn entry_rule_truth_table_matches_design_m5b_4_3() {
+        use StartRole::{Autostart, Manual};
+        let stop = BatteryAction::Stop;
+        let battery = Some(true);
+        let ac = Some(false);
+
+        // autostart + battery + stop → LISTENER (T1, B1).
+        assert!(should_listenable(Autostart, false, stop, battery));
+        // autostart + AC → FULL.
+        assert!(!should_listenable(Autostart, false, stop, ac));
+        // `run` fresh + battery + stop → FULL (the D1 override is S3).
+        assert!(!should_listenable(Manual, false, stop, battery));
+        // `run` fresh + AC → FULL, no override.
+        assert!(!should_listenable(Manual, false, stop, ac));
+        // transition child (CASCADE_RESPAWN) + battery + stop → LISTENER
+        // (T2's landing).
+        assert!(should_listenable(Manual, true, stop, battery));
+        // transition child + AC → FULL (T3's landing).
+        assert!(!should_listenable(Manual, true, stop, ac));
+        // Unknown source (255 / failed read) counts as AC (fail-open).
+        assert!(!should_listenable(Autostart, false, stop, None));
+        assert!(!should_listenable(Manual, true, stop, None));
+        // Any other `on_battery` value keeps the full daemon.
+        for action in [
+            BatteryAction::Off,
+            BatteryAction::Pause,
+            BatteryAction::Continue,
+        ] {
+            assert!(!should_listenable(Autostart, false, action, battery));
+            assert!(!should_listenable(Manual, true, action, battery));
+        }
     }
 
     #[test]

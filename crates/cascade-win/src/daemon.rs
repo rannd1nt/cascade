@@ -52,7 +52,7 @@ use crate::registry;
 use crate::repaint;
 use crate::shell::{self, ShellError, ShellSurface};
 use crate::state::{DaemonState, Store};
-use crate::tray::{Tray, TrayAction};
+use crate::tray::{Tray, TrayAction, TrayMode};
 use crate::wallpaper::WallpaperSnapshot;
 use crate::{derr, dlog};
 
@@ -642,7 +642,7 @@ fn apply_playback(
 }
 
 /// Everything one `power_step` may touch (design-m4 §2.6). Grouped into
-/// one value for the same reason as `StatusInputs`: nine loose parameters
+/// one value for the same reason as `StatusInputs`: eight loose parameters
 /// would sit well past clippy's limit.
 struct PowerStep<'a> {
     /// Control window that receives `WM_POWERBROADCAST`.
@@ -650,9 +650,9 @@ struct PowerStep<'a> {
     settings: &'a Settings,
     flags: &'a mut Flags,
     backend: &'a mut BackendGuard,
-    host: &'a mut Host,
-    /// Read-only: only `state.video.is_some()` matters here — an unload
-    /// keeps the file reference (AGENTS §3.3) so a later respawn reloads it.
+    /// Read-only: only `state.video.is_some()` matters here — a stop keeps
+    /// the file reference (AGENTS §3.3) so the AC return reloads it in the
+    /// fresh process (`design-m5b.md` §4.4 T3).
     state: &'a DaemonState,
     registration: &'a mut Option<isize>,
     hysteresis: &'a mut power::Hysteresis,
@@ -671,17 +671,27 @@ struct PowerStep<'a> {
 /// 3. **Reconcile** — [`power::reconcile`] decides unload vs. respawn vs.
 ///    nothing; a state change re-evaluates the rules (they are idempotent).
 ///
-/// Returns `true` when the daemon must respawn to bring the video back:
-/// this process has already loaded once, and a second in-process load
-/// would retain another ~50 MB pipeline (§8.3), so the reload always runs
-/// in a fresh process.
+/// Returns `true` when this process must stop and respawn — **both**
+/// arms leave through the same `power_respawn` exit ladder
+/// (`design-m5b.md` §4.4):
+///
+/// * `Reload` — the video must come back and this process has already
+///   loaded once; a second in-process load would retain another ~50 MB
+///   pipeline (§8.3), so the reload runs in a fresh process.
+/// * `Unload` — `on_battery=stop` on battery with a loaded engine. The
+///   ladder repaints the **real** wallpaper before the child starts, so
+///   the desktop is never Cascade's teal host on battery
+///   (`design-m5b.md` §1.2), and the child lands in the battery listener
+///   (§4.3) with `state.video` kept for the AC return.
+///
+/// There is deliberately **no in-place unload** any more: it is what made
+/// "stop" a coloured pause with ≈90 MB retained (AGENTS §3.15).
 fn power_step(step: PowerStep<'_>) -> bool {
     let PowerStep {
         hwnd,
         settings,
         flags,
         backend,
-        host,
         state,
         registration,
         hysteresis,
@@ -723,11 +733,14 @@ fn power_step(step: PowerStep<'_>) -> bool {
         }
     }
 
-    // 2. Raw sample → hysteresis → confirmed state. A broadcast is only
-    //    consumed while subscribed; a stale one is dropped by the disable
-    //    path's `reset` above.
+    // 2. Raw sample → hysteresis → confirmed state. Broadcast first; when
+    //    none is pending, fall back to a direct hardware read
+    //    (design-m5b §4.2 amendment 2026-11-20, §9: build 26200 delayed or
+    //    skipped AC broadcasts — a push-only collector can confirm a state
+    //    the hardware left minutes ago). A stale broadcast is dropped by
+    //    the disable path's `reset` above.
     if *collector_on {
-        if let Some(raw) = power::take_raw() {
+        if let Some(raw) = power::take_raw().or_else(power::read_source) {
             hysteresis.observe(raw, Instant::now());
         }
         let confirmed = hysteresis.tick(Instant::now());
@@ -741,28 +754,17 @@ fn power_step(step: PowerStep<'_>) -> bool {
         }
     }
 
-    // 3. Reconcile the engine with the confirmed state.
+    // 3. Reconcile the engine with the confirmed state. Both "must go"
+    //    arms return `true`: the loop's `power_respawn` path runs the exit
+    //    ladder and hands over to a fresh process (design-m5b §4.4) — the
+    //    in-place unload branch is gone with it.
     match power::reconcile(
         flags.on_battery,
         action,
         backend.loaded,
         state.video.is_some(),
     ) {
-        power::Reconcile::Reload => return true,
-        power::Reconcile::Unload => {
-            // `on_battery=stop` on battery with a loaded engine (design-m4
-            // §2.6): the engine lets go of its playback window, the colour
-            // presenter takes the client area back — the desktop is never
-            // blank (AGENTS §3.1) and the file is never touched (§3.3).
-            // `state.video` is kept, so an AC return respawns with it.
-            if let Err(err) = backend.detach_surface() {
-                derr!("power: backend detach failed: {err}");
-            }
-            backend.loaded = false;
-            host.restore_presenter();
-            dlog!("power: on_battery=stop unloaded the video; the desktop keeps its colour");
-            return false;
-        }
+        power::Reconcile::Reload | power::Reconcile::Unload => return true,
         power::Reconcile::Nothing => {}
     }
     if changed {
@@ -1684,7 +1686,7 @@ pub fn run(
     // Tray icon on the control window (design-m5 §6, P3): gated by the
     // persisted `settings.tray`; a failure logs and continues — the
     // desktop never depends on a notification-area icon.
-    let mut tray = Tray::new(control.hwnd(), settings.tray);
+    let mut tray = Tray::new(control.hwnd(), settings.tray, TrayMode::Full);
 
     let snapshot = crate::wallpaper::snapshot();
     dlog!("cascade {} starting", env!("CARGO_PKG_VERSION"));
@@ -1952,15 +1954,16 @@ pub fn run(
             settings: &settings,
             flags: &mut flags,
             backend: &mut backend_guard,
-            host: &mut host,
             state: &state,
             registration: &mut power_registration,
             hysteresis: &mut power_hysteresis,
             collector_on: &mut collector_on,
         }) {
-            // The video must come back but this process already loaded
-            // once: head straight for the quit block at the top — no
-            // wait, the child does the reload with flat memory (§8.3).
+            // Either "the engine must go away" arm (`design-m5b.md` §4.4):
+            // head straight for the quit block at the top — no wait. The
+            // ladder repaints the real wallpaper and the child does the
+            // reload with flat memory (§8.3), landing in the listener when
+            // the source is still battery (§4.3).
             power_respawn = true;
             continue;
         }

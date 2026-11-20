@@ -81,6 +81,18 @@ pub fn taskbar_created_id() -> u32 {
     TASKBAR_CREATED.load(Ordering::Acquire)
 }
 
+/// Which menu this icon shows (`design-m5b.md` §4.7, D2). A process is
+/// one role for its whole life, so the mode is fixed at construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayMode {
+    /// The full daemon: Open / Pause / Quit (design-m5 §6).
+    Full,
+    /// The battery listener: only what it can honestly do. Pw2-S2 shows
+    /// `Quit`; the disabled header and `Start now` (T6, MD1) arrive with
+    /// Pw2-S3.
+    Listening,
+}
+
 /// What one menu choice means for the main loop (pure; unit-tested).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
@@ -126,6 +138,8 @@ fn pause_label(paused: bool) -> &'static str {
 pub struct Tray {
     hwnd: HWND,
     icon: HICON,
+    /// Which menu to build (Full vs Listening, `design-m5b.md` §4.7).
+    mode: TrayMode,
     /// Whether the shell currently holds our icon — our own belief,
     /// updated only from real `NIM_ADD` / `NIM_DELETE` results.
     added: bool,
@@ -138,7 +152,7 @@ impl Tray {
     /// Load the icon and apply `want` immediately. Registration of
     /// `TaskbarCreated` happens here, before the first `NIM_ADD`, so a
     /// broadcast can never arrive before we know its id.
-    pub fn new(hwnd: HWND, want: bool) -> Self {
+    pub fn new(hwnd: HWND, want: bool, mode: TrayMode) -> Self {
         register_taskbar_created();
         let icon = load_icon();
         if icon.is_null() {
@@ -147,6 +161,7 @@ impl Tray {
         let mut tray = Self {
             hwnd,
             icon,
+            mode,
             added: false,
             warned: false,
         };
@@ -164,7 +179,7 @@ impl Tray {
         if !self.added || !MENU_PENDING.swap(false, Ordering::AcqRel) {
             return None;
         }
-        show_menu(self.hwnd, paused)
+        show_menu(self.hwnd, self.mode, paused)
     }
 
     /// Drop the icon on the exit ladder (every path, including a
@@ -294,7 +309,12 @@ fn load_icon() -> HICON {
 
 /// Build the menu at the cursor, track it modally on this thread, and
 /// map the chosen id. Returns `None` on dismissal or a create failure.
-fn show_menu(hwnd: HWND, paused: bool) -> Option<TrayAction> {
+///
+/// Each mode offers only what that role can honestly do
+/// (`design-m5b.md` §4.7): the listener has no engine, so `Open`/`Pause`
+/// would be dead entries. Pw2-S2 ships `Quit` alone; the disabled header
+/// and `Start now` (T6, MD1) join in Pw2-S3.
+fn show_menu(hwnd: HWND, mode: TrayMode, paused: bool) -> Option<TrayAction> {
     // SAFETY: a valid menu handle when non-null.
     let menu: HMENU = unsafe { CreatePopupMenu() };
     if menu.is_null() {
@@ -307,9 +327,11 @@ fn show_menu(hwnd: HWND, paused: bool) -> Option<TrayAction> {
     // SAFETY: `menu` is live for this block, the labels are
     // NUL-terminated, and every out-parameter is a valid pointer.
     let cmd = unsafe {
-        AppendMenuW(menu, MF_STRING, MENU_OPEN as usize, open.as_ptr());
-        AppendMenuW(menu, MF_STRING, MENU_TOGGLE as usize, pause.as_ptr());
-        AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+        if mode == TrayMode::Full {
+            AppendMenuW(menu, MF_STRING, MENU_OPEN as usize, open.as_ptr());
+            AppendMenuW(menu, MF_STRING, MENU_TOGGLE as usize, pause.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+        }
         AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit.as_ptr());
 
         let mut point = POINT::default();
