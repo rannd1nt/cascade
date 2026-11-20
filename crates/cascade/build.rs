@@ -42,7 +42,6 @@ fn main() {
     let icon = fs::canonicalize(&icon).unwrap_or_else(|error| {
         panic!("icon not found at {}: {error}", icon.display());
     });
-    println!("cargo:rerun-if-changed={}", icon.display());
     // rc syntax wants forward slashes; also keeps POSIX paths working if
     // this script ever runs on a Windows host.
     let icon = icon.to_string_lossy().replace('\\', "/");
@@ -134,9 +133,9 @@ BEGIN
   BEGIN
    VALUE "FileDescription", "Cascade"
    VALUE "FileVersion", "{version}"
-   VALUE "InternalName", "cascade"
-   VALUE "LegalCopyright", "Copyright (C) Cascade contributors"
-   VALUE "OriginalFilename", "cascade.exe"
+   VALUE "InternalName", "Cascade"
+   VALUE "LegalCopyright", "Copyright (C) rannd1nt"
+   VALUE "OriginalFilename", "Cascade.exe"
    VALUE "ProductName", "Cascade"
    VALUE "ProductVersion", "{version}"
   END
