@@ -105,7 +105,7 @@ fn next_request_id() -> u64 {
 /// connect retries, one line each way).
 pub fn request(cmd: &str, data: serde_json::Value) -> Result<serde_json::Value, ClientError> {
     let name = to_wide(&server_name());
-    let handle = connect(&name)?;
+    let handle = connect(&name, GENERIC_READ | GENERIC_WRITE)?;
 
     let envelope = ipc::Request {
         v: PROTOCOL_VERSION,
@@ -137,7 +137,91 @@ pub fn request(cmd: &str, data: serde_json::Value) -> Result<serde_json::Value, 
     result
 }
 
-fn connect(name: &[u16]) -> Result<HANDLE, ClientError> {
+/// `\\.\pipe\cascade-evt-{session_id}` (`ipc.md` §1, design-m5-p4 §3).
+/// Same session suffix as [`server_name`] so both sides always agree.
+pub fn event_server_name() -> String {
+    let mut session: u32 = 0;
+    // SAFETY: `GetCurrentProcessId` needs no arguments; `session` is a
+    // valid local out-parameter the OS fills in.
+    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    format!("{}{session}", crate::ipc::EVENT_PIPE_PREFIX)
+}
+
+/// A held-open subscription to the daemon's event stream (`ipc.md` §6).
+///
+/// Server→client only: the client never writes, so the handle is opened
+/// with `GENERIC_READ` against the server's outbound instance. One
+/// request is one JSON line in (`ipc.md` §2); unlike [`request`], there
+/// is **no response deadline** — the stream is read by a dedicated
+/// thread that may legitimately wait hours for the next event, and a
+/// dead daemon shows up as a read error the caller reconnects from
+/// (design-m5-p4 §5).
+pub struct EventStream {
+    handle: HANDLE,
+}
+
+impl EventStream {
+    /// Connect to the event pipe with the same bounded connect budget as
+    /// [`request`] (2 s total, `ipc.md` §7).
+    pub fn open() -> Result<Self, ClientError> {
+        let name = to_wide(&event_server_name());
+        let handle = connect(&name, GENERIC_READ)?;
+        Ok(Self { handle })
+    }
+
+    /// Block until the next event line arrives. Errors mean the stream
+    /// is over (daemon exited, pipe broken, protocol disagreement) —
+    /// the caller reconnects and resyncs statelessly (`ipc.md` §7).
+    pub fn read_event(&mut self) -> Result<ipc::Event, ClientError> {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(pos) = pending.iter().position(|&byte| byte == b'\n') {
+                let line = String::from_utf8_lossy(&pending[..pos]).into_owned();
+                return decode_event_line(&line);
+            }
+            if pending.len() > MAX_LINE_BYTES {
+                return Err(ClientError::Io(0));
+            }
+            let mut read: u32 = 0;
+            // SAFETY: `buf` is writable; null OVERLAPPED = synchronous
+            // read, which blocks until at least one byte arrives.
+            let ok = unsafe {
+                ReadFile(
+                    self.handle,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || read == 0 {
+                // Capture before any later call can overwrite it.
+                // SAFETY: reads the thread's last-error value.
+                let code = unsafe { GetLastError() };
+                return Err(ClientError::Io(code));
+            }
+            pending.extend_from_slice(&buf[..read as usize]);
+        }
+    }
+}
+
+impl Drop for EventStream {
+    fn drop(&mut self) {
+        // SAFETY: handle came from CreateFileW; closed exactly once.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+fn decode_event_line(line: &str) -> Result<ipc::Event, ClientError> {
+    let event: ipc::Event = serde_json::from_str(line).map_err(|_| ClientError::Io(0))?;
+    if event.v != PROTOCOL_VERSION {
+        return Err(ClientError::VersionMismatch);
+    }
+    Ok(event)
+}
+
+fn connect(name: &[u16], access: u32) -> Result<HANDLE, ClientError> {
     let mut last_err: u32 = 0;
     for attempt in 0..CONNECT_ATTEMPTS {
         if attempt > 0 {
@@ -148,7 +232,7 @@ fn connect(name: &[u16]) -> Result<HANDLE, ClientError> {
         let handle = unsafe {
             CreateFileW(
                 name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                access,
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -280,6 +364,48 @@ mod tests {
                 .all(|c| c.is_ascii_digit()),
             "session id must be numeric: {name}"
         );
+    }
+
+    #[test]
+    fn event_server_name_shares_the_session_but_not_the_namespace() {
+        let name = event_server_name();
+        assert!(
+            name.starts_with(crate::ipc::EVENT_PIPE_PREFIX),
+            "event pipe prefix expected: {name}"
+        );
+        let suffix = &name[crate::ipc::EVENT_PIPE_PREFIX.len()..];
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_digit()),
+            "session id must be numeric: {name}"
+        );
+        // Same session as the control pipe: both names are built from the
+        // same ProcessIdToSessionId call.
+        assert_eq!(
+            suffix,
+            &server_name()[PIPE_PREFIX.len()..],
+            "event and control pipe must address the same session"
+        );
+    }
+
+    #[test]
+    fn event_lines_decode_only_as_events_with_our_version() {
+        let good = r#"{"v":1,"event":"state","data":{"mode":"attached"}}"#;
+        let event = decode_event_line(good).expect("valid event line");
+        assert_eq!(event.event, "state");
+
+        // A response envelope is not an event (no `event` field).
+        let response = r#"{"v":1,"id":7,"ok":true,"data":null,"flush_after":false}"#;
+        assert!(
+            decode_event_line(response).is_err(),
+            "responses are not events"
+        );
+
+        // Wrong version → the documented restart remedy, not a guess.
+        let stale = r#"{"v":999,"event":"shutdown","data":{}}"#;
+        assert!(matches!(
+            decode_event_line(stale),
+            Err(ClientError::VersionMismatch)
+        ));
     }
 
     #[test]

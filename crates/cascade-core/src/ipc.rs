@@ -23,6 +23,11 @@ pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// (`ProcessIdToSessionId`, `ipc.md` §1).
 pub const PIPE_PREFIX: &str = r"\\.\pipe\cascade-ctl-";
 
+/// Server→client event-stream pipe prefix (`ipc.md` §1, design-m5-p4 §3):
+/// same session suffix as the control pipe, separate namespace so the
+/// control path (CLI-first) never shares a connection with event push.
+pub const EVENT_PIPE_PREFIX: &str = r"\\.\pipe\cascade-evt-";
+
 /// Error codes (`ipc.md` §8). Serialized as their wire strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
@@ -783,6 +788,10 @@ mod tests {
     fn pipe_prefix_is_the_branded_global_namespace() {
         // Design-m4 §2.5: pipe names are machine-global → brand required.
         assert_eq!(PIPE_PREFIX, r"\\.\pipe\cascade-ctl-");
+        // design-m5-p4 §3: the event stream shares the brand + session
+        // suffix but not the control namespace.
+        assert_eq!(EVENT_PIPE_PREFIX, r"\\.\pipe\cascade-evt-");
+        assert_ne!(EVENT_PIPE_PREFIX, PIPE_PREFIX);
     }
 
     #[test]
