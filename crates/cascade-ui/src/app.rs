@@ -1,15 +1,18 @@
 //! The library window: connection state, numbered library list, and the
-//! status strip (design-m5 §5). All pipe traffic runs on one worker
+//! status strip (design-m5 §5). Request traffic runs on one worker
 //! thread (D11c) — the UI thread only sends commands and drains replies,
-//! so a wedged or absent daemon can never freeze a frame.
+//! so a wedged or absent daemon can never freeze a frame. The persistent
+//! event subscription runs on a second thread beside the worker
+//! (design-m5-p4 §5): it never issues requests, it only pushes
+//! `Reply::Event` into the same reply channel.
 
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use cascade_core::client::{self, ClientError};
 use cascade_core::ipc::{
-    no_data, LibraryAddData, LibraryAddResult, LibraryItemsData, LibraryRemoveData, RejectedPath,
-    SetData, SetReport, Settings, Status,
+    no_data, Event, LibraryAddData, LibraryAddResult, LibraryItemsData, LibraryRemoveData,
+    RejectedPath, SetData, SetReport, Settings, Status,
 };
 use cascade_core::library::LibraryItem;
 use eframe::egui;
@@ -22,12 +25,20 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// While the engine is down every poll pays the connect budget
 /// (3 × 250 ms, `ipc.md` §7) inside the worker, so poll at half rate.
 const POLL_INTERVAL_DISCONNECTED: Duration = Duration::from_secs(2);
+/// Event-stream reconnect backoff (`ipc.md` §7: never spin — 500 ms
+/// doubling to 5 s).
+const EVENT_BACKOFF_MIN: Duration = Duration::from_millis(500);
+const EVENT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// Commands UI → worker. The worker runs them strictly in order, so at
 /// most one `Poll` is ever in flight (`poll_outstanding`) and replies
 /// can never interleave.
 enum Cmd {
-    Poll,
+    /// One status/settings snapshot; `library` is false while the event
+    /// stream is live — the events own the list then (design-m5-p4 §5).
+    Poll {
+        library: bool,
+    },
     Add(Vec<String>),
     Remove(String),
     Set(String),
@@ -39,7 +50,9 @@ enum Cmd {
 enum Reply {
     Snapshot {
         status: Result<Status, ClientError>,
-        library: Result<LibraryItemsData, ClientError>,
+        /// `None` when the poll skipped `library.list` on purpose —
+        /// the current list stays untouched.
+        library: Option<Result<LibraryItemsData, ClientError>>,
         settings: Result<Settings, ClientError>,
     },
     Added(Result<LibraryAddResult, ClientError>),
@@ -48,6 +61,11 @@ enum Reply {
     Simple(Result<(), ClientError>),
     SetDone(Result<SetReport, ClientError>),
     Started(Result<(), String>),
+    /// One server-pushed event (`ipc.md` §6) from the reader thread.
+    Event(Event),
+    /// The reader connected (`true`) or lost the stream (`false`); the
+    /// UI resyncs statelessly on `true` (`ipc.md` §7).
+    EventsLive(bool),
 }
 
 /// What the last poll said about the daemon.
@@ -80,19 +98,41 @@ pub struct CascadeApp {
     /// Guards the notice slot against the same snapshot error repeating
     /// at poll rate.
     last_snapshot_error: Option<String>,
+    /// True while the reader thread holds a live event subscription:
+    /// the polls then skip `library.list` (design-m5-p4 §5).
+    events_live: bool,
 }
 
 impl CascadeApp {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(ctx: egui::Context) -> Result<Self, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
+        let worker_tx = reply_tx.clone();
         std::thread::Builder::new()
             .name("cascade-ui-ipc".to_string())
-            .spawn(move || worker(cmd_rx, reply_tx))
+            .spawn(move || worker(cmd_rx, worker_tx))
             .map_err(|err| format!("could not start the UI connection thread: {err}"))?;
-        Ok(Self {
-            cmd: cmd_tx,
-            reply: reply_rx,
+        let mut app = Self::build(cmd_tx, reply_rx);
+        // The event stream is an enhancement, not the lifeline: if this
+        // thread cannot start the window degrades to full polling with
+        // an honest notice instead of failing to open.
+        if std::thread::Builder::new()
+            .name("cascade-ui-events".to_string())
+            .spawn(move || event_reader(reply_tx, ctx))
+            .is_err()
+        {
+            app.notice = Some(
+                "live updates unavailable \u{2014} the window refreshes once per second"
+                    .to_string(),
+            );
+        }
+        Ok(app)
+    }
+
+    fn build(cmd: Sender<Cmd>, reply: Receiver<Reply>) -> Self {
+        Self {
+            cmd,
+            reply,
             conn: Conn::Unknown,
             status: None,
             settings: None,
@@ -104,7 +144,18 @@ impl CascadeApp {
             poll_at: Instant::now(),
             poll_outstanding: false,
             last_snapshot_error: None,
-        })
+            events_live: false,
+        }
+    }
+
+    /// Test constructor: identical state, no threads — the worker would
+    /// need a daemon, and the reader would subscribe to a live one.
+    #[cfg(test)]
+    fn detached() -> Self {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<Cmd>();
+        let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
+        drop(reply_tx); // no producer: tests drive `apply` directly
+        Self::build(cmd_tx, reply_rx)
     }
 
     // --- worker plumbing ------------------------------------------------
@@ -138,7 +189,8 @@ impl CascadeApp {
             }
         }
         if !self.poll_outstanding && Instant::now() >= self.poll_at {
-            if self.cmd.send(Cmd::Poll).is_ok() {
+            let library = !self.events_live;
+            if self.cmd.send(Cmd::Poll { library }).is_ok() {
                 self.poll_outstanding = true;
             } else {
                 self.mark_worker_dead();
@@ -184,12 +236,15 @@ impl CascadeApp {
                 }
                 if self.conn == Conn::Connected {
                     match library {
-                        Ok(data) => {
+                        Some(Ok(data)) => {
                             self.library = data.items;
                             drop_missing_selection(&self.library, &mut self.selected);
                             self.last_snapshot_error = None;
                         }
-                        Err(err) => self.snapshot_error(err.to_string()),
+                        Some(Err(err)) => self.snapshot_error(err.to_string()),
+                        // Skipped on purpose while the event stream is
+                        // live — the events own the list (design-m5-p4 §5).
+                        None => {}
                     }
                     match settings {
                         Ok(settings) => self.settings = Some(settings),
@@ -241,6 +296,59 @@ impl CascadeApp {
                     Err(err) => self.notice = Some(err),
                 }
             }
+            Reply::EventsLive(live) => {
+                let became_live = live && !self.events_live;
+                self.events_live = live;
+                if became_live {
+                    // Events are not replayed (`ipc.md` §6): resync with
+                    // one full poll right after (re)connecting (§7).
+                    self.request_poll_now();
+                }
+                // Going false needs no action: the next scheduled poll
+                // carries `library.list` again within one interval.
+            }
+            Reply::Event(event) => self.apply_event(event),
+        }
+    }
+
+    /// One pushed event (`ipc.md` §6). The reader thread delivers them
+    /// in order; anything the UI cannot use falls back to a poll rather
+    /// than trusting a payload it does not understand.
+    fn apply_event(&mut self, event: Event) {
+        match event.event.as_str() {
+            // Mode/pause/applied-video changed: refresh the strip. The
+            // scheduled poll would do it within 1 s anyway — this makes
+            // it immediate (design-m5-p4 §5).
+            "state" => self.request_poll_now(),
+            "library.changed" => match serde_json::from_value::<LibraryItemsData>(event.data) {
+                Ok(data) => {
+                    self.library = data.items;
+                    drop_missing_selection(&self.library, &mut self.selected);
+                }
+                // Payload disagreement → the same remedy as a version
+                // mismatch: refetch, do not guess (ipc.md §7).
+                Err(_) => self.request_poll_now(),
+            },
+            "log" => {
+                if let Some(message) = event
+                    .data
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                {
+                    // Surface once: do not repeat the notice that is
+                    // already on screen.
+                    if self.notice.as_deref() != Some(message.as_str()) {
+                        self.notice = Some(message);
+                    }
+                }
+            }
+            // The daemon is going away (or restarting after a set):
+            // ask now — the answer decides NotRunning vs the new PID.
+            "shutdown" => self.request_poll_now(),
+            // Forward compatible: an event from a newer daemon the UI
+            // does not know is ignored, never fatal (ipc.md §2).
+            _ => {}
         }
     }
 
@@ -648,18 +756,22 @@ fn mode_color(mode: &str) -> egui::Color32 {
 fn worker(rx: Receiver<Cmd>, tx: Sender<Reply>) {
     while let Ok(cmd) = rx.recv() {
         let reply = match cmd {
-            Cmd::Poll => {
+            Cmd::Poll { library } => {
                 let status = ask_data::<Status>("status", no_data());
                 // Not running: skip the two follow-up calls — each would
                 // pay the full connect budget for the same answer.
                 let down = matches!(status, Err(ClientError::NotRunning));
                 let (library, settings) = if down {
-                    (Err(ClientError::NotRunning), Err(ClientError::NotRunning))
-                } else {
+                    (None, Err(ClientError::NotRunning))
+                } else if library {
                     (
-                        ask_data::<LibraryItemsData>("library.list", no_data()),
+                        Some(ask_data::<LibraryItemsData>("library.list", no_data())),
                         ask_data::<Settings>("settings.get", no_data()),
                     )
+                } else {
+                    // The event stream is live and owns the list
+                    // (design-m5-p4 §5): status + settings only.
+                    (None, ask_data::<Settings>("settings.get", no_data()))
                 };
                 Reply::Snapshot {
                     status,
@@ -683,6 +795,47 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Reply>) {
         if tx.send(reply).is_err() {
             break; // the window is gone
         }
+    }
+}
+
+/// The event subscription thread (design-m5-p4 §5): holds one persistent
+/// connection to `cascade-evt-{session}`, forwards every frame as
+/// [`Reply::Event`], and reports connectivity as [`Reply::EventsLive`].
+/// It never issues a request — the worker keeps its serial command order
+/// (D11c). Reconnects follow `ipc.md` §7: 500 ms doubling to 5 s, never
+/// a spin; a fresh connection means a stateless resync on the UI side.
+///
+/// `ctx` is woken after every delivery: egui draws only when something
+/// asks for a frame, and the idle schedule is one frame per second —
+/// without the wake an event waits up to `POLL_INTERVAL` before it is
+/// even read (measured 2026-11-21: a library row appeared 0–1000 ms
+/// late, design-m5-p4 §8 V1).
+fn event_reader(tx: Sender<Reply>, ctx: egui::Context) {
+    let mut backoff = EVENT_BACKOFF_MIN;
+    loop {
+        if let Ok(mut stream) = client::EventStream::open() {
+            backoff = EVENT_BACKOFF_MIN;
+            if tx.send(Reply::EventsLive(true)).is_err() {
+                return; // the window is gone
+            }
+            ctx.request_repaint();
+            // Ends on the first error: daemon exited, pipe broken,
+            // or a payload we refuse — reconnect below.
+            while let Ok(event) = stream.read_event() {
+                if tx.send(Reply::Event(event)).is_err() {
+                    return; // the window is gone
+                }
+                ctx.request_repaint();
+            }
+        }
+        // No daemon (yet) or the one subscriber slot is taken: back off
+        // and try again — never a spin (`ipc.md` §7).
+        if tx.send(Reply::EventsLive(false)).is_err() {
+            return; // the window is gone
+        }
+        ctx.request_repaint();
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(EVENT_BACKOFF_MAX);
     }
 }
 
@@ -830,5 +983,183 @@ mod tests {
             theme::ACCENT_HOVER,
             egui::Color32::from_rgb(0x4F, 0x51, 0xD6)
         );
+    }
+
+    // --- design-m5-p4 §5: event consumption ------------------------------
+
+    use cascade_core::ipc::{AutostartStatus, HostStatus, MemoryStatus};
+    use cascade_core::PROTOCOL_VERSION;
+
+    fn status_fixture() -> Status {
+        Status {
+            engine: "running".to_string(),
+            mode: "attached".to_string(),
+            paused_reasons: Vec::new(),
+            monitors: Vec::new(),
+            memory: MemoryStatus {
+                working_set_mb: 100,
+                private_mb: 50,
+            },
+            host: HostStatus {
+                strategy: "workerw_child".to_string(),
+                repaint_level: 1,
+            },
+            autostart: AutostartStatus {
+                enabled: true,
+                windows_disabled: false,
+            },
+        }
+    }
+
+    fn snapshot(library: Option<Result<LibraryItemsData, ClientError>>) -> Reply {
+        Reply::Snapshot {
+            status: Ok(status_fixture()),
+            library,
+            settings: Ok(Settings::default()),
+        }
+    }
+
+    fn event(name: &str, data: serde_json::Value) -> Event {
+        Event {
+            v: PROTOCOL_VERSION,
+            event: name.to_string(),
+            data,
+        }
+    }
+
+    fn items_data(items: Vec<LibraryItem>) -> Result<LibraryItemsData, ClientError> {
+        let items = serde_json::to_value(items).expect("test items encode");
+        let data = serde_json::from_value(serde_json::json!({ "items": items }))
+            .expect("test items decode into the wire shape");
+        Ok(data)
+    }
+
+    #[test]
+    fn library_changed_event_replaces_the_list_and_drops_dead_selection() {
+        let mut app = CascadeApp::detached();
+        app.library = vec![item("aa11"), item("bb22")];
+        app.selected = Some("bb22".to_string());
+
+        // The new list keeps aa11 only: bb22's selection must go with it.
+        let data = serde_json::to_value(vec![item("aa11")]).expect("items encode");
+        app.apply(Reply::Event(event(
+            "library.changed",
+            serde_json::json!({ "items": data }),
+        )));
+        assert_eq!(app.library.len(), 1, "the list is replaced wholesale");
+        assert_eq!(app.library[0].id, "aa11");
+        assert_eq!(app.selected, None, "a vanished id never stays selected");
+
+        // A list that still contains the selected id keeps it.
+        app.selected = Some("aa11".to_string());
+        let data = serde_json::to_value(vec![item("aa11")]).expect("items encode");
+        app.apply(Reply::Event(event(
+            "library.changed",
+            serde_json::json!({ "items": data }),
+        )));
+        assert_eq!(app.selected.as_deref(), Some("aa11"));
+    }
+
+    #[test]
+    fn state_and_shutdown_poll_now_and_unknown_events_are_ignored() {
+        let mut app = CascadeApp::detached();
+        app.apply(snapshot(None));
+        let scheduled = app.poll_at;
+        assert!(scheduled > Instant::now(), "a settled poll sits 1 s out");
+
+        app.apply(Reply::Event(event(
+            "state",
+            serde_json::json!({"mode": "paused", "paused_reasons": ["manual"]}),
+        )));
+        assert!(
+            app.poll_at <= Instant::now(),
+            "a state event refreshes the strip immediately"
+        );
+
+        app.apply(snapshot(None));
+        let scheduled = app.poll_at;
+        app.apply(Reply::Event(event("future.thing", serde_json::json!({}))));
+        assert_eq!(
+            app.poll_at, scheduled,
+            "an unknown event from a newer daemon is ignored, never fatal"
+        );
+
+        app.apply(Reply::Event(event("shutdown", serde_json::json!({}))));
+        assert!(
+            app.poll_at <= Instant::now(),
+            "shutdown asks the poll to decide NotRunning vs the new pid"
+        );
+    }
+
+    #[test]
+    fn events_live_resyncs_once_and_reports_disconnects() {
+        let mut app = CascadeApp::detached();
+        app.apply(snapshot(None));
+        assert!(!app.events_live, "starts without a subscription");
+
+        app.apply(Reply::EventsLive(true));
+        assert!(app.events_live);
+        assert!(
+            app.poll_at <= Instant::now(),
+            "events are not replayed: one stateless resync (ipc.md §7)"
+        );
+
+        // A duplicate `true` must not queue extra work.
+        app.apply(snapshot(None));
+        let scheduled = app.poll_at;
+        app.apply(Reply::EventsLive(true));
+        assert_eq!(app.poll_at, scheduled, "resync happens once per connect");
+
+        app.apply(Reply::EventsLive(false));
+        assert!(!app.events_live, "the next poll carries library again");
+    }
+
+    #[test]
+    fn log_events_surface_once_and_never_stack() {
+        let mut app = CascadeApp::detached();
+        app.apply(Reply::Event(event(
+            "log",
+            serde_json::json!({"level": "warn", "message": "could not load clip.mp4"}),
+        )));
+        assert_eq!(app.notice.as_deref(), Some("could not load clip.mp4"));
+
+        // The same warning again must not disturb the visible notice.
+        app.apply(Reply::Event(event(
+            "log",
+            serde_json::json!({"level": "warn", "message": "could not load clip.mp4"}),
+        )));
+        assert_eq!(app.notice.as_deref(), Some("could not load clip.mp4"));
+
+        app.apply(Reply::Event(event(
+            "log",
+            serde_json::json!({"level": "warn", "message": "no media backend is available"}),
+        )));
+        assert_eq!(app.notice.as_deref(), Some("no media backend is available"));
+    }
+
+    #[test]
+    fn a_gated_poll_keeps_the_event_owned_list_until_the_engine_is_down() {
+        let mut app = CascadeApp::detached();
+        app.apply(snapshot(Some(items_data(vec![item("aa11")]))));
+        assert_eq!(app.library.len(), 1);
+
+        // Live subscription: the poll skips library.list on purpose.
+        app.events_live = true;
+        app.apply(snapshot(None));
+        assert_eq!(
+            app.library.len(),
+            1,
+            "a gated poll never touches the event-owned list"
+        );
+
+        // NotRunning clears everything regardless of the gate: no stale
+        // list may linger behind a dead daemon.
+        app.apply(Reply::Snapshot {
+            status: Err(ClientError::NotRunning),
+            library: None,
+            settings: Err(ClientError::NotRunning),
+        });
+        assert!(app.library.is_empty());
+        assert_eq!(app.selected, None);
     }
 }

@@ -38,12 +38,15 @@ pub fn run() -> Result<(), String> {
         ..Default::default()
     };
 
-    let app = CascadeApp::new()?;
     eframe::run_native(
         "cascade",
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
+            // The reader thread needs the same context to request a
+            // frame when an event arrives (design-m5-p4 §5).
+            let app = CascadeApp::new(cc.egui_ctx.clone())
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
             Ok(Box::new(app))
         }),
     )
