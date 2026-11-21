@@ -39,6 +39,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::config;
 use crate::control::{self, ControlWindow};
+use crate::events;
 use crate::host::{self, Host, HostOptions};
 use crate::ipc::{
     Command, PipeChannels, PipeRole, PipeServer, PlaybackStatus, ServerMsg, StatusSnapshot,
@@ -216,6 +217,11 @@ pub(crate) struct ExitSignal;
 
 impl Drop for ExitSignal {
     fn drop(&mut self) {
+        // design-m5-p4 §4.3: tell every subscriber the daemon is going
+        // away while the pipe is still open; bounded flush, then the
+        // normal exit handshake. No-op when nothing listens (listener,
+        // tests) — the desktop teardown never waits on a client.
+        events::shutdown();
         EXIT_DONE.store(1, Ordering::Release);
         // SAFETY: address of a static that lives for the whole process.
         unsafe { WakeByAddressSingle(&EXIT_DONE as *const AtomicU32 as *const c_void) };
@@ -421,12 +427,50 @@ fn refresh_status(
     if published.as_ref().is_some_and(|prev| **prev == *next) {
         return;
     }
+    // design-m5-p4 §4.5: `state` fires only on a semantic change —
+    // mode, pause reasons, playback identity. fps/dropped/memory tick
+    // continuously and stay on the 1 s `status` poll (`design-m5.md` §8).
+    if published
+        .as_ref()
+        .is_some_and(|prev| !same_state(prev, &next))
+    {
+        events::emit_state(&next.mode, &next.paused_reasons);
+    }
     if tx.send(ServerMsg::Snapshot(Arc::clone(&next))).is_err() {
         // The pipe thread is gone; keep the desktop running and stop trying.
         derr!("ipc: message channel closed; status will stop updating");
         return;
     }
     *published = Some(next);
+}
+
+/// The playback identity a `state` event cares about: *which* video on
+/// *which* monitor with *which* decode route. fps/dropped are excluded
+/// on purpose — they change every watchdog tick (design-m5-p4 §4.5).
+fn playback_identity(
+    playback: &PlaybackStatus,
+) -> (
+    &str,
+    Option<&LibraryRef>,
+    Option<bool>,
+    Option<&VideoSize>,
+    Option<&str>,
+) {
+    (
+        &playback.monitor,
+        playback.source.as_ref(),
+        playback.hwdec,
+        playback.video.as_ref(),
+        playback.engine.as_deref(),
+    )
+}
+
+/// Do two snapshots describe the same event-worthy state? Used to keep
+/// `state` events for mode/pause/applied-video transitions only.
+fn same_state(a: &StatusSnapshot, b: &StatusSnapshot) -> bool {
+    a.mode == b.mode
+        && a.paused_reasons == b.paused_reasons
+        && a.playback.as_ref().map(playback_identity) == b.playback.as_ref().map(playback_identity)
 }
 
 /// One watchdog tick. Returns `true` when the desktop is healthy afterwards.
@@ -1250,6 +1294,10 @@ fn persist_library(ctx: &Loop) {
     if let Err(err) = ctx.lib_store.save(ctx.library) {
         derr!("library: {err}");
     }
+    // design-m5-p4 §4.5: the single choke point every mutation site
+    // calls (add/remove/prune). The payload is the full list, so a
+    // coalesced burst still delivers the newest state.
+    events::emit_library_changed(&ctx.library.items);
 }
 
 /// `wallpaper.set` (design-m4 S2). Order matters: validate the monitor,
@@ -1458,6 +1506,10 @@ fn set_wallpaper(
         match (ctx.factory)(Path::new(&path)) {
             Some(built) => ctx.backend.backend = Some(built),
             None => {
+                events::emit_log(
+                    "warn",
+                    "no media backend is available; the desktop keeps the colour background",
+                );
                 pending.responses.push(Response::err(
                     id,
                     cascade_core::ipc::ErrorCode::Internal,
@@ -1492,6 +1544,13 @@ fn set_wallpaper(
         if let Err(err) = ctx.store.save(ctx.state) {
             derr!("state: {err}");
         }
+        // design-m5-p4 §4.5: the caller's error response reaches only
+        // the client that issued the set — the `log` event surfaces the
+        // failure once to every subscriber (the UI shows a notice).
+        events::emit_log(
+            "warn",
+            &format!("could not load {path}: {message}; the desktop keeps the colour background"),
+        );
         pending.responses.push(Response::err(
             id,
             cascade_core::ipc::ErrorCode::Internal,
@@ -1690,6 +1749,11 @@ pub fn run(
     };
 
     let pipe = create_session_pipe()?;
+
+    // design-m5-p4 §4.4: the event stream starts only after the control
+    // pipe (the single-instance guard) is ours. Every failure degrades
+    // to poll-only clients with a log line — never to a broken desktop.
+    events::init();
 
     install_panic_hook();
 
@@ -2485,5 +2549,80 @@ mod tests {
         assert_eq!(options.color, host::HostOptions::default().color);
         // Slice 2: no `--video`, no persisted path -> no backend source.
         assert!(options.video.is_none());
+    }
+
+    // --- design-m5-p4 §4.5: `state` event semantics ---------------------
+
+    fn event_snapshot(
+        mode: &str,
+        paused_reasons: Vec<String>,
+        playback: Option<PlaybackStatus>,
+    ) -> StatusSnapshot {
+        StatusSnapshot {
+            mode: mode.to_string(),
+            paused_reasons,
+            monitors: Vec::new(),
+            playback,
+            host_strategy: String::new(),
+            repaint_level: 0,
+            settings: Settings::default(),
+        }
+    }
+
+    fn event_playback(fps: Option<f32>) -> PlaybackStatus {
+        PlaybackStatus {
+            monitor: "mon-1".to_string(),
+            source: None,
+            hwdec: None,
+            fps,
+            dropped: None,
+            video: None,
+            engine: None,
+        }
+    }
+
+    #[test]
+    fn state_events_fire_on_semantics_and_never_on_counters() {
+        let base = event_snapshot("attached", Vec::new(), Some(event_playback(Some(60.0))));
+
+        // fps/dropped tick on every watchdog tick — poll-only (design-m5 §8).
+        let mut counters = base.clone();
+        if let Some(playback) = counters.playback.as_mut() {
+            playback.fps = Some(144.0);
+            playback.dropped = Some(9);
+        }
+        assert!(
+            same_state(&base, &counters),
+            "counter ticks must not emit a state event"
+        );
+
+        // The documented triggers: mode, pause reason, video applied.
+        let paused = event_snapshot("paused", vec!["manual".to_string()], base.playback.clone());
+        assert!(!same_state(&base, &paused), "pause is a state event");
+
+        let degraded = event_snapshot("degraded", Vec::new(), base.playback.clone());
+        assert!(
+            !same_state(&base, &degraded),
+            "mode change is a state event"
+        );
+
+        let cleared = event_snapshot("attached", Vec::new(), None);
+        assert!(
+            !same_state(&base, &cleared),
+            "video cleared is a state event"
+        );
+
+        let mut other_source = base.clone();
+        if let Some(playback) = other_source.playback.as_mut() {
+            playback.source = Some(LibraryRef {
+                id: "a1b2".to_string(),
+                title: "clip".to_string(),
+            });
+            playback.hwdec = Some(true);
+        }
+        assert!(
+            !same_state(&base, &other_source),
+            "a different applied video is a state event"
+        );
     }
 }
