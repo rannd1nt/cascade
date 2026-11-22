@@ -41,7 +41,9 @@ fn main() -> ExitCode {
     let result = if args.is_empty() {
         bare_main()
     } else {
-        console::prepare_stdio(is_daemon_role(&args) || is_gui_role(&args));
+        console::prepare_stdio(
+            is_daemon_role(&args) || is_gui_role(&args) || is_silent_cli_role(&args),
+        );
         dispatch(&args)
     };
     match result {
@@ -134,6 +136,15 @@ fn is_daemon_role(args: &[String]) -> bool {
 /// prints errors there (same `prepare_stdio` strategy as the daemon).
 fn is_gui_role(args: &[String]) -> bool {
     matches!(args.first().map(String::as_str), Some("ui") | Some("--ui"))
+}
+
+/// `uninstall --quiet` is launched by Windows Settings with no console
+/// (design-m5-p4 §14 I4). The GUI-subsystem exe would otherwise
+/// `AllocConsole` and flash a terminal during a GUI uninstall, so this
+/// role uses the silent stdio strategy like the daemon. The flag is only
+/// recognized on `uninstall`; every other command keeps its normal output.
+fn is_silent_cli_role(args: &[String]) -> bool {
+    args.first().is_some_and(|cmd| cmd == "uninstall") && args.iter().any(|arg| arg == "--quiet")
 }
 
 fn dispatch(args: &[String]) -> Result<ExitCode, String> {
@@ -659,23 +670,29 @@ fn cmd_install(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `cascade uninstall [--purge]` — reverse the install (design-m4 §6.1).
-/// Without `--purge`, `library.json` and `state.json` are kept.
+/// `cascade uninstall [--purge] [--quiet]` — reverse the install
+/// (design-m4 §6.1, design-m5-p4 §14 I4). Without `--purge`,
+/// `library.json` and `state.json` are kept. `--quiet` only changes stdio
+/// (used by the Settings Uninstall button); the uninstall steps are
+/// identical.
 fn cmd_uninstall(args: &[String]) -> Result<ExitCode, String> {
     let purge = uninstall_options(args)?;
     install::uninstall(purge)?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// Parse `uninstall` options. Pure so the flag handling is unit-testable.
+/// Parse `uninstall` options. `--quiet` is consumed here only so it is a
+/// valid flag; its effect is the stdio choice in `is_silent_cli_role`.
+/// Pure so the flag handling is unit-testable.
 fn uninstall_options(args: &[String]) -> Result<bool, String> {
     let mut purge = false;
     for arg in args {
         match arg.as_str() {
             "--purge" => purge = true,
+            "--quiet" => {}
             other => {
                 return Err(format!(
-                    "uninstall: unknown option {other} (expected --purge)"
+                    "uninstall: unknown option {other} (expected --purge or --quiet)"
                 ))
             }
         }
@@ -1955,7 +1972,9 @@ fn print_help() {
     println!(
         "  cascade install                    copy this exe to %LOCALAPPDATA%\\Cascade + PATH"
     );
-    println!("  cascade uninstall [--purge]        remove the install (--purge also drops state)");
+    println!("  cascade uninstall [--purge] [--quiet]");
+    println!("                                      remove the install (--purge also drops state;");
+    println!("                                      --quiet hides output, used by Settings)");
     println!("  cascade ui                          open the library window");
     println!("                                      (alias: --ui; needs a running engine");
     println!("                                      or offers to start it)");
@@ -2077,11 +2096,27 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_options_only_accept_purge() {
+    fn uninstall_options_accept_purge_and_quiet() {
         assert_eq!(uninstall_options(&[]), Ok(false));
         assert_eq!(uninstall_options(&args(&["--purge"])), Ok(true));
+        // `--quiet` is the Settings launcher flag; it changes stdio only.
+        assert_eq!(uninstall_options(&args(&["--quiet"])), Ok(false));
+        assert_eq!(uninstall_options(&args(&["--purge", "--quiet"])), Ok(true));
         assert!(uninstall_options(&args(&["--nope"])).is_err());
         assert!(uninstall_options(&args(&["--purge", "--nope"])).is_err());
+    }
+
+    #[test]
+    fn silent_cli_role_is_only_uninstall_with_quiet() {
+        assert!(is_silent_cli_role(&args(&["uninstall", "--quiet"])));
+        assert!(is_silent_cli_role(&args(&[
+            "uninstall",
+            "--purge",
+            "--quiet"
+        ])));
+        assert!(!is_silent_cli_role(&args(&["uninstall"])));
+        assert!(!is_silent_cli_role(&args(&["install", "--quiet"])));
+        assert!(!is_silent_cli_role(&args(&["--quiet"])));
     }
 
     #[test]
