@@ -8,6 +8,9 @@
 
 mod app;
 mod dialog;
+/// Window/taskbar icon decoded from the tracked PNG, UI process only
+/// (design-m5-p4 §13).
+mod icon;
 mod theme;
 /// Thumbnail worker: disk cache, decode thread, texture LRU
 /// (design-m5-p4 §11). UI-process only — the daemon never links it.
@@ -31,11 +34,15 @@ pub fn run() -> Result<(), String> {
     // the taskbar on a 1366×768 machine: measured 2026-11-12, default
     // 640 opened at y=78 and its bottom (757) sat behind the taskbar
     // (top 728).
+    // winit leaves the window class icon null; without this the window
+    // and its taskbar button show Windows' generic icon (§13.1).
+    let icon = icon::window_icon()?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 590.0])
             .with_min_inner_size([640.0, 400.0])
-            .with_title("Cascade"),
+            .with_title("Cascade")
+            .with_icon(icon),
         // D5: glow, not wgpu — a lighter renderer on integrated GPUs.
         renderer: eframe::Renderer::Glow,
         ..Default::default()

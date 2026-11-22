@@ -198,6 +198,7 @@ dependencies = [
  "cascade-core",
  "cascade-media",
  "eframe",
+ "image",
  "serde",
  "serde_json",
  "windows",

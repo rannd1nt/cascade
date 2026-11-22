@@ -15,6 +15,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # design-m5 D11a: the GUI framework (glow renderer + bundled fonts).
 eframe = { workspace = true }
+# design-m5-p4 §13 I1: decode the embedded cascade-256.png into egui's
+# IconData for the window/taskbar icon. UI-process only; no new crate.
+image = { workspace = true }
 # design-m5 D11b: IFileOpenDialog straight from the workspace's windows
 # crate — no rfd, no custom file browser (architecture §9, AGENTS §2).
 windows = { workspace = true, features = [
