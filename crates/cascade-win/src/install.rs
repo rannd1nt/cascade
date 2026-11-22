@@ -9,20 +9,34 @@
 //! 3. appends the directory to the **user** `Path` (kind preserved) and
 //!    broadcasts `WM_SETTINGCHANGE`,
 //! 4. points the `Run` key at the installed copy,
+//!    creates per-user Start Menu and Desktop `Cascade.lnk` shortcuts
+//!    (design-m5-p4 §13 — the declared exception to §3.12),
 //! 5. starts the engine from the installed copy if none is running.
 //!
 //! `uninstall` reverses the steps and deletes only files this module
 //! created. Anything else in the data directory (`measurements/`, logs,
-//! user JSON without `--purge`) is left in place — Cascade never deletes
-//! what it cannot recognize as its own (AGENTS §3.3, §3.12).
+//! user JSON without `--purge`) and any other shell link is left in place
+//! — Cascade never deletes what it cannot recognize as its own
+//! (AGENTS §3.3, §3.12).
 
+use std::ffi::c_void;
 use std::fs;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use windows::core::{Interface, PCWSTR};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER,
+};
+use windows::Win32::UI::Shell::{
+    FOLDERID_Desktop, FOLDERID_Programs, IShellLinkW, SHChangeNotify, SHGetKnownFolderPath,
+    ShellLink, KF_FLAG_DEFAULT, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
+};
 use windows_sys::Win32::Foundation::LPARAM;
+use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -51,6 +65,13 @@ const STALE_NAME: &str = "cascade.stale.exe";
 /// The PATH entry in its literal form; we detect both this and the
 /// expanded `%LOCALAPPDATA%`-resolved directory, case-insensitively.
 const PATH_LITERAL: &str = "%LOCALAPPDATA%\\Cascade\\bin";
+/// Per-user shell link created by install (design-m5-p4 §13 I3/I4). Only
+/// this exact name in the two shell folders may be touched by uninstall.
+pub const SHORTCUT_NAME: &str = "Cascade.lnk";
+/// The shortcut is a thin launcher over the existing GUI CLI role
+/// (AGENTS §1: CLI first, tray and GUI are layers over the same paths).
+const SHORTCUT_ARGS: &str = "ui";
+const SHORTCUT_DESCRIPTION: &str = "Cascade library";
 
 /// The `%LOCALAPPDATA%\Cascade` directory, or `None` when the environment
 /// is unusable (AGENTS: no `unwrap()` in library code).
@@ -94,6 +115,38 @@ pub fn is_installed_here() -> bool {
 /// (cmd's own environment, always present on Windows 11).
 pub fn shim_content() -> String {
     "@echo off\r\n\"%LOCALAPPDATA%\\Cascade\\cascade.exe\" %*\r\n".to_string()
+}
+
+/// Command-line arguments the shell links pass: the GUI role only.
+pub fn shortcut_arguments() -> &'static str {
+    SHORTCUT_ARGS
+}
+
+/// Description shown in Start search and in the link's properties.
+pub fn shortcut_description() -> &'static str {
+    SHORTCUT_DESCRIPTION
+}
+
+/// The only file name this module creates in a shell folder.
+pub fn shortcut_path(folder: &Path) -> PathBuf {
+    folder.join(SHORTCUT_NAME)
+}
+
+/// `true` only for the exact name we own — an unrelated `Cascade Notes.lnk`
+/// must never be removed by uninstall (design-m5-p4 §13 I5).
+pub fn is_our_shortcut(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(SHORTCUT_NAME))
+}
+
+/// Windows paths are UTF-16; `to_string_lossy` would corrupt a path with
+/// unpaired surrogates, so encode the `OsStr` directly.
+fn path_wide(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// Split a PATH value into trimmed, non-empty entries.
@@ -183,6 +236,151 @@ fn broadcast_environment() {
     if sent == 0 {
         println!("note: environment broadcast timed out (non-fatal).");
     }
+}
+
+// ---------------------------------------------------------------------
+// Per-user shell links (design-m5-p4 §13).
+// ---------------------------------------------------------------------
+
+/// A COM apartment for the short-lived shell operations in install and
+/// uninstall. `IShellLinkW` is an STA object; no COM call happens on this
+/// CLI thread before `init`, so a successful S_OK is always ours to release.
+struct ComApartment {
+    owned: bool,
+}
+
+impl ComApartment {
+    fn init() -> Result<Self, String> {
+        // SAFETY: the reserved argument must be null;
+        // COINIT_APARTMENTTHREADED is the documented STA mode ShellLink
+        // expects, and this one-shot CLI thread has no prior apartment.
+        let hr =
+            unsafe { CoInitializeEx(std::ptr::null::<c_void>(), COINIT_APARTMENTTHREADED as u32) };
+        if hr < 0 {
+            return Err(format!("CoInitializeEx failed (0x{hr:08X})"));
+        }
+        // S_FALSE means an apartment already existed: it is not ours and
+        // must not be uninitialized below.
+        Ok(Self { owned: hr == 0 })
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.owned {
+            // SAFETY: balances the S_OK CoInitializeEx above on the same
+            // thread, after every shell object has gone out of scope.
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+/// Resolve a per-user shell folder. The returned string is shell-owned.
+fn known_folder(id: &windows::core::GUID) -> Result<PathBuf, String> {
+    // SAFETY: `id` is a static FOLDERID_* GUID; on success the shell
+    // returns a CoTaskMem-owned, NUL-terminated PWSTR, freed below while
+    // this COM apartment is still alive.
+    let path = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }
+        .map_err(|err| format!("known folder lookup: {}", err.message()))?;
+    // SAFETY: the shell returned a NUL-terminated PWSTR, valid until the
+    // CoTaskMemFree call below.
+    let result = PathBuf::from(unsafe { wide::from_wide_ptr(path.as_ptr()) });
+    // SAFETY: `path` came from SHGetKnownFolderPath's CoTaskMem
+    // allocation and is passed to CoTaskMemFree exactly once.
+    unsafe { CoTaskMemFree(Some(path.as_ptr().cast::<c_void>())) };
+    Ok(result)
+}
+
+/// Tell the shell that link files changed, so Start search refreshes
+/// without requiring a logoff. Non-fatal: the files are already correct.
+fn notify_shell() {
+    // SAFETY: SHCNF_IDLIST means neither item pointer is read, so passing
+    // None for both is the documented "associations changed" broadcast.
+    unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
+}
+
+/// Create or overwrite one `.lnk` in `folder`, pointing at the installed
+/// exe with the GUI role. `Save(..., true)` makes re-install idempotent.
+fn make_shortcut(exe: &Path, folder: &Path) -> Result<PathBuf, String> {
+    let target = path_wide(exe);
+    let working = path_wide(exe.parent().unwrap_or_else(|| Path::new("")));
+    let args = wide::to_wide(SHORTCUT_ARGS);
+    let description = wide::to_wide(SHORTCUT_DESCRIPTION);
+    let lnk = shortcut_path(folder);
+    let saved = path_wide(&lnk);
+
+    // SAFETY: both arguments are documented shell constants; the object
+    // is created inside ComApartment and released with the local values
+    // before that apartment is dropped.
+    let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
+        .map_err(|err| format!("create shell link: {}", err.message()))?;
+    // SAFETY: every PCWSTR points at a NUL-terminated buffer that outlives
+    // the call; IShellLinkW copies the strings into the link. Index 0 is
+    // the exe's embedded Cascade resource (build.rs, AGENTS §3.14).
+    unsafe {
+        link.SetPath(PCWSTR::from_raw(target.as_ptr()))
+            .map_err(|err| format!("shortcut SetPath: {}", err.message()))?;
+        link.SetArguments(PCWSTR::from_raw(args.as_ptr()))
+            .map_err(|err| format!("shortcut SetArguments: {}", err.message()))?;
+        link.SetWorkingDirectory(PCWSTR::from_raw(working.as_ptr()))
+            .map_err(|err| format!("shortcut SetWorkingDirectory: {}", err.message()))?;
+        link.SetDescription(PCWSTR::from_raw(description.as_ptr()))
+            .map_err(|err| format!("shortcut SetDescription: {}", err.message()))?;
+        link.SetIconLocation(PCWSTR::from_raw(target.as_ptr()), 0)
+            .map_err(|err| format!("shortcut SetIconLocation: {}", err.message()))?;
+    }
+    // QueryInterface on the same object; both wrappers release on drop.
+    let persist: IPersistFile = link
+        .cast()
+        .map_err(|err| format!("shortcut IPersistFile: {}", err.message()))?;
+    // SAFETY: `saved` is NUL-terminated and alive for the call; Save's
+    // `true` commits the file we just created/overwrote.
+    unsafe { persist.Save(PCWSTR::from_raw(saved.as_ptr()), true) }
+        .map_err(|err| format!("save {}: {}", lnk.display(), err.message()))?;
+    Ok(lnk)
+}
+
+/// Install both links. Failure is surfaced to `cascade install`: a
+/// half-installed shell integration must not be reported as success.
+fn install_shortcuts(exe: &Path) -> Result<(), String> {
+    let _apartment = ComApartment::init()?;
+    let targets: [(&windows::core::GUID, &str); 2] = [
+        (&FOLDERID_Programs, "Start Menu"),
+        (&FOLDERID_Desktop, "Desktop"),
+    ];
+    for (id, label) in targets {
+        let folder = known_folder(id)?;
+        let lnk = make_shortcut(exe, &folder)?;
+        println!("{label} shortcut: {}", lnk.display());
+    }
+    notify_shell();
+    Ok(())
+}
+
+/// Remove only the two links this module owns. A missing link is a no-op;
+/// unrelated files in either folder are never enumerated or deleted.
+fn remove_shortcuts() -> Result<(), String> {
+    let _apartment = ComApartment::init()?;
+    let targets: [(&windows::core::GUID, &str); 2] = [
+        (&FOLDERID_Programs, "Start Menu"),
+        (&FOLDERID_Desktop, "Desktop"),
+    ];
+    for (id, label) in targets {
+        let folder = known_folder(id)?;
+        let lnk = shortcut_path(&folder);
+        if !is_our_shortcut(&lnk) {
+            return Err("refusing to remove a shortcut that is not ours".to_string());
+        }
+        match fs::remove_file(&lnk) {
+            Ok(()) => println!("Removed {label} shortcut: {}", lnk.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                println!("{label} shortcut: not present");
+            }
+            Err(err) => return Err(format!("remove {}: {err}", lnk.display())),
+        }
+    }
+    notify_shell();
+    Ok(())
 }
 
 fn read_path() -> (u32, String) {
@@ -351,6 +549,10 @@ pub fn install_from(source: &Path) -> Result<(), String> {
         .map_err(|rc| format!("autostart: registry write failed ({rc})"))?;
     println!("Autostart: on.");
 
+    // Step 4b (design-m5-p4 §13 I4): discoverable from Start search and
+    // the Desktop, both per-user and both pointing at `cascade.exe ui`.
+    install_shortcuts(&dest_exe)?;
+
     // Step 5: engine from the installed copy (it was stopped above when
     // the source differed; a same-file install keeps a running engine).
     if control::find_existing().is_some() {
@@ -383,6 +585,9 @@ pub fn uninstall(purge: bool) -> Result<(), String> {
     registry::autostart_disable()
         .map_err(|rc| format!("autostart: registry delete failed ({rc})"))?;
     println!("Autostart: off.");
+
+    // 2b (design-m5-p4 §13 I5): remove exactly our two shell links.
+    remove_shortcuts()?;
 
     // 3. PATH entry gone (either form), then broadcast.
     let (kind, raw) = read_path();
@@ -608,5 +813,36 @@ mod tests {
         assert_eq!(path_without_dir(r"C:\X", dir, literal), r"C:\X");
         // Nothing to remove must round-trip to a still-valid PATH.
         assert_eq!(path_without_dir("", dir, literal), "");
+    }
+
+    #[test]
+    fn shortcut_name_arguments_and_description_are_stable() {
+        // The link is a launcher over the same `cascade ui` CLI role;
+        // changing any of these changes what users see in Start search.
+        assert_eq!(SHORTCUT_NAME, "Cascade.lnk");
+        assert_eq!(shortcut_arguments(), "ui");
+        assert_eq!(shortcut_description(), "Cascade library");
+        let start = Path::new(r"C:\Users\X\AppData\Roaming\Microsoft\Windows\Start Menu\Programs");
+        assert_eq!(shortcut_path(start), start.join("Cascade.lnk"));
+    }
+
+    #[test]
+    fn shortcut_cleanup_matches_only_our_exact_name() {
+        assert!(is_our_shortcut(Path::new(r"C:\Desktop\Cascade.lnk")));
+        assert!(is_our_shortcut(Path::new(r"C:\Desktop\CASCADE.LNK")));
+        // Similar names, backups and other extensions are not ours.
+        assert!(!is_our_shortcut(Path::new(r"C:\Desktop\Cascade Notes.lnk")));
+        assert!(!is_our_shortcut(Path::new(r"C:\Desktop\Cascade.lnk.bak")));
+        assert!(!is_our_shortcut(Path::new(r"C:\Desktop\Cascade.exe")));
+        assert!(!is_our_shortcut(Path::new(r"C:\Desktop\Other.lnk")));
+        assert!(!is_our_shortcut(Path::new("Cascade")));
+    }
+
+    #[test]
+    fn path_wide_preserves_non_ascii_components() {
+        // Win32 paths are UTF-16: encode the OsStr, never a lossy String.
+        let wide = path_wide(Path::new(r"C:\Users\Zahraan Dzakii\Cascade"));
+        assert_eq!(wide::from_wide(&wide), r"C:\Users\Zahraan Dzakii\Cascade");
+        assert_eq!(wide.last(), Some(&0));
     }
 }

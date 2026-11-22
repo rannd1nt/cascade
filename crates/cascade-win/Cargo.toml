@@ -36,6 +36,9 @@ windows-sys = { workspace = true, features = [
     # CreateFileW / CreateNamedPipeW are cfg-gated on this feature in
     # windows-sys 0.61 (their signatures take SECURITY_ATTRIBUTES).
     "Win32_Security",
+    # design-m5-p4 §13 I4: raw CoInitializeEx HRESULT, so a successful
+    # S_FALSE is not mistaken for an apartment we own and must release.
+    "Win32_System_Com",
 ] }
 # `windows-sys` no longer ships the D3D11/DXGI (nor Media Foundation) bindings,
 # and the renderer needs COM interfaces with vtable dispatch. The two crates
@@ -54,4 +57,8 @@ windows = { version = "0.62", features = [
     # MFTEnumEx needs on the calling thread.
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    # design-m5-p4 §13 I4: IShellLinkW + IPersistFile, FOLDERID_{Programs,
+    # Desktop}, SHGetKnownFolderPath and SHChangeNotify for the per-user
+    # Start Menu / Desktop shortcuts.
+    "Win32_UI_Shell",
 ] }
