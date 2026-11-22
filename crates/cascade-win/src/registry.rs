@@ -10,11 +10,13 @@
 
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
+};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, RRF_NOEXPAND, RRF_RT_REG_BINARY,
-    RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteValueW, RegEnumKeyExW, RegGetValueW,
+    RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_DWORD,
+    REG_SZ, RRF_NOEXPAND, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 
 use crate::wide;
@@ -273,6 +275,62 @@ pub fn write_string_typed(subkey: &str, value: &str, kind: u32, data: &str) -> R
     }
 }
 
+/// Create (or open) a key under `HKEY_CURRENT_USER` for writing.
+///
+/// `RegOpenKeyExW` cannot create the Installed-apps key on a first install;
+/// `RegCreateKeyExW` is idempotent when the key already exists.
+pub fn create_key(subkey: &str) -> Result<(), u32> {
+    let sub = wide::to_wide(subkey);
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: `sub` is NUL-terminated; all optional arguments are null and
+    // `key` is a valid out pointer. No security attributes are needed for a
+    // per-user key. The handle is closed before returning.
+    let rc = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(rc);
+    }
+    // SAFETY: handle came from `RegCreateKeyExW` and is no longer used.
+    unsafe { RegCloseKey(key) };
+    Ok(())
+}
+
+/// Write a `REG_DWORD` value under `HKEY_CURRENT_USER`.
+pub fn write_u32(subkey: &str, value: &str, data: u32) -> Result<(), u32> {
+    let key = open_for_write(subkey)?;
+    let val = wide::to_wide(value);
+    // SAFETY: `data` is a properly aligned u32 and the size is its byte
+    // length, as REG_DWORD requires.
+    let rc = unsafe {
+        RegSetValueExW(
+            key,
+            val.as_ptr(),
+            0,
+            REG_DWORD,
+            (&data as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    // SAFETY: handle came from `RegOpenKeyExW` and is no longer used.
+    unsafe { RegCloseKey(key) };
+    if rc == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(rc)
+    }
+}
+
 /// Delete a value under `HKEY_CURRENT_USER`. Missing values are not an error.
 pub fn delete_value(subkey: &str, value: &str) -> Result<(), u32> {
     let key = open_for_write(subkey)?;
@@ -282,6 +340,20 @@ pub fn delete_value(subkey: &str, value: &str) -> Result<(), u32> {
     // SAFETY: handle came from `RegOpenKeyExW` and is no longer used.
     unsafe { RegCloseKey(key) };
     if rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(rc)
+    }
+}
+
+/// Delete an empty key under `HKEY_CURRENT_USER`. A missing key is a no-op.
+/// Only Cascade's own single key (no subkeys) is ever passed here.
+pub fn delete_key(subkey: &str) -> Result<(), u32> {
+    let sub = wide::to_wide(subkey);
+    // SAFETY: `sub` is NUL-terminated and the fixed HKEY is validated by
+    // the OS. `RegDeleteKeyW` fails when the key has subkeys; ours has none.
+    let rc = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, sub.as_ptr()) };
+    if rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND {
         Ok(())
     } else {
         Err(rc)

@@ -10,14 +10,15 @@
 //!    broadcasts `WM_SETTINGCHANGE`,
 //! 4. points the `Run` key at the installed copy,
 //!    creates per-user Start Menu and Desktop `Cascade.lnk` shortcuts
-//!    (design-m5-p4 §13 — the declared exception to §3.12),
+//!    (design-m5-p4 §13 — the declared exception to §3.12), and registers
+//!    one per-user Installed-apps key (design-m5-p4 §14),
 //! 5. starts the engine from the installed copy if none is running.
 //!
 //! `uninstall` reverses the steps and deletes only files this module
 //! created. Anything else in the data directory (`measurements/`, logs,
-//! user JSON without `--purge`) and any other shell link is left in place
-//! — Cascade never deletes what it cannot recognize as its own
-//! (AGENTS §3.3, §3.12).
+//! user JSON without `--purge`) and any other shell link or registry key
+//! is left in place — Cascade never deletes what it cannot recognize as
+//! its own (AGENTS §3.3, §3.12).
 
 use std::ffi::c_void;
 use std::fs;
@@ -72,6 +73,13 @@ pub const SHORTCUT_NAME: &str = "Cascade.lnk";
 /// (AGENTS §1: CLI first, tray and GUI are layers over the same paths).
 const SHORTCUT_ARGS: &str = "ui";
 const SHORTCUT_DESCRIPTION: &str = "Cascade library";
+/// The one per-user Apps-entry key this module owns (design-m5-p4 §14 I1).
+/// Only this exact subkey may be deleted by uninstall.
+pub const APPS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Cascade";
+/// Display values written to the Apps entry. No invented company name:
+/// the project is published under its own name (design-m5-p4 §14 I2).
+pub const APPS_DISPLAY_NAME: &str = "Cascade";
+pub const APPS_PUBLISHER: &str = "Cascade";
 
 /// The `%LOCALAPPDATA%\Cascade` directory, or `None` when the environment
 /// is unusable (AGENTS: no `unwrap()` in library code).
@@ -138,6 +146,26 @@ pub fn is_our_shortcut(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.eq_ignore_ascii_case(SHORTCUT_NAME))
+}
+
+/// The `UninstallString` (and `QuietUninstallString`) written to the Apps
+/// entry. `--quiet` selects the silent stdio strategy so Windows Settings,
+/// which launches us with no console, never flashes a terminal window
+/// (design-m5-p4 §14 I3/I4). Pure so the exact command is unit-tested.
+pub fn uninstall_command(exe: &Path) -> String {
+    format!("\"{}\" uninstall --quiet", exe.display())
+}
+
+/// The `DisplayIcon` value: the exe holds the Cascade icon at index 0
+/// (build.rs, AGENTS §3.14); Windows expects `<path>,0` for a PE resource.
+pub fn display_icon(exe: &Path) -> String {
+    format!("{},0", exe.display())
+}
+
+/// `EstimatedSize` is the exe size in KiB, rounded up. Saturates at DWORD
+/// range so a pathological file never wraps into a wrong, smaller value.
+pub fn estimated_size_kb(bytes: u64) -> u32 {
+    bytes.div_ceil(1024).min(u32::MAX as u64) as u32
 }
 
 /// Windows paths are UTF-16; `to_string_lossy` would corrupt a path with
@@ -383,6 +411,54 @@ fn remove_shortcuts() -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// Per-user "Installed apps" entry (design-m5-p4 §14).
+// ---------------------------------------------------------------------
+
+/// Create/refresh Cascade's one Apps entry from the installed exe.
+///
+/// Only `APPS_KEY` is touched; another application's `Uninstall` subkey is
+/// never enumerated or modified (AGENTS §3.12). Values mirror the real
+/// install: version comes from this crate's manifest, size from the exe on
+/// disk (so a reinstall corrects a stale number), and the removal command
+/// points at the same CLI path that S2b V5 already verified.
+pub fn write_apps_entry(exe: &Path, dir: &Path) -> Result<(), String> {
+    registry::create_key(APPS_KEY).map_err(|rc| format!("Apps entry: create key failed ({rc})"))?;
+
+    let write = |value: &str, data: &str| {
+        registry::write_string(APPS_KEY, value, data)
+            .map_err(|rc| format!("Apps entry: {value} write failed ({rc})"))
+    };
+    write("DisplayName", APPS_DISPLAY_NAME)?;
+    write("DisplayVersion", env!("CARGO_PKG_VERSION"))?;
+    write("Publisher", APPS_PUBLISHER)?;
+    write("InstallLocation", &dir.to_string_lossy())?;
+    write("DisplayIcon", &display_icon(exe))?;
+
+    let cmd = uninstall_command(exe);
+    write("UninstallString", &cmd)?;
+    write("QuietUninstallString", &cmd)?;
+
+    let bytes = fs::metadata(exe)
+        .map_err(|err| format!("Apps entry: stat {}: {err}", exe.display()))?
+        .len();
+    for (value, data) in [
+        ("EstimatedSize", estimated_size_kb(bytes)),
+        ("NoModify", 1),
+        ("NoRepair", 1),
+    ] {
+        registry::write_u32(APPS_KEY, value, data)
+            .map_err(|rc| format!("Apps entry: {value} write failed ({rc})"))?;
+    }
+    Ok(())
+}
+
+/// Remove exactly our Apps entry. A missing key is not an error; nothing
+/// else under the Uninstall branch is ever touched.
+pub fn remove_apps_entry() -> Result<(), String> {
+    registry::delete_key(APPS_KEY).map_err(|rc| format!("Apps entry: delete key failed ({rc})"))
+}
+
 fn read_path() -> (u32, String) {
     registry::read_string_raw(
         HKEY_CURRENT_USER,
@@ -553,6 +629,12 @@ pub fn install_from(source: &Path) -> Result<(), String> {
     // the Desktop, both per-user and both pointing at `cascade.exe ui`.
     install_shortcuts(&dest_exe)?;
 
+    // Step 4c (design-m5-p4 §14 I5): visible in Settings → Installed apps
+    // with a GUI uninstall path. Written after the exe exists so the size
+    // and command point at a real file.
+    write_apps_entry(&dest_exe, &dir)?;
+    println!("Installed apps entry: HKCU\\{APPS_KEY}");
+
     // Step 5: engine from the installed copy (it was stopped above when
     // the source differed; a same-file install keeps a running engine).
     if control::find_existing().is_some() {
@@ -588,6 +670,12 @@ pub fn uninstall(purge: bool) -> Result<(), String> {
 
     // 2b (design-m5-p4 §13 I5): remove exactly our two shell links.
     remove_shortcuts()?;
+
+    // 2c (design-m5-p4 §14 I5): drop the Apps entry while the installed
+    // exe still exists, so Windows never advertises a removal command
+    // pointing at a file we have already renamed/deleted.
+    remove_apps_entry()?;
+    println!("Installed apps entry: removed.");
 
     // 3. PATH entry gone (either form), then broadcast.
     let (kind, raw) = read_path();
@@ -844,5 +932,36 @@ mod tests {
         let wide = path_wide(Path::new(r"C:\Users\Zahraan Dzakii\Cascade"));
         assert_eq!(wide::from_wide(&wide), r"C:\Users\Zahraan Dzakii\Cascade");
         assert_eq!(wide.last(), Some(&0));
+    }
+
+    #[test]
+    fn apps_entry_command_is_quoted_and_silent() {
+        let exe = Path::new(r"C:\Users\Zahraan Dzakii\AppData\Local\Cascade\cascade.exe");
+        assert_eq!(
+            uninstall_command(exe),
+            r#""C:\Users\Zahraan Dzakii\AppData\Local\Cascade\cascade.exe" uninstall --quiet"#
+        );
+        assert_eq!(display_icon(exe), format!("{},0", exe.display()));
+    }
+
+    #[test]
+    fn apps_entry_size_rounds_up_and_saturates() {
+        assert_eq!(estimated_size_kb(0), 0);
+        assert_eq!(estimated_size_kb(1), 1);
+        assert_eq!(estimated_size_kb(1024), 1);
+        assert_eq!(estimated_size_kb(1025), 2);
+        assert_eq!(estimated_size_kb(u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn apps_key_is_per_user_and_owned_by_us() {
+        // Renaming this orphan an existing install on every upgrade and
+        // leaves a stale tile in Settings; never change it casually.
+        assert_eq!(
+            APPS_KEY,
+            r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Cascade"
+        );
+        assert_eq!(APPS_DISPLAY_NAME, "Cascade");
+        assert_eq!(APPS_PUBLISHER, "Cascade");
     }
 }
