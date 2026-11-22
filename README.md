@@ -81,6 +81,13 @@ Start search and can be opened from the Desktop. Both point at the installed
 `cascade.exe ui` (the same GUI path as `cascade ui`). `cascade uninstall`
 removes exactly those two files and nothing else.
 
+`cascade install` also registers Cascade in **Settings → Apps →
+Installed apps** (a per-user entry, no admin needed), showing the
+version, publisher and installed size. The tile's **More options →
+Uninstall** runs the same uninstall as the CLI, without opening a
+terminal. Windows 11 may still show a **Modify** entry in that menu;
+the supported removal path is **Uninstall**.
+
 ---
 
 ## Measured baseline (M0, mpv harness)
