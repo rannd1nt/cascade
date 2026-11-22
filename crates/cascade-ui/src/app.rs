@@ -1,9 +1,9 @@
-//! The library window: connection state, numbered library list, and the
-//! status strip (design-m5 §5). Request traffic runs on one worker
-//! thread (D11c) — the UI thread only sends commands and drains replies,
-//! so a wedged or absent daemon can never freeze a frame. The persistent
-//! event subscription runs on a second thread beside the worker
-//! (design-m5-p4 §5): it never issues requests, it only pushes
+//! The library window: connection state, numbered library list, the
+//! Settings surface and the status strip (design-m5 §5). Request traffic
+//! runs on one worker thread (D11c) — the UI thread only sends commands
+//! and drains replies, so a wedged or absent daemon can never freeze a
+//! frame. The persistent event subscription runs on a second thread beside
+//! the worker (design-m5-p4 §5): it never issues requests, it only pushes
 //! `Reply::Event` into the same reply channel.
 
 use std::collections::{HashMap, HashSet};
@@ -12,10 +12,13 @@ use std::time::{Duration, Instant};
 
 use cascade_core::client::{self, ClientError};
 use cascade_core::ipc::{
-    no_data, Event, LibraryAddData, LibraryAddResult, LibraryItemsData, LibraryRemoveData,
-    RejectedPath, SetData, SetReport, Settings, Status,
+    no_data, AutostartStatus, EnabledData, Event, LibraryAddData, LibraryAddResult,
+    LibraryItemsData, LibraryRemoveData, PausePatch, RejectedPath, SetData, SetReport, Settings,
+    SettingsPatch, Status,
 };
 use cascade_core::library::LibraryItem;
+use cascade_core::rule_engine::{BatteryAction, PauseSettings, PowerProfile};
+use cascade_core::PresentationMode;
 use eframe::egui::{self, vec2};
 
 use crate::theme;
@@ -60,6 +63,13 @@ enum Cmd {
     Set(String),
     Resume,
     StartEngine,
+    /// One settings write. The daemon answers with the full `Settings`
+    /// payload; an engine-mode change additionally respawns *after* the
+    /// answer (AGENTS §3.15, design-m5-p4 §15 S5).
+    SettingsSet(SettingsPatch),
+    /// Autostart is its own wire command — the Run key is the oracle, not
+    /// `config.toml` (design-m4 D10, design-m5-p4 §15 S4).
+    AutostartSet(bool),
 }
 
 /// Replies worker → UI.
@@ -77,6 +87,11 @@ enum Reply {
     Simple(Result<(), ClientError>),
     SetDone(Result<SetReport, ClientError>),
     Started(Result<(), String>),
+    /// A `settings.set` answer — the new wire snapshot, not an echo we
+    /// invent locally.
+    SettingsChanged(Result<Settings, ClientError>),
+    /// An `autostart.set` answer — the Run-key oracle after the write.
+    AutostartChanged(Result<AutostartStatus, ClientError>),
     /// One server-pushed event (`ipc.md` §6) from the reader thread.
     Event(Event),
     /// The reader connected (`true`) or lost the stream (`false`); the
@@ -93,6 +108,113 @@ enum Conn {
     NotRunning,
     /// Any other transport failure, with its human message.
     Unreachable(String),
+}
+
+/// The two surfaces implemented so far (design-m5 §5). Monitors belongs to
+/// S4 — it is only shown when >1 monitor exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    Library,
+    Settings,
+}
+
+/// Editable copy of the wire settings. `volume` is the live slider value —
+/// there is no second "committed" copy: keeping one made a fast drag (or a
+/// scroll made while an earlier write was in flight) snap back when the
+/// snapshot landed (design-m5-p4 §15 S6, corrected 2026-11-22).
+///
+/// The whole form is protected by `CascadeApp::dirty`: while any draft is
+/// unsent, the 1 s poll may not adopt a newer wire snapshot over it. That
+/// is what keeps the engine-mode selection alive long enough for the
+/// explicit "Apply & restart" button to appear.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SettingsForm {
+    volume: u8,
+    engine_mode: PresentationMode,
+    power_profile: PowerProfile,
+    on_battery: BatteryAction,
+    pause: PauseSettings,
+    restore_wallpaper_on_exit: bool,
+    tray: bool,
+    autostart: bool,
+}
+
+impl SettingsForm {
+    fn from_wire(settings: &Settings, autostart: bool) -> Self {
+        Self {
+            volume: settings.volume,
+            engine_mode: settings.engine_mode,
+            power_profile: settings.power_profile,
+            on_battery: settings.on_battery,
+            pause: settings.pause,
+            restore_wallpaper_on_exit: settings.restore_wallpaper_on_exit,
+            tray: settings.tray,
+            autostart,
+        }
+    }
+
+    fn sync_from_wire(&mut self, settings: &Settings, autostart: bool) {
+        *self = Self::from_wire(settings, autostart);
+    }
+
+    /// Pure diff against the last wire snapshot. `autostart` is excluded on
+    /// purpose: it travels through `autostart.set` (design-m4 D10).
+    /// `engine_mode` is excluded too — it needs the explicit confirmation
+    /// button, never a silent change from a combo misclick (S5).
+    fn changes(
+        &self,
+        base: &Settings,
+        autostart_now: bool,
+        send_volume: bool,
+    ) -> (Option<SettingsPatch>, Option<bool>) {
+        let mut patch = SettingsPatch::default();
+        let mut any = false;
+        // A mid-drag slider is still a draft, but sending on every frame
+        // would spam the worker. The caller gates this on drag release.
+        if send_volume && self.volume != base.volume {
+            patch.volume = Some(self.volume);
+            any = true;
+        }
+        if self.power_profile != base.power_profile {
+            patch.power_profile = Some(self.power_profile);
+            any = true;
+        }
+        if self.on_battery != base.on_battery {
+            patch.on_battery = Some(self.on_battery);
+            any = true;
+        }
+        if self.pause != base.pause {
+            let pause = self.pause;
+            patch.pause = Some(PausePatch {
+                fullscreen: Some(pause.fullscreen),
+                maximized: Some(pause.maximized),
+                display_off: Some(pause.display_off),
+                session_lock: Some(pause.session_lock),
+                screensaver: Some(pause.screensaver),
+                remote_session: Some(pause.remote_session),
+            });
+            any = true;
+        }
+        if self.restore_wallpaper_on_exit != base.restore_wallpaper_on_exit {
+            patch.restore_wallpaper_on_exit = Some(self.restore_wallpaper_on_exit);
+            any = true;
+        }
+        if self.tray != base.tray {
+            patch.tray = Some(self.tray);
+            any = true;
+        }
+        let autostart = (self.autostart != autostart_now).then_some(self.autostart);
+        (any.then_some(patch), autostart)
+    }
+
+    /// The explicit engine-mode write, kept pure so the confirmation path
+    /// is unit-testable without a window.
+    fn engine_mode_patch(&self) -> SettingsPatch {
+        SettingsPatch {
+            engine_mode: Some(self.engine_mode),
+            ..SettingsPatch::default()
+        }
+    }
 }
 
 pub struct CascadeApp {
@@ -141,6 +263,21 @@ pub struct CascadeApp {
     /// The orphan prune already ran after the first successful list
     /// reply (T11) — never from an error path.
     pruned: bool,
+    /// Which surface the sidebar shows (design-m5-p4 §15 S1).
+    tab: Tab,
+    /// Draft settings, synced from the wire only while no write is in
+    /// flight (S6).
+    form: SettingsForm,
+    /// One settings/autostart write is in flight. While true the 1 s poll
+    /// cannot overwrite the draft with a pre-write snapshot.
+    settings_pending: bool,
+    /// A draft exists that has not been sent yet (engine mode always waits
+    /// for its button; a second edit can land while another write is
+    /// pending). While true the wire snapshot may not replace the form —
+    /// otherwise the selection snaps back on the next frame.
+    dirty: bool,
+    /// Success note for the in-flight write (engine-mode restart wording).
+    pending_notice: Option<String>,
 }
 
 impl CascadeApp {
@@ -213,6 +350,11 @@ impl CascadeApp {
             thumb_failed: HashMap::new(),
             textures: TextureLru::new(thumbs::LRU_LIMIT),
             pruned: false,
+            tab: Tab::Library,
+            form: SettingsForm::from_wire(&Settings::default(), false),
+            settings_pending: false,
+            dirty: false,
+            pending_notice: None,
         }
     }
 
@@ -367,6 +509,31 @@ impl CascadeApp {
         self.poll_at = Instant::now();
     }
 
+    /// Queue one settings write. At most one is in flight (S6), so replies
+    /// cannot overwrite a newer draft with an older snapshot.
+    fn send_setting(&mut self, patch: SettingsPatch, note: Option<String>) {
+        if self.settings_pending {
+            return;
+        }
+        self.settings_pending = true;
+        // The draft is now in flight; the answer is the next wire truth.
+        self.dirty = false;
+        self.pending_notice = note;
+        self.send(Cmd::SettingsSet(patch));
+    }
+
+    /// Autostart is a separate wire command: the Run key is the oracle
+    /// (design-m4 D10), never a field of `SettingsPatch`.
+    fn send_autostart(&mut self, enabled: bool) {
+        if self.settings_pending {
+            return;
+        }
+        self.settings_pending = true;
+        self.dirty = false;
+        self.pending_notice = None;
+        self.send(Cmd::AutostartSet(enabled));
+    }
+
     /// Whether the next poll must carry `library.list`: always while no
     /// subscription is live, plus the one owed resync fetch after a
     /// (re)connect (design-m5-p4 §5, `ipc.md §7`).
@@ -394,6 +561,11 @@ impl CascadeApp {
                         self.conn = Conn::NotRunning;
                         self.status = None;
                         self.settings = None;
+                        // A daemon that died before answering cannot leave
+                        // the form frozen (S6): the CLI remains the oracle.
+                        self.settings_pending = false;
+                        self.dirty = false;
+                        self.pending_notice = None;
                         self.set_library(Vec::new(), false);
                         self.last_snapshot_error = None;
                     }
@@ -423,7 +595,12 @@ impl CascadeApp {
                         None => {}
                     }
                     match settings {
-                        Ok(settings) => self.settings = Some(settings),
+                        // While a write is in flight the pre-write snapshot
+                        // must not become the new diff base — otherwise the
+                        // user's draft would be sent twice or reverted
+                        // visually (design-m5-p4 §15 S6).
+                        Ok(settings) if !self.settings_pending => self.settings = Some(settings),
+                        Ok(_) => {}
                         Err(err) => self.snapshot_error(err.to_string()),
                     }
                 }
@@ -471,6 +648,41 @@ impl CascadeApp {
                     }
                     Err(err) => self.notice = Some(err),
                 }
+            }
+            Reply::SettingsChanged(result) => {
+                self.settings_pending = false;
+                match result {
+                    Ok(settings) => {
+                        self.settings = Some(settings);
+                        if let Some(note) = self.pending_notice.take() {
+                            self.notice = Some(note);
+                        }
+                    }
+                    Err(err) => {
+                        self.pending_notice = None;
+                        self.dirty = false;
+                        self.notice = Some(err.to_string());
+                    }
+                }
+                // The write changed state (or failed): refresh the strip,
+                // the conflict warning and the autostart oracle at once.
+                self.request_poll_now();
+            }
+            Reply::AutostartChanged(result) => {
+                self.settings_pending = false;
+                self.pending_notice = None;
+                match result {
+                    Ok(autostart) => {
+                        if let Some(status) = self.status.as_mut() {
+                            status.autostart = autostart;
+                        }
+                    }
+                    Err(err) => {
+                        self.dirty = false;
+                        self.notice = Some(err.to_string());
+                    }
+                }
+                self.request_poll_now();
             }
             Reply::EventsLive(live) => {
                 let became_live = live && !self.events_live;
@@ -609,9 +821,21 @@ impl CascadeApp {
         ui.add_space(12.0);
         ui.label(egui::RichText::new("Cascade").strong().size(18.0));
         ui.add_space(14.0);
-        // Only Library exists in P2 — Monitors/Settings arrive in P4
-        // (design-m5 §5), so this entry is the current, fixed surface.
-        let _ = ui.selectable_label(true, "Library");
+        // Two of the four reserved surfaces exist; Monitors is S4 (only
+        // meaningful with >1 monitor) — design-m5-p4 §15 S1.
+        let tab = self.tab;
+        if ui
+            .selectable_label(tab == Tab::Library, "Library")
+            .clicked()
+        {
+            self.tab = Tab::Library;
+        }
+        if ui
+            .selectable_label(tab == Tab::Settings, "Settings")
+            .clicked()
+        {
+            self.tab = Tab::Settings;
+        }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             theme::muted(ui, concat!("cascade ", env!("CARGO_PKG_VERSION")));
             ui.add_space(8.0);
@@ -683,7 +907,10 @@ impl CascadeApp {
             }
             Conn::NotRunning => self.start_screen(ui),
             Conn::Unreachable(message) => self.unreachable_screen(ui, &message),
-            Conn::Connected => self.library_screen(ui),
+            Conn::Connected => match self.tab {
+                Tab::Library => self.library_screen(ui),
+                Tab::Settings => self.settings_screen(ui),
+            },
         }
     }
 
@@ -721,6 +948,220 @@ impl CascadeApp {
                 self.request_poll_now();
             }
         });
+    }
+
+    /// The Settings surface (design-m5 §5, design-m5-p4 §15). Pure wire
+    /// shapes only: every write goes through the worker with the same
+    /// commands the CLI uses; nothing is applied locally.
+    fn settings_screen(&mut self, ui: &mut egui::Ui) {
+        // Adopt the wire snapshot only when no write is in flight AND no
+        // draft is waiting. A draft can exist while a write is pending
+        // (a second scroll, or the engine-mode selection), so checking
+        // `settings_pending` alone lost the user's last edit (S6 fix).
+        if !self.settings_pending && !self.dirty {
+            if let Some(settings) = self.settings {
+                let autostart = self
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.autostart.enabled);
+                self.form.sync_from_wire(&settings, autostart);
+            }
+        }
+        let Some(settings) = self.settings else {
+            ui.add_space(28.0);
+            ui.vertical_centered(|ui| {
+                ui.label("Settings are unavailable");
+                ui.add_space(6.0);
+                theme::muted(
+                    ui,
+                    "The engine did not answer `settings get`. Use `cascade settings get` in a terminal, or Retry.",
+                );
+            });
+            return;
+        };
+
+        let listening = self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.mode == "listening");
+        let autostart_now = self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.autostart.enabled);
+        let windows_disabled = self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.autostart.windows_disabled);
+        let engine_mode_changing = self.form.engine_mode != settings.engine_mode;
+        let conflict = settings.conflict_warning();
+        let mut apply_engine = false;
+        let mut slider_settled = false;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Settings").strong().size(16.0));
+                ui.add_space(8.0);
+                ui.separator();
+
+                ui.label(egui::RichText::new("Playback").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Volume");
+                    // The slider owns the draft value directly. A drag
+                    // changes it every frame; `dirty` (computed below)
+                    // keeps the poll from reverting it, and the write is
+                    // sent on release (or on a discrete wheel/key step).
+                    let response =
+                        ui.add(egui::Slider::new(&mut self.form.volume, 0..=100).suffix("%"));
+                    slider_settled =
+                        response.drag_stopped() || (response.changed() && !response.dragged());
+                    ui.label(format!("{} / 100", self.form.volume));
+                });
+                theme::muted(
+                    ui,
+                    if listening {
+                        "Applies at the next load — no engine to restart."
+                    } else {
+                        "Applies to the playing video immediately; no restart."
+                    },
+                );
+                ui.add_space(10.0);
+
+                ui.label(egui::RichText::new("Engine").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Engine mode");
+                    egui::ComboBox::from_id_salt("cascade-engine-mode")
+                        .selected_text(self.form.engine_mode.as_str())
+                        .show_ui(ui, |ui| {
+                            for mode in [PresentationMode::Accurate, PresentationMode::Efficient] {
+                                ui.selectable_value(
+                                    &mut self.form.engine_mode,
+                                    mode,
+                                    mode.as_str(),
+                                );
+                            }
+                        });
+                });
+                if engine_mode_changing {
+                    if listening {
+                        theme::muted(ui, "No engine to restart — applied at the next start.");
+                    } else {
+                        ui.colored_label(
+                            theme::WARN,
+                            "Changing the engine mode restarts the engine when a video is playing; the desktop is restored during the switch.",
+                        );
+                    }
+                    apply_engine = theme::accent_button(ui, "Apply & restart").clicked();
+                } else {
+                    theme::muted(
+                        ui,
+                        "Changing this restarts the engine when a video is playing; the desktop is restored during the switch.",
+                    );
+                }
+                ui.add_space(10.0);
+
+                ui.label(egui::RichText::new("Pause rules").strong());
+                ui.checkbox(&mut self.form.pause.fullscreen, "Pause on fullscreen");
+                ui.checkbox(&mut self.form.pause.maximized, "Pause on maximized window");
+                ui.checkbox(&mut self.form.pause.display_off, "Pause when display turns off");
+                ui.checkbox(&mut self.form.pause.session_lock, "Pause on session lock");
+                ui.checkbox(&mut self.form.pause.screensaver, "Pause on screensaver");
+                ui.checkbox(&mut self.form.pause.remote_session, "Pause on remote session");
+                ui.add_space(10.0);
+
+                ui.label(egui::RichText::new("Power").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Power profile");
+                    egui::ComboBox::from_id_salt("cascade-power-profile")
+                        .selected_text(self.form.power_profile.as_str())
+                        .show_ui(ui, |ui| {
+                            for profile in [
+                                PowerProfile::Off,
+                                PowerProfile::Balanced,
+                                PowerProfile::Battery,
+                                PowerProfile::Quality,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.form.power_profile,
+                                    profile,
+                                    profile.as_str(),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("On battery");
+                    egui::ComboBox::from_id_salt("cascade-on-battery")
+                        .selected_text(self.form.on_battery.as_str())
+                        .show_ui(ui, |ui| {
+                            for action in [
+                                BatteryAction::Off,
+                                BatteryAction::Pause,
+                                BatteryAction::Stop,
+                                BatteryAction::Continue,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.form.on_battery,
+                                    action,
+                                    action.as_str(),
+                                );
+                            }
+                        });
+                });
+                if self.form.on_battery == BatteryAction::Stop {
+                    ui.colored_label(
+                        theme::WARN,
+                        "A full stop: the real wallpaper is restored and a zero-compute listener serves the tray until AC returns.",
+                    );
+                }
+                if let Some(warning) = &conflict {
+                    ui.colored_label(theme::WARN, warning);
+                }
+                ui.add_space(10.0);
+
+                ui.label(egui::RichText::new("System").strong());
+                ui.checkbox(
+                    &mut self.form.restore_wallpaper_on_exit,
+                    "Restore wallpaper on exit",
+                );
+                theme::muted(
+                    ui,
+                    "Desktop is restored on every exit regardless; this is stored state only.",
+                );
+                ui.checkbox(&mut self.form.tray, "Tray icon");
+                ui.checkbox(&mut self.form.autostart, "Start Cascade with Windows");
+                if windows_disabled {
+                    ui.colored_label(theme::WARN, "Disabled in Settings → Apps → Startup");
+                }
+            });
+
+        // Apply after the widgets updated the draft: one write in flight,
+        // engine mode only through the explicit confirmation above.
+        let (patch, autostart_patch) = self.form.changes(&settings, autostart_now, slider_settled);
+        let volume_draft = self.form.volume != settings.volume;
+        let engine_draft = self.form.engine_mode != settings.engine_mode;
+        // Any unsent draft freezes the snapshot. This is the fix for both
+        // bugs found on target: the combo selection now survives until the
+        // Apply button is clicked, and a scroll made during an in-flight
+        // write is still owed after the answer lands.
+        self.dirty = volume_draft || patch.is_some() || autostart_patch.is_some() || engine_draft;
+
+        if apply_engine {
+            let note = if listening {
+                "Engine mode saved — applied at the next start (no engine to restart)."
+            } else {
+                "Engine mode saved — the daemon restarts to apply it if a video is playing."
+            };
+            self.send_setting(self.form.engine_mode_patch(), Some(note.to_string()));
+        }
+        if !self.settings_pending {
+            if let Some(patch) = patch {
+                self.send_setting(patch, None);
+            } else if let Some(enabled) = autostart_patch {
+                self.send_autostart(enabled);
+            }
+        }
     }
 
     fn library_screen(&mut self, ui: &mut egui::Ui) {
@@ -1174,6 +1615,10 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Reply>) {
             )),
             Cmd::Resume => Reply::Simple(ask_ok("playback.resume", no_data())),
             Cmd::StartEngine => Reply::Started(start_engine()),
+            Cmd::SettingsSet(patch) => Reply::SettingsChanged(ask_data("settings.set", patch)),
+            Cmd::AutostartSet(enabled) => {
+                Reply::AutostartChanged(ask_data("autostart.set", EnabledData { enabled }))
+            }
         };
         if tx.send(reply).is_err() {
             break; // the window is gone
@@ -1627,5 +2072,193 @@ mod tests {
             app.thumb_failed.is_empty(),
             "a dead engine leaves no stale thumbnail state"
         );
+    }
+
+    // --- design-m5-p4 §15: Settings surface -------------------------------
+
+    #[test]
+    fn form_diff_sends_only_edited_fields_and_separates_autostart() {
+        let base = Settings::default();
+        let mut form = SettingsForm::from_wire(&base, false);
+        assert_eq!(
+            form.changes(&base, false, true),
+            (None, None),
+            "a fresh form is idle"
+        );
+
+        form.pause.fullscreen = false;
+        form.tray = false;
+        form.autostart = true;
+        let (patch, autostart) = form.changes(&base, false, true);
+        let patch = patch.expect("two edited fields");
+        assert_eq!(
+            patch.pause,
+            Some(PausePatch {
+                fullscreen: Some(false),
+                maximized: Some(base.pause.maximized),
+                display_off: Some(base.pause.display_off),
+                session_lock: Some(base.pause.session_lock),
+                screensaver: Some(base.pause.screensaver),
+                remote_session: Some(base.pause.remote_session),
+            })
+        );
+        assert_eq!(patch.tray, Some(false));
+        assert_eq!(patch.volume, None);
+        assert_eq!(patch.engine_mode, None, "engine mode needs its own button");
+        assert_eq!(autostart, Some(true));
+    }
+
+    #[test]
+    fn slider_draft_and_engine_mode_draft_are_not_sent_implicitly() {
+        let base = Settings::default();
+        let mut form = SettingsForm::from_wire(&base, false);
+        form.volume = 42; // live slider position, gesture not settled yet
+        form.engine_mode = PresentationMode::Efficient; // awaiting confirmation
+        assert_eq!(
+            form.changes(&base, false, false),
+            (None, None),
+            "no field is written just because its widget moved"
+        );
+
+        let (patch, _) = form.changes(&base, false, true);
+        assert_eq!(
+            patch.and_then(|patch| patch.volume),
+            Some(42),
+            "drag release sends the live slider value"
+        );
+
+        let explicit = form.engine_mode_patch();
+        assert_eq!(explicit.engine_mode, Some(PresentationMode::Efficient));
+        assert_eq!(
+            explicit.volume, None,
+            "the explicit patch carries one field"
+        );
+    }
+
+    #[test]
+    fn dirty_draft_blocks_the_snapshot_thatused_to_snap_it_back() {
+        // Regression, 2026-11-22, target: a scroll made while an earlier
+        // write was in flight was discarded when the first answer landed.
+        let mut app = CascadeApp::detached();
+        let stale = Settings::default(); // volume 0, the pre-write truth
+        app.settings = Some(stale);
+        app.form.volume = 70; // second scroll, not sent yet
+        app.settings_pending = true;
+        app.dirty = true;
+
+        // The screen-side guard is pure: a dirty draft must not adopt this.
+        let may_sync = !app.settings_pending && !app.dirty;
+        assert!(!may_sync, "the 1 s poll cannot overwrite an unsent draft");
+
+        // Once the answer lands and no new draft exists, sync resumes.
+        app.settings_pending = false;
+        app.dirty = false;
+        let newer = Settings {
+            volume: 35,
+            ..Settings::default()
+        };
+        app.form.sync_from_wire(&newer, false);
+        assert_eq!(app.form.volume, 35, "the acknowledged wire value wins");
+    }
+
+    #[test]
+    fn engine_mode_selection_survives_until_the_explicit_apply() {
+        // Regression, 2026-11-22, target: selecting "accurate" reverted to
+        // "efficient" because engine_mode is excluded from the auto-diff.
+        let wire = Settings {
+            engine_mode: PresentationMode::Efficient,
+            ..Settings::default()
+        };
+        let mut app = CascadeApp::detached();
+        app.settings = Some(wire);
+        app.form.engine_mode = PresentationMode::Accurate;
+        // The screen marks the unsent engine draft dirty right away.
+        app.dirty = app.form.engine_mode != wire.engine_mode;
+        assert!(app.dirty);
+        assert!(!app.settings_pending, "no write was sent by the combo");
+
+        let may_sync = !app.settings_pending && !app.dirty;
+        assert!(!may_sync, "the selection survives the next frame");
+        assert_eq!(app.form.engine_mode, PresentationMode::Accurate);
+
+        assert_eq!(
+            app.form.engine_mode_patch().engine_mode,
+            Some(PresentationMode::Accurate),
+            "Apply & restart sends exactly that selection"
+        );
+    }
+
+    #[test]
+    fn pending_write_ignores_a_stale_snapshot_and_reports_failure() {
+        let mut app = CascadeApp::detached();
+        let mut settings = Settings::default();
+        app.settings = Some(settings);
+        app.settings_pending = true;
+        settings.volume = 80;
+        app.apply(Reply::Snapshot {
+            status: Ok(status_fixture()),
+            library: None,
+            settings: Ok(settings),
+        });
+        assert_eq!(
+            app.settings.map(|settings| settings.volume),
+            Some(0),
+            "the pre-write snapshot stays the diff base until the answer"
+        );
+
+        app.apply(Reply::SettingsChanged(Err(ClientError::Timeout)));
+        assert!(!app.settings_pending);
+        assert!(app.notice.is_some(), "the failed write is visible");
+    }
+
+    #[test]
+    fn settings_answer_clears_pending_and_shows_the_restart_note() {
+        let mut app = CascadeApp::detached();
+        app.settings_pending = true;
+        app.pending_notice = Some("restart note".to_string());
+        let settings = Settings {
+            engine_mode: PresentationMode::Efficient,
+            ..Settings::default()
+        };
+        app.apply(Reply::SettingsChanged(Ok(settings)));
+        assert!(!app.settings_pending);
+        assert_eq!(app.notice.as_deref(), Some("restart note"));
+        assert_eq!(
+            app.settings.map(|settings| settings.engine_mode),
+            Some(PresentationMode::Efficient)
+        );
+    }
+
+    #[test]
+    fn autostart_answer_updates_the_run_key_oracle_only() {
+        let mut app = CascadeApp::detached();
+        app.status = Some(status_fixture());
+        app.settings_pending = true;
+        app.apply(Reply::AutostartChanged(Ok(AutostartStatus {
+            enabled: false,
+            windows_disabled: true,
+        })));
+        assert!(!app.settings_pending);
+        let status = app.status.expect("status still present");
+        assert!(!status.autostart.enabled);
+        assert!(status.autostart.windows_disabled);
+        assert!(
+            app.settings.is_none(),
+            "autostart never invents a settings payload"
+        );
+    }
+
+    #[test]
+    fn engine_down_releases_a_stuck_write() {
+        let mut app = CascadeApp::detached();
+        app.settings_pending = true;
+        app.pending_notice = Some("waiting".to_string());
+        app.apply(Reply::Snapshot {
+            status: Err(ClientError::NotRunning),
+            library: None,
+            settings: Err(ClientError::NotRunning),
+        });
+        assert!(!app.settings_pending);
+        assert_eq!(app.pending_notice, None);
     }
 }
