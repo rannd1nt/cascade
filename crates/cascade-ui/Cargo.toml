@@ -8,6 +8,9 @@ rust-version = "1.95"
 
 [dependencies]
 cascade-core = { workspace = true }
+# design-m5-p4 §11 T1: thumbnails decode in the UI process only — the UI
+# is the sole caller of cascade-media::thumbnail (architecture §3).
+cascade-media = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # design-m5 D11a: the GUI framework (glow renderer + bundled fonts).

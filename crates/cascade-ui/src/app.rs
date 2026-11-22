@@ -6,6 +6,7 @@
 //! (design-m5-p4 §5): it never issues requests, it only pushes
 //! `Reply::Event` into the same reply channel.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -15,9 +16,10 @@ use cascade_core::ipc::{
     RejectedPath, SetData, SetReport, Settings, Status,
 };
 use cascade_core::library::LibraryItem;
-use eframe::egui;
+use eframe::egui::{self, vec2};
 
 use crate::theme;
+use crate::thumbs::{self, TextureLru, ThumbDone, ThumbReq};
 
 /// Refresh cadence while the window draws (design-m5 §8: the strip polls
 /// `status` every 1 s, never faster — AGENTS §13).
@@ -29,6 +31,20 @@ const POLL_INTERVAL_DISCONNECTED: Duration = Duration::from_secs(2);
 /// doubling to 5 s).
 const EVENT_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const EVENT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Library grid geometry (design-m5-p4 §11.4): the on-screen tile is
+/// 160×90 pt under a 320×180 texture (2× the tile, sharp at 100–200 %
+/// DPI — AGENTS §1). The row adds the ordinal/title line (15 pt) and
+/// the meta line (13 pt): 90 + 4 + 15 + 2 + 13 = 124.
+const TILE_W: f32 = 160.0;
+const THUMB_H: f32 = 90.0;
+const ROW_H: f32 = 124.0;
+/// Height reserved under the grid for the separator + action row: the
+/// buttons sit **below** the grid (`design-m5.md` §5 sketch), so the
+/// grid must never grow into their space.
+const BOTTOM_H: f32 = 56.0;
+/// Smallest grid the window still shows at its 640×400 floor.
+const MIN_GRID_H: f32 = 90.0;
 
 /// Commands UI → worker. The worker runs them strictly in order, so at
 /// most one `Poll` is ever in flight (`poll_outstanding`) and replies
@@ -101,18 +117,57 @@ pub struct CascadeApp {
     /// True while the reader thread holds a live event subscription:
     /// the polls then skip `library.list` (design-m5-p4 §5).
     events_live: bool,
+    /// One `library.list` fetch is still owed after the stream
+    /// (re)connects: events carry *changes*, never the initial list
+    /// (`ipc.md §6`), so the first poll after `EventsLive(true)` must
+    /// include the library even though the stream is live (§7
+    /// stateless resync). Cleared when that fetch lands.
+    library_resync: bool,
+    /// Search box text: client-side filter over title + path (D6).
+    search: String,
+    /// Thumb requests (UI → worker); `None` when no thread runs — the
+    /// spawn failed, or the worker exited (T6).
+    thumb_tx: Option<Sender<ThumbReq>>,
+    /// Thumb results (worker → UI), drained once per `tick` (T7).
+    thumb_rx: Receiver<ThumbDone>,
+    /// Ids with a decode in flight — one request at a time per id (T6).
+    thumb_pending: HashSet<String>,
+    /// Ids whose decode failed → the reason shown on hover over the
+    /// placeholder (T8). Cleared when the id set changes or the library
+    /// is edited (T9); never a banner (§11.1).
+    thumb_failed: HashMap<String, String>,
+    /// GPU textures for the grid, LRU-limited (T10).
+    textures: TextureLru<egui::TextureHandle>,
+    /// The orphan prune already ran after the first successful list
+    /// reply (T11) — never from an error path.
+    pruned: bool,
 }
 
 impl CascadeApp {
     pub fn new(ctx: egui::Context) -> Result<Self, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
+        let (thumb_tx, thumb_req_rx) = mpsc::channel::<ThumbReq>();
+        let (thumb_done_tx, thumb_done_rx) = mpsc::channel::<ThumbDone>();
         let worker_tx = reply_tx.clone();
         std::thread::Builder::new()
             .name("cascade-ui-ipc".to_string())
             .spawn(move || worker(cmd_rx, worker_tx))
             .map_err(|err| format!("could not start the UI connection thread: {err}"))?;
-        let mut app = Self::build(cmd_tx, reply_rx);
+        let mut app = Self::build(cmd_tx, reply_rx, Some(thumb_tx), thumb_done_rx);
+        // The thumbnail thread is an enhancement, not the lifeline: if
+        // it cannot start, every tile keeps its placeholder (§11.1) and
+        // the window opens anyway.
+        let thumb_ctx = ctx.clone();
+        if std::thread::Builder::new()
+            .name("cascade-ui-thumbs".to_string())
+            .spawn(move || thumbs::thumb_worker(thumb_req_rx, thumb_done_tx, thumb_ctx))
+            .is_err()
+        {
+            app.thumb_tx = None;
+            app.notice =
+                Some("thumbnails unavailable \u{2014} the grid shows placeholders".to_string());
+        }
         // The event stream is an enhancement, not the lifeline: if this
         // thread cannot start the window degrades to full polling with
         // an honest notice instead of failing to open.
@@ -129,7 +184,12 @@ impl CascadeApp {
         Ok(app)
     }
 
-    fn build(cmd: Sender<Cmd>, reply: Receiver<Reply>) -> Self {
+    fn build(
+        cmd: Sender<Cmd>,
+        reply: Receiver<Reply>,
+        thumb_tx: Option<Sender<ThumbReq>>,
+        thumb_rx: Receiver<ThumbDone>,
+    ) -> Self {
         Self {
             cmd,
             reply,
@@ -145,17 +205,27 @@ impl CascadeApp {
             poll_outstanding: false,
             last_snapshot_error: None,
             events_live: false,
+            library_resync: false,
+            search: String::new(),
+            thumb_tx,
+            thumb_rx,
+            thumb_pending: HashSet::new(),
+            thumb_failed: HashMap::new(),
+            textures: TextureLru::new(thumbs::LRU_LIMIT),
+            pruned: false,
         }
     }
 
     /// Test constructor: identical state, no threads — the worker would
     /// need a daemon, and the reader would subscribe to a live one.
+    /// `thumb_tx: None` says the same for the thumbnail worker.
     #[cfg(test)]
     fn detached() -> Self {
         let (cmd_tx, _cmd_rx) = mpsc::channel::<Cmd>();
         let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
         drop(reply_tx); // no producer: tests drive `apply` directly
-        Self::build(cmd_tx, reply_rx)
+        let (_done_tx, done_rx) = mpsc::channel::<ThumbDone>();
+        Self::build(cmd_tx, reply_rx, None, done_rx)
     }
 
     // --- worker plumbing ------------------------------------------------
@@ -188,8 +258,11 @@ impl CascadeApp {
                 }
             }
         }
+        // After the replies: results are validated against the freshest
+        // list, so a removal that raced a decode drops its texture (T9).
+        self.drain_thumbs(ctx);
         if !self.poll_outstanding && Instant::now() >= self.poll_at {
-            let library = !self.events_live;
+            let library = self.poll_carries_library();
             if self.cmd.send(Cmd::Poll { library }).is_ok() {
                 self.poll_outstanding = true;
             } else {
@@ -201,9 +274,104 @@ impl CascadeApp {
         ctx.request_repaint_after(POLL_INTERVAL);
     }
 
+    /// Drain finished thumbnails into GPU textures (T7): `load_texture`
+    /// runs only here, on the UI thread — never on the worker.
+    fn drain_thumbs(&mut self, ctx: &egui::Context) {
+        loop {
+            match self.thumb_rx.try_recv() {
+                Ok(done) => self.apply_thumb(ctx, done),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The worker exited (it never started, or it died):
+                    // every tile keeps its placeholder from now on — no
+                    // retry loops (§11.1).
+                    self.thumb_tx = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// One result: forget its pending request, then either build the
+    /// texture or remember the failure reason (T7/T8). A result for an
+    /// id that left the library is dropped (T9).
+    fn apply_thumb(&mut self, ctx: &egui::Context, done: ThumbDone) {
+        let (id, result) = match done {
+            ThumbDone::Ready {
+                id,
+                width,
+                height,
+                rgba,
+            } => (id, Ok((width, height, rgba))),
+            ThumbDone::Failed { id, reason } => (id, Err(reason)),
+        };
+        self.thumb_pending.remove(&id);
+        if !self.library.iter().any(|item| item.id == id) {
+            return;
+        }
+        match result {
+            Ok((width, height, rgba)) => {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [width as usize, height as usize],
+                    &rgba,
+                );
+                let handle = ctx.load_texture(
+                    format!("cascade-thumb-{id}"),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.textures.insert(id, handle);
+            }
+            Err(reason) => {
+                self.thumb_failed.insert(id, reason);
+            }
+        }
+    }
+
+    /// Adopt a new library list (T9): textures and in-flight requests
+    /// for ids that stayed, everything dropped for ids that left, and
+    /// all failure reasons cleared when the id set changed — a fresh id
+    /// must get a fresh attempt. `prune` is true **only** from a
+    /// successful `library.list` reply: the single place an orphan
+    /// prune may run (T11 — an empty guess from an error path would
+    /// wipe a valid cache).
+    fn set_library(&mut self, items: Vec<LibraryItem>, prune: bool) {
+        let old: HashSet<String> = self.library.iter().map(|item| item.id.clone()).collect();
+        let new: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
+        let changed = old != new;
+        self.library = items;
+        drop_missing_selection(&self.library, &mut self.selected);
+        self.textures.retain_ids(&new);
+        self.thumb_pending.retain(|id| new.contains(id));
+        if changed {
+            self.thumb_failed.clear();
+        }
+        if prune && !self.pruned {
+            self.pruned = true;
+            // The prune compiles only outside tests (`cfg(not(test))`,
+            // mirrored here): a unit test never touches the real cache
+            // directory (AGENTS §7). The full prune is V4 on target.
+            #[cfg(not(test))]
+            {
+                let ids: Vec<String> = new.into_iter().collect();
+                let removed = thumbs::prune_orphans(&ids);
+                if removed > 0 {
+                    eprintln!("cascade: ui: pruned {removed} orphan thumbnail cache file(s)");
+                }
+            }
+        }
+    }
+
     /// Poll again as soon as possible (after an action, or on Retry).
     fn request_poll_now(&mut self) {
         self.poll_at = Instant::now();
+    }
+
+    /// Whether the next poll must carry `library.list`: always while no
+    /// subscription is live, plus the one owed resync fetch after a
+    /// (re)connect (design-m5-p4 §5, `ipc.md §7`).
+    fn poll_carries_library(&self) -> bool {
+        !self.events_live || self.library_resync
     }
 
     fn apply(&mut self, reply: Reply) {
@@ -221,12 +389,12 @@ impl CascadeApp {
                     }
                     Err(ClientError::NotRunning) => {
                         // The engine is down: forget everything it owned
-                        // so no stale list or strip values linger.
+                        // so no stale list, strip values, or thumbnail
+                        // textures linger.
                         self.conn = Conn::NotRunning;
                         self.status = None;
                         self.settings = None;
-                        self.library.clear();
-                        self.selected = None;
+                        self.set_library(Vec::new(), false);
                         self.last_snapshot_error = None;
                     }
                     Err(err) => {
@@ -237,13 +405,21 @@ impl CascadeApp {
                 if self.conn == Conn::Connected {
                     match library {
                         Some(Ok(data)) => {
-                            self.library = data.items;
-                            drop_missing_selection(&self.library, &mut self.selected);
+                            // A carried `library.list` discharges the
+                            // resync owed after (re)connecting.
+                            self.library_resync = false;
+                            // The one path where an orphan prune is
+                            // allowed (T11): a *successful* list reply.
+                            self.set_library(data.items, true);
                             self.last_snapshot_error = None;
                         }
-                        Some(Err(err)) => self.snapshot_error(err.to_string()),
-                        // Skipped on purpose while the event stream is
-                        // live — the events own the list (design-m5-p4 §5).
+                        Some(Err(err)) => {
+                            self.library_resync = false;
+                            self.snapshot_error(err.to_string());
+                        }
+                        // Skipped only while the event stream is live
+                        // *and* no resync is owed — the events own the
+                        // list from then on (design-m5-p4 §5).
                         None => {}
                     }
                     match settings {
@@ -301,7 +477,14 @@ impl CascadeApp {
                 self.events_live = live;
                 if became_live {
                     // Events are not replayed (`ipc.md` §6): resync with
-                    // one full poll right after (re)connecting (§7).
+                    // one full poll right after (re)connecting (§7) —
+                    // full means it *carries* `library.list`, which
+                    // `library_resync` forces even while live. Without
+                    // this the window could start empty and stay empty
+                    // until the next `library.changed` (seen on the
+                    // target machine, P4-S2: a UI started after the
+                    // daemon showed 0 videos).
+                    self.library_resync = true;
                     self.request_poll_now();
                 }
                 // Going false needs no action: the next scheduled poll
@@ -322,8 +505,12 @@ impl CascadeApp {
             "state" => self.request_poll_now(),
             "library.changed" => match serde_json::from_value::<LibraryItemsData>(event.data) {
                 Ok(data) => {
-                    self.library = data.items;
-                    drop_missing_selection(&self.library, &mut self.selected);
+                    self.set_library(data.items, false);
+                    // The list was *edited*: give every failed thumbnail
+                    // one fresh attempt (T8) — a mutation is the only
+                    // thing that can change a file's state behind our
+                    // back.
+                    self.thumb_failed.clear();
                 }
                 // Payload disagreement → the same remedy as a version
                 // mismatch: refetch, do not guess (ipc.md §7).
@@ -544,10 +731,159 @@ impl CascadeApp {
         });
         ui.add_space(8.0);
 
-        // Toolbar directly under the header: the actions must stay
-        // visible whatever the list does — a full-height ScrollArea
-        // placed after them swallowed them off-panel (seen on the target
-        // machine, P2b).
+        // Search **above** the grid (`design-m5.md` §5 sketch): a
+        // client-side filter over title + path (D6).
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 32.0).max(80.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Search title or path\u{2026}")
+                    .desired_width(width),
+            );
+            if !self.search.is_empty()
+                && ui
+                    .small_button("\u{d7}")
+                    .on_hover_text("Clear search")
+                    .clicked()
+            {
+                self.search.clear();
+            }
+        });
+        ui.add_space(8.0);
+
+        if self.library.is_empty() {
+            ui.add_space(28.0);
+            ui.vertical_centered(|ui| {
+                ui.label("No videos yet.");
+                ui.add_space(6.0);
+                theme::muted(
+                    ui,
+                    "Files are referenced, never copied \u{2014} use + Add below, or drop files onto this window.",
+                );
+            });
+            ui.add_space(28.0);
+        } else {
+            self.library_grid(ui);
+        }
+
+        // The actions live **below** the grid (`design-m5.md` §5). They
+        // are drawn last on purpose: a ScrollArea can only grow down, so
+        // nothing the list does can push them off-panel (the P2b lesson,
+        // now on the other side of the grid).
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+        self.action_row(ui);
+    }
+
+    /// The virtualized tile grid (design-m5-p4 §11.4): `show_rows`
+    /// renders only the visible rows, each visible tile requests its
+    /// thumbnail on render (T6), and every action is collected during
+    /// the pass and applied after it (edition 2021 disjoint captures).
+    fn library_grid(&mut self, ui: &mut egui::Ui) {
+        let filtered: Vec<usize> = (0..self.library.len())
+            .filter(|&index| matches_query(&self.library[index], &self.search))
+            .collect();
+        if filtered.is_empty() {
+            ui.add_space(28.0);
+            ui.vertical_centered(|ui| {
+                ui.label("No matches.");
+                ui.add_space(6.0);
+                theme::muted(
+                    ui,
+                    &format!(
+                        "Nothing in the library matches \u{201c}{}\u{201d}.",
+                        self.search.trim()
+                    ),
+                );
+            });
+            ui.add_space(28.0);
+            return;
+        }
+
+        // Columns follow the live width — no monitor assumption
+        // (AGENTS §1). The horizontal gap is the current item spacing
+        // (8 pt default); `show_rows` adds the same spacing vertically,
+        // so the pitch matches the row advance exactly.
+        let spacing = ui.spacing().item_spacing;
+        let columns =
+            (((ui.available_width() + spacing.x) / (TILE_W + spacing.x)).floor() as usize).max(1);
+        let total_rows = filtered.len().div_ceil(columns);
+        // Reserve the action row's height under the grid (BOTTOM_H).
+        let grid_h = (ui.available_height() - BOTTOM_H).max(MIN_GRID_H);
+
+        let mut enqueue: Vec<ThumbReq> = Vec::new();
+        let mut select: Option<String> = None;
+        let mut set_row: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(grid_h)
+            .show_rows(ui, ROW_H, total_rows, |ui, row_range| {
+                for row_index in row_range {
+                    ui.horizontal(|ui| {
+                        for column in 0..columns {
+                            let index = row_index * columns + column;
+                            let Some(&item_index) = filtered.get(index) else {
+                                break;
+                            };
+                            let item = &self.library[item_index];
+                            // Request-on-render (T6): only visible tiles
+                            // ask, each id asks once, and a failure is
+                            // never re-asked until the list changes
+                            // (T8/T9) — no retry loops (§11.1).
+                            if self.thumb_tx.is_some()
+                                && !self.textures.contains(&item.id)
+                                && !self.thumb_pending.contains(&item.id)
+                                && !self.thumb_failed.contains_key(&item.id)
+                            {
+                                self.thumb_pending.insert(item.id.clone());
+                                enqueue.push(ThumbReq {
+                                    id: item.id.clone(),
+                                    path: item.path.clone(),
+                                });
+                            }
+                            let texture = self.textures.get_touch(&item.id);
+                            let failure = self.thumb_failed.get(&item.id).map(String::as_str);
+                            let meta = item_meta(item);
+                            let response = ui.add(LibraryTile {
+                                // Ordinals renumber over the *filtered*
+                                // list (search keeps 1..n contiguous).
+                                ordinal: index + 1,
+                                title: &item.title,
+                                meta: &meta,
+                                path: &item.path,
+                                selected: self.selected.as_deref() == Some(item.id.as_str()),
+                                texture,
+                                failure,
+                            });
+                            if response.clicked() {
+                                select = Some(item.id.clone());
+                            }
+                            if response.double_clicked() {
+                                set_row = Some(item.id.clone());
+                            }
+                        }
+                    });
+                }
+            });
+        if let Some(id) = select {
+            self.selected = Some(id);
+        }
+        if let Some(id) = set_row {
+            self.send(Cmd::Set(id));
+        }
+        // Hand the collected requests to the thumb thread (T6). The
+        // worker wakes the UI itself when a result arrives.
+        if let Some(tx) = self.thumb_tx.as_ref() {
+            for req in enqueue {
+                let _ = tx.send(req);
+            }
+        }
+    }
+
+    /// The three actions under the grid: Add / Remove / Set as
+    /// wallpaper — unchanged semantics (`design-m5.md` §5).
+    fn action_row(&mut self, ui: &mut egui::Ui) {
         let has_selection = self.selected_item().is_some();
         let mut add = false;
         let mut remove = false;
@@ -590,63 +926,6 @@ impl CascadeApp {
                 self.send(Cmd::Set(id));
             }
         }
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-
-        if self.library.is_empty() {
-            ui.add_space(28.0);
-            ui.vertical_centered(|ui| {
-                ui.label("No videos yet.");
-                ui.add_space(6.0);
-                theme::muted(
-                    ui,
-                    "Files are referenced, never copied \u{2014} use + Add above, or drop files onto this window.",
-                );
-            });
-            ui.add_space(28.0);
-            return;
-        }
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                // Collected during the pass: `self.library` is borrowed
-                // by the loop, so the actions land after it (edition
-                // 2021 disjoint captures keep this borrow-checkable).
-                let mut select: Option<String> = None;
-                let mut set_row: Option<String> = None;
-                for (index, item) in self.library.iter().enumerate() {
-                    let selected = self.selected.as_deref() == Some(item.id.as_str());
-                    let title = format!("{}. {}", index + 1, item.title);
-                    let meta = item_meta(item);
-                    let row = ui
-                        .horizontal(|ui| {
-                            let row = ui.selectable_label(selected, title);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(egui::RichText::new(meta).color(theme::MUTED));
-                                },
-                            );
-                            row
-                        })
-                        .inner
-                        .on_hover_text(&item.path);
-                    if row.clicked() {
-                        select = Some(item.id.clone());
-                    }
-                    if row.double_clicked() {
-                        set_row = Some(item.id.clone());
-                    }
-                }
-                if let Some(id) = select {
-                    self.selected = Some(id);
-                }
-                if let Some(id) = set_row {
-                    self.send(Cmd::Set(id));
-                }
-            });
     }
 }
 
@@ -714,6 +993,110 @@ fn item_meta(item: &LibraryItem) -> String {
         meta.push_str(&format!(" \u{b7} {}", format_duration(ms)));
     }
     meta
+}
+
+/// Client-side search (D6): case-insensitive substring over title and
+/// path. An empty or whitespace-only query matches everything — pure,
+/// unit-tested (design-m5-p4 §11.5 V5).
+fn matches_query(item: &LibraryItem, query: &str) -> bool {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    item.title.to_lowercase().contains(&needle) || item.path.to_lowercase().contains(&needle)
+}
+
+/// One grid tile: thumbnail + ordinal/title line + meta line inside a
+/// single 160×124 allocation (design-m5-p4 §11.4). Painted by hand so
+/// the row's cursor math stays exactly one `allocate_exact_size`.
+struct LibraryTile<'a> {
+    /// 1-based position in the *filtered* list (renumbers with search).
+    ordinal: usize,
+    title: &'a str,
+    meta: &'a str,
+    path: &'a str,
+    selected: bool,
+    /// `Some` = decoded texture; `None` = placeholder (decoding/failed).
+    texture: Option<&'a egui::TextureHandle>,
+    /// Failure reason for the hover; `None` while still decoding.
+    failure: Option<&'a str>,
+}
+
+impl egui::Widget for LibraryTile<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(vec2(TILE_W, ROW_H), egui::Sense::click());
+        let thumb = egui::Rect::from_min_size(rect.min, vec2(TILE_W, THUMB_H));
+        let painter = ui.painter();
+        match self.texture {
+            Some(handle) => {
+                painter.image(
+                    handle.id(),
+                    thumb,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            None => {
+                // Placeholder: the same surface the letterbox pad uses,
+                // so a decoding tile and a letterboxed frame blend.
+                painter.rect_filled(thumb, 2.0, theme::SURFACE);
+                if self.failure.is_some() {
+                    painter.text(
+                        thumb.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "no preview",
+                        egui::FontId::proportional(12.0),
+                        theme::MUTED,
+                    );
+                }
+            }
+        }
+        let stroke = if self.selected {
+            egui::Stroke::new(2.0, theme::ACCENT)
+        } else {
+            egui::Stroke::new(1.0, theme::BORDER)
+        };
+        painter.rect(
+            thumb,
+            2.0,
+            egui::Color32::TRANSPARENT,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+
+        // The two text lines live in their own scope: `Ui::put` is a
+        // `scope_builder` that advances the *calling* ui's cursor to the
+        // widget rect (verified, egui 0.37 `ui.rs:1691`) — without this
+        // scope the puts would pull the row's cursor back under the
+        // tile. Both rects span the full tile width and the meta line
+        // ends exactly at the tile bottom, so the scope's advance
+        // lands on the same point as the allocation above.
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            let title_rect =
+                egui::Rect::from_min_size(rect.min + vec2(0.0, THUMB_H + 4.0), vec2(TILE_W, 15.0));
+            ui.put(
+                title_rect,
+                egui::Label::new(format!("{}. {}", self.ordinal, self.title))
+                    .truncate()
+                    .halign(egui::Align::Min),
+            );
+            let meta_rect =
+                egui::Rect::from_min_size(rect.min + vec2(0.0, THUMB_H + 21.0), vec2(TILE_W, 13.0));
+            ui.put(
+                meta_rect,
+                egui::Label::new(egui::RichText::new(self.meta).color(theme::MUTED))
+                    .truncate()
+                    .halign(egui::Align::Min),
+            );
+        });
+
+        // Hover: the path always; a failed decode adds its reason
+        // (T8) — the placeholder explains itself, never a banner.
+        match self.failure {
+            Some(reason) => response.on_hover_text(format!("{}\n{}", self.path, reason)),
+            None => response.on_hover_text(self.path),
+        }
+    }
 }
 
 /// One notice for a batch of rejected adds — the same words the CLI
@@ -1115,6 +1498,36 @@ mod tests {
     }
 
     #[test]
+    fn resync_after_connect_carries_the_initial_library() {
+        let mut app = CascadeApp::detached();
+        // The daemon already has items when this window opens; events
+        // carry changes, never the initial list (ipc.md §6).
+        assert!(
+            app.poll_carries_library(),
+            "the first poll always fetches the library"
+        );
+
+        // If the event thread wins the race before that poll is sent,
+        // the resync still has to carry library.list (P4-S2: the UI
+        // opened with 0 videos while the daemon had 17).
+        app.apply(Reply::EventsLive(true));
+        assert!(
+            app.poll_carries_library(),
+            "a live stream owes exactly one full poll"
+        );
+
+        app.apply(snapshot(Some(items_data(vec![item("aa11")]))));
+        assert_eq!(app.library.len(), 1, "the resync fills the grid");
+        assert!(
+            !app.poll_carries_library(),
+            "after the resync the events own the list"
+        );
+        // A duplicate `true` must not owe a second library fetch.
+        app.apply(Reply::EventsLive(true));
+        assert!(!app.poll_carries_library());
+    }
+
+    #[test]
     fn log_events_surface_once_and_never_stack() {
         let mut app = CascadeApp::detached();
         app.apply(Reply::Event(event(
@@ -1161,5 +1574,58 @@ mod tests {
         });
         assert!(app.library.is_empty());
         assert_eq!(app.selected, None);
+    }
+
+    // --- design-m5-p4 §11: search + thumbnail state ---------------------
+
+    #[test]
+    fn search_matches_title_and_path_case_insensitively() {
+        let mut clip = item("aa11");
+        clip.title = "Furina Midnight".to_string();
+        assert!(matches_query(&clip, ""), "an empty query matches all");
+        assert!(matches_query(&clip, "   "), "a blank query matches all");
+        assert!(matches_query(&clip, "furina"), "title, lower-case needle");
+        assert!(matches_query(&clip, "FURINA"), "title, upper-case needle");
+        assert!(matches_query(&clip, "videos"), "path substring");
+        assert!(!matches_query(&clip, "ganyu"), "no false match");
+    }
+
+    #[test]
+    fn adopting_a_new_list_syncs_the_thumbnail_state() {
+        let mut app = CascadeApp::detached();
+        app.set_library(vec![item("aa11"), item("bb22")], false);
+        app.thumb_failed
+            .insert("bb22".to_string(), "codec".to_string());
+        app.thumb_pending.insert("bb22".to_string());
+
+        // Same id set: a refresh must not wipe the failure reasons (a
+        // poll repeats the same list every second).
+        app.set_library(vec![item("aa11"), item("bb22")], false);
+        assert!(app.thumb_failed.contains_key("bb22"));
+        assert!(app.thumb_pending.contains("bb22"));
+
+        // Id set changed: failures clear and requests for gone ids are
+        // dropped — a fresh id gets exactly one fresh attempt (T9).
+        app.set_library(vec![item("aa11"), item("cc33")], false);
+        assert!(app.thumb_failed.is_empty());
+        assert!(!app.thumb_pending.contains("bb22"));
+    }
+
+    #[test]
+    fn engine_down_drops_the_thumbnail_state_too() {
+        let mut app = CascadeApp::detached();
+        app.set_library(vec![item("aa11")], false);
+        app.thumb_failed
+            .insert("aa11".to_string(), "boom".to_string());
+        app.apply(Reply::Snapshot {
+            status: Err(ClientError::NotRunning),
+            library: None,
+            settings: Err(ClientError::NotRunning),
+        });
+        assert!(app.library.is_empty());
+        assert!(
+            app.thumb_failed.is_empty(),
+            "a dead engine leaves no stale thumbnail state"
+        );
     }
 }

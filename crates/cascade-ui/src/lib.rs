@@ -9,6 +9,9 @@
 mod app;
 mod dialog;
 mod theme;
+/// Thumbnail worker: disk cache, decode thread, texture LRU
+/// (design-m5-p4 §11). UI-process only — the daemon never links it.
+mod thumbs;
 
 use eframe::egui;
 
