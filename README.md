@@ -75,6 +75,12 @@ icon with a small menu — **Open Cascade / Pause / Quit**. Every entry is a
 thin wrapper over the commands above (`ui`, `pause`/`resume`, `stop`);
 `settings set tray false` hides the icon while the daemon keeps running.
 
+`cascade install` also writes two per-user shortcuts — **Start Menu →
+Programs\Cascade.lnk** and **Desktop\Cascade.lnk** — so Cascade is found by
+Start search and can be opened from the Desktop. Both point at the installed
+`cascade.exe ui` (the same GUI path as `cascade ui`). `cascade uninstall`
+removes exactly those two files and nothing else.
+
 ---
 
 ## Measured baseline (M0, mpv harness)
@@ -205,7 +211,9 @@ cascade uninstall [--purge]
 ```
 
 One command reverses every install step: it stops the engine, turns autostart
-off, removes the `bin` shim directory from your user PATH, deletes the shim and
+off, deletes the Start Menu and Desktop `Cascade.lnk` shortcuts (exactly those
+two names — any other `.lnk`, even one named similarly, is left alone), removes
+the `bin` shim directory from your user PATH, deletes the shim and
 the installed copy (if the copy is the running image, a small helper in `%TEMP%`
 finishes the delete right after it exits), and removes Cascade's own files from
 `%LOCALAPPDATA%\Cascade`. `library.json` and `state.json` are kept unless you
