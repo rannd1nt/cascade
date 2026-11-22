@@ -89,8 +89,9 @@ pub(crate) const MF_SOURCE_READER_ALL_STREAMS: u32 = 0xFFFFFFFF;
 pub(crate) const MF_SOURCE_READER_FIRST_VIDEO_STREAM: u32 = 0xFFFFFFFC;
 
 // Stream flags returned by ReadSample, not exposed as named items.
-const MF_SOURCE_READER_FLAG_END_OF_STREAM: u32 = 0x2;
-const MF_SOURCE_READER_FLAG_ERROR: u32 = 0x8;
+// `pub(crate)`: the thumbnail reader (thumbnail.rs) checks the same flags.
+pub(crate) const MF_SOURCE_READER_FLAG_END_OF_STREAM: u32 = 0x2;
+pub(crate) const MF_SOURCE_READER_FLAG_ERROR: u32 = 0x8;
 
 // H.264 / AVC is the only codec Cascade ships support for in v1. Everything
 // else is rejected with a clear, actionable message. The probe below checks
@@ -1343,6 +1344,14 @@ fn open_reader(source: &Path, e3: Option<E3Request<'_>>) -> Result<IMFSourceRead
     Ok(reader)
 }
 
+/// Open the file for a CPU-side one-frame consumer (the thumbnail
+/// reader, design-m5-p4 §11): video stream selected, no D3D manager,
+/// no output negotiation — the caller negotiates its own output type.
+/// `pub(crate)` wrapper so `E3Request` stays private.
+pub(crate) fn open_reader_plain(source: &Path) -> Result<IMFSourceReader, String> {
+    open_reader(source, None)
+}
+
 /// Seek to the start of the stream (media time 0, units of 100 ns).
 ///
 /// The `PROPVARIANT` must be `VT_I8`: a `VT_EMPTY` value returns S_OK but
@@ -1363,7 +1372,8 @@ fn seek_start(reader: &IMFSourceReader) -> Result<(), String> {
 
 /// Read `MF_MT_FRAME_SIZE` (UINT64: width in the high dword) from the
 /// native media type of the first video stream.
-fn query_frame_size(reader: &IMFSourceReader) -> windows::core::Result<(u32, u32)> {
+/// `pub(crate)`: the thumbnail reader negotiates RGB32 at native size.
+pub(crate) fn query_frame_size(reader: &IMFSourceReader) -> windows::core::Result<(u32, u32)> {
     // SAFETY: stream/type indices are the documented defaults for a file
     // with a single video stream; MF owns the returned media type.
     let mt = unsafe { reader.GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0) }?;
@@ -1415,7 +1425,10 @@ fn subtype_name(mt: &IMFMediaType) -> String {
 ///
 /// Only NV12 is supported by the CPU converter; anything else is a hard
 /// error so the daemon log shows exactly what happened.
-fn negotiate_nv12(reader: &IMFSourceReader) -> Result<(), String> {
+/// `pub(crate)`: the thumbnail reader (thumbnail.rs) uses the same
+/// proven output type (design-m5-p4 §11 T3 amendment — RGB32 is a
+/// measured dead end on this machine, rnd-tier2-step5 D.3).
+pub(crate) fn negotiate_nv12(reader: &IMFSourceReader) -> Result<(), String> {
     // SAFETY: plain COM object creation.
     let mt = unsafe { MFCreateMediaType() }
         .map_err(|err| format!("MFCreateMediaType: {}", err.message()))?;
@@ -1460,7 +1473,16 @@ pub(crate) fn create_dxgi_device_manager(
 /// With advanced video processing enabled the reader inserts MF's video
 /// processor (XVP): YUV→RGB conversion and the resize both run on the GPU,
 /// so the CPU only ever copies or forwards the finished frame.
-fn negotiate_rgb32(reader: &IMFSourceReader, out_w: u32, out_h: u32) -> Result<(), String> {
+/// The video processor needs a frame rate: copy it from the native type.
+/// A missing native rate is tolerated — the reader may still accept the
+/// type without it.
+/// `pub(crate)`: the thumbnail reader (thumbnail.rs) reuses it at native
+/// size (design-m5-p4 §11 T3).
+pub(crate) fn negotiate_rgb32(
+    reader: &IMFSourceReader,
+    out_w: u32,
+    out_h: u32,
+) -> Result<(), String> {
     // SAFETY: plain COM object creation.
     let mt = unsafe { MFCreateMediaType() }
         .map_err(|err| format!("MFCreateMediaType: {}", err.message()))?;
@@ -1500,7 +1522,9 @@ fn negotiate_rgb32(reader: &IMFSourceReader, out_w: u32, out_h: u32) -> Result<(
 /// A tight buffer holds exactly `out_w * 4 * out_h` bytes; padded buffers
 /// are a whole number of `out_h` rows of at least `out_w * 4` bytes.
 /// Returns `None` when the size cannot cover the surface.
-fn rgb32_stride(buf_len: usize, out_w: usize, out_h: usize) -> Option<usize> {
+/// `pub(crate)`: the thumbnail reader validates its locked buffer the same
+/// way (design-m5-p4 §11).
+pub(crate) fn rgb32_stride(buf_len: usize, out_w: usize, out_h: usize) -> Option<usize> {
     if out_w == 0 || out_h == 0 {
         return None;
     }
@@ -2296,7 +2320,8 @@ fn create_staging(
 ///
 /// Returns `video_h` when the buffer size does not divide into whole NV12
 /// frames at `video_w` (unknown layout -> assume tight packing).
-fn nv12_alloc_height(buf_len: usize, video_w: usize, video_h: usize) -> usize {
+/// `pub(crate)`: the thumbnail reader derives its UV offset the same way.
+pub(crate) fn nv12_alloc_height(buf_len: usize, video_w: usize, video_h: usize) -> usize {
     let half_row = video_w * 3 / 2;
     let alloc_h = if half_row > 0 && buf_len.is_multiple_of(half_row) {
         buf_len / half_row
@@ -2317,8 +2342,10 @@ fn nv12_alloc_height(buf_len: usize, video_w: usize, video_h: usize) -> usize {
 /// # Safety
 /// `src` must hold at least `uv_plane_offset + video_w * video_h / 2`
 /// readable bytes and `dst` must hold `out_h` rows of `row_pitch` bytes.
+/// `pub(crate)`: the thumbnail reader (thumbnail.rs) reuses this
+/// unit-tested converter (design-m5-p4 §11 T3).
 #[allow(clippy::too_many_arguments)]
-unsafe fn convert_nv12_to_bgr8(
+pub(crate) unsafe fn convert_nv12_to_bgr8(
     src: *const u8,
     dst: *mut u8,
     row_pitch: usize,

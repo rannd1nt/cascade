@@ -25,6 +25,12 @@ cascade-ui = { path = "crates/cascade-ui" }
 # "persistence" restores the window size across launches (design-m5 D4)
 # into %APPDATA%\Cascade\data\app.ron — inside our own data directory.
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence"] }
+# design-m5 P4-S2 / design-m5-p4 §11 T2: JPEG encode/decode for library
+# thumbnails. Already in Cargo.lock via eframe (which pulls it with the
+# `png` feature only); enabling `jpeg` adds zune-core + zune-jpeg — both
+# MIT OR Apache-2.0 (license check, AGENTS §11). Pure Rust, no GPL, and
+# the daemon never calls it (thumbnails decode in the UI process only).
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

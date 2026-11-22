@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 cascade-core = { workspace = true }
+# design-m5-p4 §11 T2: JPEG encode/decode for the thumbnail cache (first
+# frame → RGB → JPEG). MIT OR Apache-2.0; called by cascade-ui only — the
+# daemon never links a decode *call path* (isolation DoD, §11.5 V6).
+image = { workspace = true }
 # Media Foundation COM bindings (design-m2 §2.3): windows-sys ships no MF
 # APIs. License MIT OR Apache-2.0, same as the rest of the workspace.
 windows = { workspace = true, features = [
