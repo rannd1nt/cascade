@@ -7,17 +7,12 @@ after a reboot, and never touches your files.
 
 No WebView2. No Electron. No bundled mpv/ffmpeg. One small executable.
 
-> **Status (2026-11-12):** M0–M4 measured complete (S7 evidence:
-> `docs/design-m4.md` §8.7); **M5 in progress — P1 (CLI foundation) and
-> P2 (GUI MVP) shipped and verified on target**: `run --detached`,
-> ordinal `library ls` / `set <n>` / `library rm <n>`, `stop`
-> (`P1-VERIFY: ALL PASS`, 38 checks), and the GUI (`cascade ui`): add /
-> remove / set a video through the native file dialog, Start-engine when
-> the daemon is down, window geometry persistence, and **0 MB** measured
-> impact on the daemon while the window is open (`docs/design-m5.md`
-> §14). The daemon plays H.264 behind the icons, is fully
-> controllable over a named pipe, `cascade install` puts `cascade` on
-> your PATH, and every exit path restores the desktop.
+> **Status (2026-11-23):** M0–M5, M5b and the M5-P4 surfaces S1–S4 are
+> implemented. S4 (Monitors) is pending target-machine verification. The daemon
+> plays H.264 behind the icons, is fully controllable over a named pipe, and
+> every exit path restores the desktop. Remaining milestones are M6 (hardening
+> and release) and M7 (compatibility verification). Internal design notes are
+> local-only and are not distributed with this repository.
 
 ---
 
@@ -25,20 +20,22 @@ No WebView2. No Electron. No bundled mpv/ffmpeg. One small executable.
 
 - **Video only.** MP4/MKV/MOV with H.264 8-bit 4:2:0 ≤ 1080p60, decoded by Windows Media Foundation. Other codecs (HEVC, VP9, AV1, HDR, 10-bit) are rejected with a clear message — no silent fallback.
 - **Windows 11 only.** One platform, one desktop-host path, no legacy branches.
-- **Cross-GPU.** Developed on Intel UHD iGPU; D3D11 hardware selection adapts to dedicated GPU (NVIDIA/AMD) when present.
+- **Vendor-agnostic.** Generic D3D11 and Media Foundation APIs only — no vendor-specific decode path. Windows selects the adapter; behaviour across GPU vendors is not yet verified.
 - **Any monitor size, any video resolution, any video FPS.** Swapchain is created per-monitor; `ID3D11VideoProcessor` handles scaling. Higher resolution/FPS costs more compute — expected, not a regression.
 - **Runs behind the icons.** A child window of the desktop's wallpaper surface, not an overlay, not a second desktop, not a hook.
 - **A tiny daemon plus an optional UI.** The wallpaper engine keeps running when the app window is closed.
 - **Your library, not your files.** Adding a video stores its path. Nothing is copied, moved, or deleted.
 - **Comes back after reboot.** Autostart that waits for the shell, a persisted selection, and a watchdog that repairs the desktop after a crash or an Explorer restart.
-- **MIT OR Apache-2.0.** No GPL anywhere in the shipped binary.
+- **GPL-3.0-only.** No third-party GPL/LGPL code in the shipped binary.
 
 ## What it is not
 
 | Not doing | Why |
 |---|---|
 | HTML / WebView2 / JavaScript wallpapers | A browser runtime is the thing we are avoiding |
-| Bundling mpv or ffmpeg | GPL, size, and a second process to babysit |
+| Bundling mpv or ffmpeg | Third-party licence obligations, size, and a second process to babysit |
+| Built-in transcode / `convert` | Withdrawn: Cascade plays the file as-is; convert it externally if you need lighter playback |
+| Automatic backend download / install | Deferred and out of v0.1.0: no product network call, no auto-installed ffmpeg |
 | Audio | A wallpaper should be silent |
 | Windows 10 | A second host code path for no benefit |
 | Marketplace, accounts, cloud, telemetry | Local files only |
@@ -59,7 +56,7 @@ cascade set <n> | <file> | --id <id>       # play a library row (n = the number 
 cascade library ls | add <path> | rm <n> | prune
 cascade settings get | set <key> <value>
 cascade autostart on | off | status
-cascade ui                                 # open the library window (alias --ui)
+cascade ui                                 # open the GUI: Library / Settings (alias --ui)
 cascade doctor                             # no daemon needed
 ```
 
@@ -106,7 +103,7 @@ These are mpv numbers, not Cascade's. Two conclusions shaped the design:
 1. Decode is essentially free; **composition is the cost**, and pausing is the only real
    battery lever.
 2. High-quality scaling is not worth it on this GPU. **Balanced is the default**;
-   `Quality` is opt-in with a warning. See [`docs/quality.md`](docs/quality.md).
+   `Quality` is opt-in with a warning. See the internal quality notes.
 
 ## The safety promise
 
@@ -120,7 +117,7 @@ A wallpaper app must never eat the wallpaper. Cascade:
 - reattaches within ~5 seconds if Explorer restarts;
 - pauses when the desktop is not visible (fullscreen, lock, display off).
 
-Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
+Full contract and test procedures live in the internal reliability notes.
 
 ## Known limitations
 
@@ -140,7 +137,8 @@ Full contract and test procedures: [`docs/reliability.md`](docs/reliability.md).
   expensive one. "No re-encoding, no bit-depth loss, correct colour" is the promise —
   not "pixel-identical to 1080p".
 - HDR is detected and reported, not tone-mapped (v1).
-- HEVC / VP9 / AV1 / HDR / 10-bit are rejected in v1 with a clear message — only H.264 8-bit 4:2:0 ≤ 1080p60 is supported.
+- **Hardware coverage is generic, not exhaustively verified.** D3D11 requests feature level 11 and lets Windows pick the adapter — no adapter pinning, no lower-feature-level or software fallback. There is no `WM_DPICHANGED` handler, and `hwdec` is omitted unless a hardware MFT explicitly registers H.264. Intel/AMD/NVIDIA iGPU and dGPU, mixed-DPI, mixed-refresh and no-audio machines are untested outside the development box (`docs/design-m7-p0-honesty.md` §8).
+- HEVC / VP9 / AV1 / HDR / 10-bit are rejected in v1 with a clear message — only H.264 8-bit 4:2:0 ≤ 1080p60 is supported. Cascade does not convert them; convert externally yourself. OS-extension and optional-backend handling is deferred and not in v0.1.0.
 - A clip looping has a visible seam; crossfade is not in v1.
 - **Frame-server colour fix costs CPU and RAM.** The default engine mode presents
   through a CPU staging bridge between two D3D11 devices (needed so MF honours the
@@ -202,14 +200,14 @@ Run the resulting `.exe` from Windows. Release artifacts are built by GitHub Act
 
 ## Documentation
 
-| File | Contents |
-|---|---|
-| [`docs/architecture.md`](docs/architecture.md) | system shape, crates, contracts, milestones |
-| [`docs/reliability.md`](docs/reliability.md) | lifecycle, restore, autostart, watchdog, M1 gates |
-| [`docs/quality.md`](docs/quality.md) | pipeline, profiles, what "no loss" means |
-| [`docs/ipc.md`](docs/ipc.md) | daemon/client protocol |
-| [`docs/spike-m0.md`](docs/spike-m0.md) | environment, commands, measurements, findings |
-| [`AGENTS.md`](AGENTS.md) | development workflow and hard rules |
+`AGENTS.md` in this repository is the development workflow and hard rules.
+
+Internal design, measurement and spike notes are **local-only companion files**;
+they are not part of this repository and are not distributed with a release.
+They cover the system shape (`architecture.md`), lifecycle (`reliability.md`),
+pipeline and profiles (`quality.md`), wire protocol (`ipc.md`) and measured
+findings (`spike-m0.md`). `AGENTS.md` records the read order for contributors
+who have them.
 
 ## Uninstall
 
@@ -231,5 +229,6 @@ Your videos are untouched — they were never copied or modified.
 
 ## License
 
-MIT OR Apache-2.0, at your option. `LICENSE-MIT` and `LICENSE-APACHE` are added at the
-first release.
+GPL-3.0-only. See [`LICENSE`](LICENSE). Cascade itself is GPL-3.0-only; no third-party
+GPL/LGPL dependency is compiled into the shipped binary. Third-party dependencies keep
+their own licences and are checked before release.

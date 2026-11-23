@@ -5,6 +5,12 @@ Instructions for anyone (human or agent) working on Cascade.
 **Read order:** this file → `docs/architecture.md` → `docs/reliability.md` →
 `docs/quality.md` → `docs/ipc.md` → `docs/spike-m0.md`.
 
+**Internal design notes are local-only and are not distributed with this
+repository.** They live in a companion directory registered in OpenCode as the
+`cascade-docs` reference. Every `docs/...` path in this file is relative to that
+reference root, not to this checkout; a fresh clone is expected to have none of
+them. Keep this file as the single committed entry point.
+
 If a rule here conflicts with a design doc, this file wins on *process*, and
 `docs/architecture.md` wins on *design*. If code conflicts with docs, the code is
 probably wrong — or the docs must be updated in the same commit.
@@ -15,9 +21,15 @@ probably wrong — or the docs must be updated in the same commit.
 
 A native, single-executable video live-wallpaper engine for Windows 11. Plays the user's
 own video files behind the desktop icons using Media Foundation + D3D11. No WebView2, no
-Electron, no bundled mpv/ffmpeg, no GPL.
+Electron, no bundled mpv/ffmpeg, no third-party GPL/LGPL code in the shipped binary
+(Cascade itself is GPL-3.0-only; see `LICENSE`). The default backend is Media Foundation
+only: unusual codecs are the user's trade-off — convert them externally, install an OS
+codec extension, or (later, if re-scoped) install an optional backend. Nothing is
+downloaded or installed by Cascade in v0.1.0.
 
-Current state: **docs complete, M0 complete, implementation starts at M1.**
+Current state: **M0–M5, M5b and M5-P4 S1–S4 are implemented; S4 (Monitors) is
+pending the user's target-machine verification. M6 (hardening/release) and M7
+(compatibility verification) remain.**
 
 The app has three roles in one binary:
 
@@ -70,13 +82,23 @@ Do **not** build any of this unless the user explicitly re-scopes:
   video track's volume above is in scope; no audio features beyond it).
 - Windows 10 support, cross-platform abstractions, mobile.
 - Marketplace, accounts, cloud sync, telemetry, auto-update.
-- Plugin systems, scripting, custom codec packs.
+- Plugin systems, scripting, custom codec packs, optional user-installed backends
+  (ffmpeg or other binaries), product-side backend download/auto-install. **DEFERRED**:
+  out of v0.1.0, never bundled, and needing an explicit re-scope before any code.
 - Playlist rotation, tags, collections, a video preview player, themes (v1.1 at the
   earliest).
 - A custom file browser. Use the native `IFileOpenDialog`.
 
 The GUI is in scope, but only the four surfaces in `docs/architecture.md` §9. If a UI
 idea does not fit one of them, it is a v1.1 idea.
+
+v0.1.0 status of the codec work (`docs/design-m5-p4-codec-conversion.md` §12.6):
+built-in `convert`, copy/replace/retranscode, conversion overlays and the Compatibility
+page are **WITHDRAWN** — not deferred plans. OS-extension display, optional
+user-installed backends, backend download/auto-install and the Settings
+codec-prerequisite block are **DEFERRED**. The Monitors surface (S4) was implemented
+2026-11-22 and is pending the user's target-machine verification; it was held, not
+cancelled.
 
 ---
 
@@ -91,8 +113,10 @@ idea does not fit one of them, it is a v1.1 idea.
 4. **The daemon must not depend on the UI.** Separate processes; the daemon's memory and
    behaviour are unchanged when the UI is open or closed. The daemon path must not
    initialize egui/wgpu.
-5. **No GPL/LGPL code in the shipped binary.** Dev-only tooling is acceptable behind a
-   non-default feature, excluded from release artifacts. Check licenses before coding.
+5. **No third-party GPL/LGPL code in the shipped binary.** Cascade itself is
+   GPL-3.0-only (`LICENSE`). Dev-only tooling is acceptable behind a non-default feature,
+   excluded from release artifacts. Check licences before coding; an optional external
+   backend is never bundled or linked in v0.1.0.
 6. **No mpv/ffmpeg binaries committed or bundled.** mpv is a local dev harness only.
 7. **No injection or hooking.** No global `SetWindowsHookEx`, no remote threads, no DLL
    injection, no patching Explorer.
@@ -137,6 +161,10 @@ idea does not fit one of them, it is a v1.1 idea.
     running" verdict. Never add a file watcher on `config.toml`/`library.json`,
     never start the daemon from a read command, and never write a file behind
     a possibly-live daemon (`docs/design-m5b.md` §3).
+
+A future product-side backend downloader/auto-installer remains **DEFERRED** and would
+have to amend §§2, 3.8, 3.9, 3.10 and 3.12 explicitly. It is not a hidden exception to
+those rules and is not part of v0.1.0 (`docs/design-m5-p4-codec-conversion.md` §12.5).
 
 ---
 
