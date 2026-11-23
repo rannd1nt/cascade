@@ -1,4 +1,4 @@
-//! Power-source collector (design-m4 §2.6, D8/D9, slice S2b).
+//! Power-source collector (slice ).
 //!
 //! Two halves:
 //!
@@ -12,9 +12,9 @@
 //!   to the main loop (atomics, like the session-lock flags in
 //!   [`crate::control`]).
 //!
-//! The collector exists **only while `on_battery != off`**: at the D8
+//! The collector exists **only while `on_battery != off`**: at the
 //! default the daemon never calls `GetSystemPowerStatus` and never
-//! subscribes to power events (design-m4 D8).
+//! subscribes to power events.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -32,11 +32,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_WINDOW_HANDLE;
 use crate::{derr, dlog};
 
 /// A raw source sample must stay unchanged for this long before the
-/// collector publishes it (design-m4 §2.6): kills flapping (C4) and makes
+/// collector publishes it: kills flapping (C4) and makes
 /// a manual `resume` hold until the next *confirmed* transition (C3).
 pub const HYSTERESIS: Duration = Duration::from_secs(3);
 
-/// The confirmed state of the AC↔battery source (design-m4 §2.6).
+/// The confirmed state of the AC↔battery source.
 ///
 /// Pure: samples and timestamps go in, the published state comes out. The
 /// caller owns the instance (the daemon's main loop) and feeds it from
@@ -85,13 +85,13 @@ impl Hysteresis {
 
     /// True while a raw candidate is waiting out its stability window.
     /// The listener arms its one-shot `SetTimer` only in this state
-    /// (`design-m5b.md` §4.2 — steady state has zero timers).
+    /// (steady state has zero timers).
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
 
     /// Publish `raw` as the confirmed state with no stability window
-    /// (`design-m5b.md` §4.2). The listener uses this instead of
+    /// The listener uses this instead of
     /// [`observe`](Self::observe): it only exists *because* the source is
     /// already on battery, so there is nothing to wait for — and a seeded
     /// candidate would leave `confirmed` on AC for the first 3 s, a window
@@ -102,7 +102,7 @@ impl Hysteresis {
         self.pending = None;
     }
 
-    /// Drop everything: the collector was disabled (D8) or the daemon is
+    /// Drop everything: the collector was disabled or the daemon is
     /// resetting. The next enable seeds a fresh state from the hardware.
     pub fn reset(&mut self) {
         self.confirmed = false;
@@ -110,16 +110,16 @@ impl Hysteresis {
     }
 }
 
-/// What the collector must do about the engine right now (design-m4 §2.6).
+/// What the collector must do about the engine right now.
 ///
 /// Pure so the unload/reload decision is unit-tested without a host
 /// window. `Reload` never loads in this process: the daemon respawns so
-/// the child gets flat memory (design-m4 §8.3 — a second load pipeline
+/// the child gets flat memory (a second load pipeline
 /// would retain ~50 MB until process exit).
 ///
-/// The consumer of [`Reconcile::Unload`] changed in `design-m5b.md` §4.4
-/// (T2): `power_step` maps it to the existing `power_respawn` exit ladder
-/// — repaint the real wallpaper, respawn, and let the child land in the
+/// The consumer of [`Reconcile::Unload`] changed in
+/// `power_step` maps it to the existing `power_respawn` exit ladder
+/// repaint the real wallpaper, respawn, and let the child land in the
 /// battery listener — instead of an in-place unload. The pure meaning is
 /// untouched: "the engine must go away".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,8 +127,8 @@ pub enum Reconcile {
     /// Nothing to do; the rules may still need a re-evaluate.
     Nothing,
     /// `on_battery=stop` on battery with a loaded engine: it must go away.
-    /// Consumed by `power_step` as an exit-ladder + respawn (`design-m5b.md`
-    /// §4.4 T2), never as an in-place unload.
+    /// Consumed by `power_step` as an exit-ladder + respawn (
+    /// never as an in-place unload.
     Unload,
     /// The video should be present but the engine is unloaded: respawn.
     Reload,
@@ -143,7 +143,7 @@ pub enum Reconcile {
 /// situation — an `on_battery=stop` unload — so `Reload` can never fight
 /// a failed load or a cleared wallpaper into a respawn loop: every load
 /// failure clears `state.video` before the next tick (`daemon.rs` startup
-/// load, `wallpaper.set`, `wallpaper.clear`), and `design-m5b.md` §4.4 T2
+/// load, `wallpaper.set`, `wallpaper.clear`), and
 /// makes the unload leave the process instead of flipping `loaded` in
 /// place.
 pub fn reconcile(
@@ -185,8 +185,8 @@ pub fn take_raw() -> Option<bool> {
     }
 }
 
-/// Sentinel error [`register`] returns when the M9 forced-failure hook is
-/// set (`design-m5b.md` §4.10 M9 / B7): a fake code no Win32 call would
+/// Sentinel error [`register`] returns when the forced-failure hook is
+/// set: a fake code no Win32 call would
 /// ever produce, so the log line is obviously a test.
 pub const REGISTER_FAIL_SENTINEL: u32 = 0xDEAD_0001;
 
@@ -199,8 +199,8 @@ pub const REGISTER_FAIL_SENTINEL: u32 = 0xDEAD_0001;
 /// keep pumping messages — the OS delivers `WM_POWERBROADCAST` to it
 /// until [`unregister`] runs or the window is destroyed.
 pub unsafe fn register(hwnd: HWND) -> Result<isize, u32> {
-    // M9 forced-failure hook (design-m5b §4.10, precedent `CASCADE_GATE`):
-    // dev-only manual verification of the T8 fail-open path — the listener
+    // forced-failure hook (precedent `CASCADE_GATE`):
+    // dev-only manual verification of the fail-open path — the listener
     // refuses to become a listener and the full daemon runs with the
     // collector off. Never set in production; no product behaviour depends
     // on this variable.
@@ -228,7 +228,7 @@ pub fn unregister(handle: isize) {
     let _ = unsafe { UnregisterPowerSettingNotification(handle) };
 }
 
-/// The one seed read (design-m4 D8: only ever called while the user has
+/// The one seed read : only ever called while the user has
 /// opted in). `None` means "no honest answer" — an unknown AC status
 /// (255) or a failed call — and the collector then waits for the first
 /// event instead of guessing.
@@ -272,7 +272,7 @@ pub unsafe fn record_broadcast(lparam: LPARAM) {
     // read_unaligned tolerates the byte offset.
     let value = unsafe { (setting.Data.as_ptr() as *const u32).read_unaligned() };
     // Log every payload before parsing: a *dropped* value is invisible
-    // downstream, and §9 evidence (build 26200.9711) shows the OS can
+    // downstream, and evidence (build 26200.9711) shows the OS can
     // deliver a stale or surprising value at a plug — the raw number is
     // what makes that diagnosable from a redirected stdout.
     match source_from_dword(value) {
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn hysteresis_seed_publishes_immediately_with_no_window() {
-        // design-m5b §4.2: the listener seeds from `read_source()` — it
+        // the listener seeds from `read_source()` — it
         // exists because the source is already battery, so a candidate
         // would leave `confirmed` on AC for 3 s and swallow a real AC
         // event inside that window (it would read as "already AC").

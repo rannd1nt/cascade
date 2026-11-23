@@ -1,16 +1,16 @@
 //! Named-pipe **client** transport for the control protocol
-//! (`docs/ipc.md` §1 and §7).
 //!
-//! Moved here from `cascade-win` (design-m5 D10): `cascade-ui` must be
+//!
+//! Moved here from `cascade-win`: `cascade-ui` must be
 //! able to reach the daemon **without** depending on `cascade-win`
-//! (AGENTS §4; `architecture.md` §3 — `cascade-ui ──▶ core, media,
+//! (; — `cascade-ui ──▶ core, media,
 //! never win`). The pipe **server** stays in `cascade-win`: it owns the
 //! pipe thread, the `WM_APP_PIPE` wakeup and the snapshot channel —
 //! daemon plumbing the UI never needs.
 //!
 //! One request is one JSON line out and one JSON line in: bounded connect
 //! retries (2 s budget) and a 2 s response deadline, so a wedged daemon
-//! can never hang a client forever (`ipc.md` §7).
+//! can never hang a client forever.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -27,15 +27,15 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use crate::ipc::{self, encode_line, no_data, DecodeError, MAX_LINE_BYTES, PIPE_PREFIX};
 use crate::PROTOCOL_VERSION;
 
-/// Client-side bounds (`ipc.md` §7): 2 s connect budget with retries, 2 s
+/// Client-side bounds: 2 s connect budget with retries, 2 s
 /// for the response line.
 const CONNECT_ATTEMPTS: u32 = 3;
 const CONNECT_PAUSE: Duration = Duration::from_millis(250);
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(2);
 const PEEK_POLL: Duration = Duration::from_millis(25);
 
-/// `\\.\pipe\cascade-ctl-{session_id}` (`ipc.md` §1). Machine-global
-/// namespace → branded prefix (design-m4 §2.5). Shared by the client and
+/// `\\.\pipe\cascade-ctl-{session_id}`. Machine-global
+/// namespace → branded prefix. Shared by the client and
 /// the server (which lives in `cascade-win`), so both sides always agree
 /// on the name.
 pub fn server_name() -> String {
@@ -47,7 +47,7 @@ pub fn server_name() -> String {
 }
 
 /// Why a CLI/GUI request failed. Messages are English and say what to do
-/// next (`ipc.md` §8).
+/// next.
 #[derive(Debug)]
 pub enum ClientError {
     /// No pipe exists for this session: the daemon is not running.
@@ -91,7 +91,7 @@ impl std::fmt::Display for ClientError {
 
 /// Request id: unique per request **and** per process. The pipe thread
 /// matches responses by id and drops stale ones, so two CLI invocations
-/// must never collide on the same number (design-m4 §2.2).
+/// must never collide on the same number.
 fn next_request_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let slot = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -101,7 +101,7 @@ fn next_request_id() -> u64 {
     (pid << 32) | (slot & 0xFFFF_FFFF)
 }
 
-/// Send one command and return its `data` payload (`ipc.md` §7: bounded
+/// Send one command and return its `data` payload : bounded
 /// connect retries, one line each way).
 pub fn request(cmd: &str, data: serde_json::Value) -> Result<serde_json::Value, ClientError> {
     let name = to_wide(&server_name());
@@ -137,7 +137,7 @@ pub fn request(cmd: &str, data: serde_json::Value) -> Result<serde_json::Value, 
     result
 }
 
-/// `\\.\pipe\cascade-evt-{session_id}` (`ipc.md` §1, design-m5-p4 §3).
+/// `\\.\pipe\cascade-evt-{session_id}`.
 /// Same session suffix as [`server_name`] so both sides always agree.
 pub fn event_server_name() -> String {
     let mut session: u32 = 0;
@@ -147,22 +147,22 @@ pub fn event_server_name() -> String {
     format!("{}{session}", crate::ipc::EVENT_PIPE_PREFIX)
 }
 
-/// A held-open subscription to the daemon's event stream (`ipc.md` §6).
+/// A held-open subscription to the daemon's event stream.
 ///
 /// Server→client only: the client never writes, so the handle is opened
 /// with `GENERIC_READ` against the server's outbound instance. One
-/// request is one JSON line in (`ipc.md` §2); unlike [`request`], there
+/// request is one JSON line in; unlike [`request`], there
 /// is **no response deadline** — the stream is read by a dedicated
 /// thread that may legitimately wait hours for the next event, and a
 /// dead daemon shows up as a read error the caller reconnects from
-/// (design-m5-p4 §5).
+///
 pub struct EventStream {
     handle: HANDLE,
 }
 
 impl EventStream {
     /// Connect to the event pipe with the same bounded connect budget as
-    /// [`request`] (2 s total, `ipc.md` §7).
+    /// [`request`] (2 s total).
     pub fn open() -> Result<Self, ClientError> {
         let name = to_wide(&event_server_name());
         let handle = connect(&name, GENERIC_READ)?;
@@ -171,7 +171,7 @@ impl EventStream {
 
     /// Block until the next event line arrives. Errors mean the stream
     /// is over (daemon exited, pipe broken, protocol disagreement) —
-    /// the caller reconnects and resyncs statelessly (`ipc.md` §7).
+    /// the caller reconnects and resyncs statelessly.
     pub fn read_event(&mut self) -> Result<ipc::Event, ClientError> {
         let mut pending: Vec<u8> = Vec::new();
         let mut buf = [0u8; 4096];
@@ -345,7 +345,7 @@ fn decode_response_line(line: &str) -> Result<ipc::Response, ClientError> {
 /// Encode a Rust string as a NUL-terminated UTF-16 buffer — the form
 /// `CreateFileW` expects. A private copy of `cascade_win::wide::to_wide`:
 /// `cascade-core` must not expose a Win32 helper module for one call site
-/// (design-m5 D10).
+///
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

@@ -36,7 +36,7 @@ impl std::fmt::Display for OsInfo {
         }
         write!(f, " (build {})", self.build_string())?;
         if let Some(p) = &self.product_name {
-            // Windows 11 keeps reporting "Windows 10 ..." in this value; only
+            // Windows 11 keeps reporting "Windows 10..." in this value; only
             // show it when it does not contradict the build number.
             let misleading = self.major >= 11 && p.contains("Windows 10");
             if !misleading {

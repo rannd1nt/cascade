@@ -5,21 +5,21 @@
 //! SessionState from Win32 events + power notifications and calls the
 //! engine on every watchdog tick / state change.
 //!
-//! See `docs/architecture.md` §7 for the pause contract.
+//! See for the pause contract.
 
 use crate::PauseReason;
 
 /// Power profile selected by the user (`settings set power_profile`,
-/// design-m4 D8/D9).
+///
 ///
 /// `Off` (the default) means Cascade applies no profile at all: the daemon
 /// reads no power state and nothing here changes playback. A profile is a
 /// **preset** that fills `on_battery` while it is still `off` — it is never
-/// an independent pause source (design-m4 §2.6).
+/// an independent pause source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PowerProfile {
-    /// No profile: default behaviour, only the pause rules apply (D8).
+    /// No profile: default behaviour, only the pause rules apply.
     #[default]
     Off,
     /// Pause on fullscreen/lock/display-off, uncapped fps on AC.
@@ -42,7 +42,7 @@ impl PowerProfile {
         }
     }
 
-    /// Must match the serde spelling (`ipc.md` §5).
+    /// Must match the serde spelling.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -54,23 +54,23 @@ impl PowerProfile {
 }
 
 /// What to do when running on battery (`settings set on_battery`,
-/// design-m4 D8/D9).
+///
 ///
 /// `Off` (the default) means the daemon never even reads the power source
-/// (D8: no `GetSystemPowerStatus` until the user opts in). When it is
+/// no `GetSystemPowerStatus` until the user opts in). When it is
 /// enabled, the collector is event-driven — a power-source transition with
 /// ~3 s hysteresis, never a per-tick re-evaluation — so a manual
-/// `cascade resume` holds until the next transition (design-m4 §2.6).
+/// `cascade resume` holds until the next transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BatteryAction {
-    /// Ignore power state entirely; never read it (D8 default).
+    /// Ignore power state entirely; never read it (default).
     #[default]
     Off,
     /// Pause the video, freeze the last frame on the desktop.
     Pause,
     /// Stop playback entirely (unload). Until the power collector lands
-    /// (design-m4 S2b) this behaves like `Pause`; both report
+    /// this behaves like `Pause`; both report
     /// `PauseReason::OnBattery`.
     Stop,
     /// Keep playing on battery.
@@ -89,7 +89,7 @@ impl BatteryAction {
         }
     }
 
-    /// Must match the serde spelling (`ipc.md` §5).
+    /// Must match the serde spelling.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -102,7 +102,7 @@ impl BatteryAction {
 
 /// Which pause reasons are enabled (user settings, `settings set pause.*`).
 ///
-/// The `Default` is the documented product default (`ipc.md` §5), so a
+/// The `Default` is the documented product default, so a
 /// missing `[pause]` table or key in `config.toml` decodes to it
 /// (`#[serde(default)]` on the container).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -168,10 +168,10 @@ pub struct SessionState {
     pub remote_session: bool, // GetSystemMetrics(SM_REMOTESESSION)
     pub user_paused: bool,    // Manual pause from CLI / GUI / tray
     pub degraded: bool,       // Host / device unhealthy (watchdog)
-    pub power_profile: PowerProfile, // Preset only (D9): never pauses by itself
-    pub on_battery: bool,     // True when the power source is battery (S2b collector)
+    pub power_profile: PowerProfile, // Preset only: never pauses by itself
+    pub on_battery: bool,     // True when the power source is battery (collector)
     pub pause_settings: PauseSettings, // Per-reason toggles
-    pub battery_action: BatteryAction, // What to do on battery (D8: default Off)
+    pub battery_action: BatteryAction, // What to do on battery; default Off
 }
 
 /// What the engine wants playback to do.
@@ -199,17 +199,17 @@ impl DesiredPlayback {
 
 /// Pure rule engine. Given session state, returns desired playback.
 ///
-/// One oracle, first match wins (design-m4 §2.6, D9):
+/// One oracle, first match wins:
 /// 1. `user_paused` — manual override, always wins; a manual `resume`
 ///    holds until the condition that paused it changes
 /// 2. `degraded` — host/device unhealthy, pause but keep desktop valid
-/// 3. Enabled pause reasons (fullscreen, maximized, display_off, ...)
+/// 3. Enabled pause reasons (fullscreen, maximized, display_off,...)
 /// 4. Battery action — event-driven, reports `PauseReason::OnBattery`
 /// 5. `playing` — default
 ///
 /// `power_profile` never enters this function: it is a settings-layer
 /// preset (it fills `on_battery` while unset) and cannot pause on its own,
-/// so the two systems cannot fight each other (design-m4 §2.6).
+/// so the two systems cannot fight each other.
 pub struct RuleEngine;
 
 impl RuleEngine {
@@ -245,10 +245,10 @@ impl RuleEngine {
             return DesiredPlayback::paused(PauseReason::RemoteSession);
         }
 
-        // Battery handling (D8 default `Off`: the collector never reads the
+        // Battery handling (default `Off`: the collector never reads the
         // power source, so `on_battery` stays false and this is unreachable
         // until the user opts in). Pause and stop both freeze playback and
-        // report the real reason (design-m4 §2.6 C7).
+        // report the real reason (C7).
         if state.on_battery {
             match state.battery_action {
                 BatteryAction::Pause | BatteryAction::Stop => {
@@ -383,10 +383,10 @@ mod tests {
 
     #[test]
     fn battery_off_is_the_d8_default_and_never_reads_power() {
-        // D8: default off — the collector stays dark until the user opts in.
+        // default off — the collector stays dark until the user opts in.
         assert_eq!(BatteryAction::default(), BatteryAction::Off);
         let state = SessionState {
-            on_battery: true, // would only happen after the S2b collector is enabled
+            on_battery: true, // would only happen after the collector is enabled
             ..SessionState::default()
         };
         let result = RuleEngine::evaluate(state);
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn battery_pause_and_stop_report_on_battery() {
-        // Design-m4 §2.6 C7: battery pause must not masquerade as
+        // Design-m4 C7: battery pause must not masquerade as
         // display_off or user_paused.
         for action in [BatteryAction::Pause, BatteryAction::Stop] {
             let state = SessionState {
@@ -445,13 +445,13 @@ mod tests {
 
     #[test]
     fn power_profile_default_is_off() {
-        // D8: no profile until the user opts in.
+        // no profile until the user opts in.
         assert_eq!(PowerProfile::default(), PowerProfile::Off);
     }
 
     #[test]
     fn power_profile_and_battery_action_wire_strings_are_stable() {
-        // Renaming these breaks config.toml and every client (ipc.md §5).
+        // Renaming these breaks config.toml and every client.
         for (profile, wire) in [
             (PowerProfile::Off, "off"),
             (PowerProfile::Balanced, "balanced"),
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn pause_settings_default_matches_the_documented_defaults() {
-        // ipc.md §5: maximized off, everything else on. This Default is what
+        // maximized off, everything else on. This Default is what
         // a missing [pause] table in config.toml decodes to.
         let default = PauseSettings::default();
         assert!(default.fullscreen);

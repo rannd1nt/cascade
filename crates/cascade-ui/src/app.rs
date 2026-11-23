@@ -1,9 +1,9 @@
 //! The library window: connection state, numbered library grid, the
-//! Settings surface (design-m5 §5). Request traffic
-//! runs on one worker thread (D11c) — the UI thread only sends commands
+//! Settings surface. Request traffic
+//! runs on one worker thread — the UI thread only sends commands
 //! and drains replies, so a wedged or absent daemon can never freeze a
 //! frame. The persistent event subscription runs on a second thread beside
-//! the worker (design-m5-p4 §5): it never issues requests, it only pushes
+//! the worker: it never issues requests, it only pushes
 //! `Reply::Event` into the same reply channel.
 
 use std::collections::{HashMap, HashSet};
@@ -24,18 +24,18 @@ use eframe::egui::{self, vec2};
 use crate::theme;
 use crate::thumbs::{self, TextureLru, ThumbDone, ThumbReq};
 
-/// Refresh cadence while the window draws (design-m5 §8: status/settings
-/// are polled every 1 s, never faster — AGENTS §13).
+/// Refresh cadence while the window draws : status/settings
+/// are polled every 1 s, never faster — ).
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// While the engine is down every poll pays the connect budget
-/// (3 × 250 ms, `ipc.md` §7) inside the worker, so poll at half rate.
+/// (3 × 250 ms) inside the worker, so poll at half rate.
 const POLL_INTERVAL_DISCONNECTED: Duration = Duration::from_secs(2);
-/// Event-stream reconnect backoff (`ipc.md` §7: never spin — 500 ms
+/// Event-stream reconnect backoff : never spin — 500 ms
 /// doubling to 5 s).
 const EVENT_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const EVENT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-/// Library grid geometry (§16 UI refinement): a 256×144 pt thumbnail
+/// Library grid geometry (UI refinement): a 256×144 pt thumbnail
 /// (16:9), then a wrapping title and a wrapping metadata line laid out
 /// naturally so the gap between them is only `TEXT_GAP`. The cached
 /// texture stays 320×180; the media/cache path is untouched here.
@@ -60,22 +60,22 @@ const SIDEBAR_ITEM_H: f32 = 44.0;
 /// can never interleave.
 enum Cmd {
     /// One status/settings snapshot; `library` is false while the event
-    /// stream is live — the events own the list then (design-m5-p4 §5).
+    /// stream is live — the events own the list then.
     Poll {
         library: bool,
     },
     Add(Vec<String>),
     Remove(String),
     /// Library id plus the UI-local target monitor (`None` = daemon default).
-    /// The monitor travels in the existing `SetData.monitor` field (S4 S6).
+    /// The monitor travels in the existing `SetData.monitor` field.
     Set(String, Option<String>),
     StartEngine,
     /// One settings write. The daemon answers with the full `Settings`
     /// payload; an engine-mode change additionally respawns *after* the
-    /// answer (AGENTS §3.15, design-m5-p4 §15 S5).
+    /// answer.
     SettingsSet(SettingsPatch),
     /// Autostart is its own wire command — the Run key is the oracle, not
-    /// `config.toml` (design-m4 D10, design-m5-p4 §15 S4).
+    /// `config.toml`.
     AutostartSet(bool),
 }
 
@@ -99,10 +99,10 @@ enum Reply {
     SettingsChanged(Result<Settings, ClientError>),
     /// An `autostart.set` answer — the Run-key oracle after the write.
     AutostartChanged(Result<AutostartStatus, ClientError>),
-    /// One server-pushed event (`ipc.md` §6) from the reader thread.
+    /// One server-pushed event from the reader thread.
     Event(Event),
     /// The reader connected (`true`) or lost the stream (`false`); the
-    /// UI resyncs statelessly on `true` (`ipc.md` §7).
+    /// UI resyncs statelessly on `true`.
     EventsLive(bool),
 }
 
@@ -117,8 +117,8 @@ enum Conn {
     Unreachable(String),
 }
 
-/// The surfaces implemented so far (design-m5 §5). Monitors is only shown
-/// when >1 monitor exists (S4 S1).
+/// The surfaces implemented so far. Monitors is only shown
+/// when >1 monitor exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Library,
@@ -128,7 +128,7 @@ enum Tab {
 
 impl Tab {
     /// A display change can take the second monitor away while the surface
-    /// is open. Fall back to Library rather than leaving a dead tab (S4 S2).
+    /// is open. Fall back to Library rather than leaving a dead tab.
     fn normalize(self, monitor_count: usize) -> Self {
         if self == Self::Monitors && monitor_count <= 1 {
             Self::Library
@@ -141,7 +141,7 @@ impl Tab {
 /// Editable copy of the wire settings. `volume` is the live slider value —
 /// there is no second "committed" copy: keeping one made a fast drag (or a
 /// scroll made while an earlier write was in flight) snap back when the
-/// snapshot landed (design-m5-p4 §15 S6, corrected 2026-11-22).
+/// snapshot landed (corrected 2026-11-22).
 ///
 /// The whole form is protected by `CascadeApp::dirty`: while any draft is
 /// unsent, the 1 s poll may not adopt a newer wire snapshot over it. That
@@ -178,9 +178,9 @@ impl SettingsForm {
     }
 
     /// Pure diff against the last wire snapshot. `autostart` is excluded on
-    /// purpose: it travels through `autostart.set` (design-m4 D10).
+    /// purpose: it travels through `autostart.set`.
     /// `engine_mode` is excluded too — it needs the explicit confirmation
-    /// button, never a silent change from a combo misclick (S5).
+    /// button, never a silent change from a combo misclick.
     fn changes(
         &self,
         base: &Settings,
@@ -244,7 +244,7 @@ pub struct CascadeApp {
     status: Option<Status>,
     settings: Option<Settings>,
     library: Vec<LibraryItem>,
-    /// Stable 4-hex id — ordinals are display-only (D1: numbers never
+    /// Stable 4-hex id — ordinals are display-only : numbers never
     /// travel on the wire, they are resolved against the list on view).
     selected: Option<String>,
     /// One dismissible message: action errors, add rejections, infos.
@@ -257,44 +257,44 @@ pub struct CascadeApp {
     /// at poll rate.
     last_snapshot_error: Option<String>,
     /// True while the reader thread holds a live event subscription:
-    /// the polls then skip `library.list` (design-m5-p4 §5).
+    /// the polls then skip `library.list`.
     events_live: bool,
     /// One `library.list` fetch is still owed after the stream
     /// (re)connects: events carry *changes*, never the initial list
-    /// (`ipc.md §6`), so the first poll after `EventsLive(true)` must
-    /// include the library even though the stream is live (§7
+    /// so the first poll after `EventsLive(true)` must
+    /// include the library even though the stream is live (
     /// stateless resync). Cleared when that fetch lands.
     library_resync: bool,
-    /// Search box text: client-side filter over title + path (D6).
+    /// Search box text: client-side filter over title + path.
     search: String,
     /// Whether the search field is currently revealed. The icon-only
     /// button toggles it; a click anywhere else (empty space, a tile)
-    /// hides it and clears the query (§16 refinement).
+    /// hides it and clears the query (refinement).
     search_open: bool,
     /// Thumb requests (UI → worker); `None` when no thread runs — the
-    /// spawn failed, or the worker exited (T6).
+    /// spawn failed, or the worker exited.
     thumb_tx: Option<Sender<ThumbReq>>,
-    /// Thumb results (worker → UI), drained once per `tick` (T7).
+    /// Thumb results (worker → UI), drained once per `tick`.
     thumb_rx: Receiver<ThumbDone>,
-    /// Ids with a decode in flight — one request at a time per id (T6).
+    /// Ids with a decode in flight — one request at a time per id.
     thumb_pending: HashSet<String>,
     /// Ids whose decode failed → the reason shown on hover over the
-    /// placeholder (T8). Cleared when the id set changes or the library
-    /// is edited (T9); never a banner (§11.1).
+    /// placeholder. Cleared when the id set changes or the library
+    /// is edited; never a banner.
     thumb_failed: HashMap<String, String>,
-    /// GPU textures for the grid, LRU-limited (T10).
+    /// GPU textures for the grid, LRU-limited.
     textures: TextureLru<egui::TextureHandle>,
     /// The orphan prune already ran after the first successful list
-    /// reply (T11) — never from an error path.
+    /// reply — never from an error path.
     pruned: bool,
-    /// Which surface the sidebar shows (design-m5-p4 §15 S1, §18 S1).
+    /// Which surface the sidebar shows.
     tab: Tab,
-    /// UI-local target monitor for the next `Set as wallpaper` (§18 S5).
+    /// UI-local target monitor for the next `Set as wallpaper`.
     /// `None` keeps the daemon's primary→first fallback; this is not a
     /// persisted setting and never starts the engine by itself.
     target_monitor: Option<String>,
     /// Draft settings, synced from the wire only while no write is in
-    /// flight (S6).
+    /// flight.
     form: SettingsForm,
     /// One settings/autostart write is in flight. While true the 1 s poll
     /// cannot overwrite the draft with a pre-write snapshot.
@@ -321,7 +321,7 @@ impl CascadeApp {
             .map_err(|err| format!("could not start the UI connection thread: {err}"))?;
         let mut app = Self::build(cmd_tx, reply_rx, Some(thumb_tx), thumb_done_rx);
         // The thumbnail thread is an enhancement, not the lifeline: if
-        // it cannot start, every tile keeps its placeholder (§11.1) and
+        // it cannot start, every tile keeps its placeholder and
         // the window opens anyway.
         let thumb_ctx = ctx.clone();
         if std::thread::Builder::new()
@@ -400,7 +400,7 @@ impl CascadeApp {
         Self::build(cmd_tx, reply_rx, None, done_rx)
     }
 
-    // --- worker plumbing ------------------------------------------------
+    // worker plumbing ------------------------------------------------
 
     fn send(&mut self, cmd: Cmd) {
         if self.cmd.send(cmd).is_err() {
@@ -431,7 +431,7 @@ impl CascadeApp {
             }
         }
         // After the replies: results are validated against the freshest
-        // list, so a removal that raced a decode drops its texture (T9).
+        // list, so a removal that raced a decode drops its texture.
         self.drain_thumbs(ctx);
         if !self.poll_outstanding && Instant::now() >= self.poll_at {
             let library = self.poll_carries_library();
@@ -442,11 +442,11 @@ impl CascadeApp {
             }
         }
         // Reschedule every frame; a hidden window draws no frame, so no
-        // repaint is requested and no poll is sent (architecture §9).
+        // repaint is requested and no poll is sent (architecture ).
         ctx.request_repaint_after(POLL_INTERVAL);
     }
 
-    /// Drain finished thumbnails into GPU textures (T7): `load_texture`
+    /// Drain finished thumbnails into GPU textures: `load_texture`
     /// runs only here, on the UI thread — never on the worker.
     fn drain_thumbs(&mut self, ctx: &egui::Context) {
         loop {
@@ -456,7 +456,7 @@ impl CascadeApp {
                 Err(TryRecvError::Disconnected) => {
                     // The worker exited (it never started, or it died):
                     // every tile keeps its placeholder from now on — no
-                    // retry loops (§11.1).
+                    // retry loops.
                     self.thumb_tx = None;
                     break;
                 }
@@ -465,8 +465,8 @@ impl CascadeApp {
     }
 
     /// One result: forget its pending request, then either build the
-    /// texture or remember the failure reason (T7/T8). A result for an
-    /// id that left the library is dropped (T9).
+    /// texture or remember the failure reason. A result for an
+    /// id that left the library is dropped.
     fn apply_thumb(&mut self, ctx: &egui::Context, done: ThumbDone) {
         let (id, result) = match done {
             ThumbDone::Ready {
@@ -500,12 +500,12 @@ impl CascadeApp {
         }
     }
 
-    /// Adopt a new library list (T9): textures and in-flight requests
+    /// Adopt a new library list: textures and in-flight requests
     /// for ids that stayed, everything dropped for ids that left, and
     /// all failure reasons cleared when the id set changed — a fresh id
     /// must get a fresh attempt. `prune` is true **only** from a
     /// successful `library.list` reply: the single place an orphan
-    /// prune may run (T11 — an empty guess from an error path would
+    /// prune may run (an empty guess from an error path would
     /// wipe a valid cache).
     fn set_library(&mut self, items: Vec<LibraryItem>, prune: bool) {
         let old: HashSet<String> = self.library.iter().map(|item| item.id.clone()).collect();
@@ -522,7 +522,7 @@ impl CascadeApp {
             self.pruned = true;
             // The prune compiles only outside tests (`cfg(not(test))`,
             // mirrored here): a unit test never touches the real cache
-            // directory (AGENTS §7). The full prune is V4 on target.
+            // directory. The full prune is on target.
             #[cfg(not(test))]
             {
                 let ids: Vec<String> = new.into_iter().collect();
@@ -539,7 +539,7 @@ impl CascadeApp {
         self.poll_at = Instant::now();
     }
 
-    /// Queue one settings write. At most one is in flight (S6), so replies
+    /// Queue one settings write. At most one is in flight, so replies
     /// cannot overwrite a newer draft with an older snapshot.
     fn send_setting(&mut self, patch: SettingsPatch, note: Option<String>) {
         if self.settings_pending {
@@ -553,7 +553,7 @@ impl CascadeApp {
     }
 
     /// Autostart is a separate wire command: the Run key is the oracle
-    /// (design-m4 D10), never a field of `SettingsPatch`.
+    /// never a field of `SettingsPatch`.
     fn send_autostart(&mut self, enabled: bool) {
         if self.settings_pending {
             return;
@@ -566,7 +566,7 @@ impl CascadeApp {
 
     /// Whether the next poll must carry `library.list`: always while no
     /// subscription is live, plus the one owed resync fetch after a
-    /// (re)connect (design-m5-p4 §5, `ipc.md §7`).
+    /// (re)connect.
     fn poll_carries_library(&self) -> bool {
         !self.events_live || self.library_resync
     }
@@ -583,7 +583,7 @@ impl CascadeApp {
                     Ok(status) => {
                         self.conn = Conn::Connected;
                         // A display change can remove the second monitor or
-                        // the chosen target (§18 S2/S5). Both are resolved
+                        // the chosen target. Both are resolved
                         // from the wire snapshot, never guessed locally.
                         self.tab = self.tab.normalize(status.monitors.len());
                         if retain_target(&mut self.target_monitor, &status) {
@@ -602,7 +602,7 @@ impl CascadeApp {
                         self.status = None;
                         self.settings = None;
                         // A daemon that died before answering cannot leave
-                        // the form frozen (S6): the CLI remains the oracle.
+                        // the form frozen: the CLI remains the oracle.
                         self.settings_pending = false;
                         self.dirty = false;
                         self.pending_notice = None;
@@ -621,7 +621,7 @@ impl CascadeApp {
                             // resync owed after (re)connecting.
                             self.library_resync = false;
                             // The one path where an orphan prune is
-                            // allowed (T11): a *successful* list reply.
+                            // allowed: a *successful* list reply.
                             self.set_library(data.items, true);
                             self.last_snapshot_error = None;
                         }
@@ -631,14 +631,14 @@ impl CascadeApp {
                         }
                         // Skipped only while the event stream is live
                         // *and* no resync is owed — the events own the
-                        // list from then on (design-m5-p4 §5).
+                        // list from then on.
                         None => {}
                     }
                     match settings {
                         // While a write is in flight the pre-write snapshot
                         // must not become the new diff base — otherwise the
                         // user's draft would be sent twice or reverted
-                        // visually (design-m5-p4 §15 S6).
+                        // visually.
                         Ok(settings) if !self.settings_pending => self.settings = Some(settings),
                         Ok(_) => {}
                         Err(err) => self.snapshot_error(err.to_string()),
@@ -728,13 +728,13 @@ impl CascadeApp {
                 let became_live = live && !self.events_live;
                 self.events_live = live;
                 if became_live {
-                    // Events are not replayed (`ipc.md` §6): resync with
-                    // one full poll right after (re)connecting (§7) —
+                    // Events are not replayed: resync with
+                    // one full poll right after (re)connecting —
                     // full means it *carries* `library.list`, which
                     // `library_resync` forces even while live. Without
                     // this the window could start empty and stay empty
                     // until the next `library.changed` (seen on the
-                    // target machine, P4-S2: a UI started after the
+                    // target machine,: a UI started after the
                     // daemon showed 0 videos).
                     self.library_resync = true;
                     self.request_poll_now();
@@ -746,26 +746,26 @@ impl CascadeApp {
         }
     }
 
-    /// One pushed event (`ipc.md` §6). The reader thread delivers them
+    /// One pushed event. The reader thread delivers them
     /// in order; anything the UI cannot use falls back to a poll rather
     /// than trusting a payload it does not understand.
     fn apply_event(&mut self, event: Event) {
         match event.event.as_str() {
             // Mode/pause/applied-video changed: refresh status. The
             // scheduled poll would do it within 1 s anyway — this makes
-            // it immediate (design-m5-p4 §5).
+            // it immediate.
             "state" => self.request_poll_now(),
             "library.changed" => match serde_json::from_value::<LibraryItemsData>(event.data) {
                 Ok(data) => {
                     self.set_library(data.items, false);
                     // The list was *edited*: give every failed thumbnail
-                    // one fresh attempt (T8) — a mutation is the only
+                    // one fresh attempt — a mutation is the only
                     // thing that can change a file's state behind our
                     // back.
                     self.thumb_failed.clear();
                 }
                 // Payload disagreement → the same remedy as a version
-                // mismatch: refetch, do not guess (ipc.md §7).
+                // mismatch: refetch, do not guess.
                 Err(_) => self.request_poll_now(),
             },
             "log" => {
@@ -786,7 +786,7 @@ impl CascadeApp {
             // ask now — the answer decides NotRunning vs the new PID.
             "shutdown" => self.request_poll_now(),
             // Forward compatible: an event from a newer daemon the UI
-            // does not know is ignored, never fatal (ipc.md §2).
+            // does not know is ignored, never fatal.
             _ => {}
         }
     }
@@ -813,10 +813,10 @@ impl CascadeApp {
         }
     }
 
-    // --- drawing --------------------------------------------------------
+    // drawing --------------------------------------------------------
 
     /// Files dropped onto the window go through the same `library.add`
-    /// as the dialog (design-m5 §5: drag-and-drop).
+    /// as the dialog : drag-and-drop).
     fn collect_drops(&mut self, ui: &egui::Ui) {
         let dropped: Vec<String> = ui.ctx().input(|input| {
             input
@@ -862,10 +862,10 @@ impl CascadeApp {
         ui.label(egui::RichText::new("Cascade").strong().size(20.0));
         ui.add_space(18.0);
         // Three of the four reserved surfaces exist. Monitors only makes
-        // sense with >1 monitor (§18 S1); the count comes from `status`,
+        // sense with >1 monitor; the count comes from `status`,
         // never from a captured machine id.
         // Full-width nav rows, not buttons: the active row gets a tint and
-        // a left accent bar, hover only a faint fill (§16 refinement).
+        // a left accent bar, hover only a faint fill (refinement).
         let tab = self.tab;
         if sidebar_nav_item(ui, "Library", tab == Tab::Library) {
             self.tab = Tab::Library;
@@ -948,7 +948,7 @@ impl CascadeApp {
         });
     }
 
-    /// The Monitors surface (design-m5-p4 §18). Read-only except for two
+    /// The Monitors surface. Read-only except for two
     /// actions that reuse existing wire commands: choosing the target for
     /// the next Set (a UI-local value sent in `SetData.monitor`) and
     /// re-targeting the current video with `wallpaper.set --monitor`.
@@ -1058,14 +1058,14 @@ impl CascadeApp {
         }
     }
 
-    /// The Settings surface (design-m5 §5, design-m5-p4 §15). Pure wire
+    /// The Settings surface. Pure wire
     /// shapes only: every write goes through the worker with the same
     /// commands the CLI uses; nothing is applied locally.
     fn settings_screen(&mut self, ui: &mut egui::Ui) {
         // Adopt the wire snapshot only when no write is in flight AND no
         // draft is waiting. A draft can exist while a write is pending
         // (a second scroll, or the engine-mode selection), so checking
-        // `settings_pending` alone lost the user's last edit (S6 fix).
+        // `settings_pending` alone lost the user's last edit (fix).
         if !self.settings_pending && !self.dirty {
             if let Some(settings) = self.settings {
                 let autostart = self
@@ -1279,7 +1279,7 @@ impl CascadeApp {
         let mut add = false;
         let was_open = self.search_open;
         // "Library" owns its row alone — no count, no button beside it
-        // (§16 refinement).
+        // (refinement).
         ui.add_space(2.0);
         ui.label(egui::RichText::new("Library").strong().size(20.0));
         ui.add_space(8.0);
@@ -1309,7 +1309,7 @@ impl CascadeApp {
                 let width = SEARCH_W.min(ui.available_width());
                 // No right-pinning: the field sits immediately after the
                 // magnifier, sharing the same action row and box height
-                // (§16 Settings/search pass).
+                // (Settings/search pass).
                 let field = egui::TextEdit::singleline(&mut self.search)
                     .hint_text("Search title or path\u{2026}")
                     .desired_width(width)
@@ -1337,7 +1337,7 @@ impl CascadeApp {
         // A click anywhere outside the search affordances hides the
         // field — including a click on a thumbnail (the "active" case
         // the user called out). Clicks on the toggle itself are excluded
-        // so the opening frame is not immediately undone (§16 refinement).
+        // so the opening frame is not immediately undone (refinement).
         if was_open && self.search_open {
             let click = ui.ctx().input(|input| {
                 if input.pointer.any_click() {
@@ -1359,9 +1359,9 @@ impl CascadeApp {
         }
     }
 
-    /// The virtualized tile grid (design-m5-p4 §11.4): `show_rows`
+    /// The virtualized tile grid: `show_rows`
     /// renders only the visible rows, each visible tile requests its
-    /// thumbnail on render (T6), and every action is collected during
+    /// thumbnail on render, and every action is collected during
     /// the pass and applied after it (edition 2021 disjoint captures).
     fn library_grid(&mut self, ui: &mut egui::Ui) {
         let filtered: Vec<usize> = (0..self.library.len())
@@ -1385,7 +1385,7 @@ impl CascadeApp {
         }
 
         // Columns follow the live width — no monitor assumption
-        // (AGENTS §1). The horizontal gap is the current item spacing
+        // The horizontal gap is the current item spacing
         // (8 pt default); `show_rows` adds the same spacing vertically,
         // so the pitch matches the row advance exactly.
         let spacing = ui.spacing().item_spacing;
@@ -1393,7 +1393,7 @@ impl CascadeApp {
             (((ui.available_width() + spacing.x) / (TILE_W + spacing.x)).floor() as usize).max(1);
         let total_rows = filtered.len().div_ceil(columns);
         // No action row below the grid any more: the whole panel height
-        // belongs to the tiles (§16 refinement).
+        // belongs to the tiles (refinement).
         let grid_h = ui.available_height().max(MIN_GRID_H);
 
         let mut enqueue: Vec<ThumbReq> = Vec::new();
@@ -1412,10 +1412,10 @@ impl CascadeApp {
                                 break;
                             };
                             let item = &self.library[item_index];
-                            // Request-on-render (T6): only visible tiles
+                            // Request-on-render: only visible tiles
                             // ask, each id asks once, and a failure is
                             // never re-asked until the list changes
-                            // (T8/T9) — no retry loops (§11.1).
+                            // no retry loops.
                             if self.thumb_tx.is_some()
                                 && !self.textures.contains(&item.id)
                                 && !self.thumb_pending.contains(&item.id)
@@ -1476,7 +1476,7 @@ impl CascadeApp {
         if let Some(id) = remove_row {
             self.send(Cmd::Remove(id));
         }
-        // Hand the collected requests to the thumb thread (T6). The
+        // Hand the collected requests to the thumb thread. The
         // worker wakes the UI itself when a result arrives.
         if let Some(tx) = self.thumb_tx.as_ref() {
             for req in enqueue {
@@ -1502,7 +1502,7 @@ impl eframe::App for CascadeApp {
             )
             .show(ui, |ui| self.sidebar(ui));
 
-        // The bottom status strip is gone (§16 refinement): mode, engine
+        // The bottom status strip is gone (refinement): mode, engine
         // mode, fps, memory and volume are CLI facts, not UI chrome.
 
         egui::CentralPanel::default()
@@ -1511,17 +1511,17 @@ impl eframe::App for CascadeApp {
     }
 
     /// Paint the app background with the palette instead of egui's
-    /// translucent default (design-m5 §5.1).
+    /// translucent default.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG.to_normalized_gamma_f32()
     }
 }
 
-// --- drawing helpers -----------------------------------------------------
+// drawing helpers -----------------------------------------------------
 
 /// Hand-painted icon-only search button: a zoom glass drawn as shapes,
 /// not a text glyph, so it renders at any DPI without font coverage
-/// (§16 refinement).
+/// (refinement).
 fn search_button(ui: &mut egui::Ui, size: f32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), egui::Sense::click());
     let painter = ui.painter();
@@ -1546,7 +1546,7 @@ fn search_button(ui: &mut egui::Ui, size: f32) -> egui::Response {
 /// One Settings category: a slightly larger bold heading, then its
 /// controls indented forward so they do not align with the heading. The
 /// manual indent (instead of `ui.indent`) keeps the layout free of egui's
-/// optional guide line; only presentation changes, no wire shape (§16
+/// optional guide line; only presentation changes, no wire shape (
 /// Settings pass).
 fn settings_group(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
     ui.label(egui::RichText::new(title).size(15.0).strong());
@@ -1558,14 +1558,14 @@ fn settings_group(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egu
 }
 
 /// Geometry straight from the wire rect — no assumed origin or size
-/// (§18 S11). Negative coordinates are normal for a monitor left of the
+/// Negative coordinates are normal for a monitor left of the
 /// primary one and must be shown, not clamped.
 fn format_monitor_rect(rect: &Rect) -> String {
     format!("{},{} {}×{}", rect.x, rect.y, rect.w, rect.h)
 }
 
 /// The library id currently playing, if any. The daemon attaches `source`
-/// only to the active monitor row (`ipc.md` §4), so this is never a guess.
+/// only to the active monitor row, so this is never a guess.
 fn active_source_id(status: &Status) -> Option<String> {
     status
         .monitors
@@ -1586,12 +1586,12 @@ fn retain_target(target: &mut Option<String>, status: &Status) -> bool {
     true
 }
 
-// --- pure helpers (unit-tested) ------------------------------------------
+// pure helpers (unit-tested) ------------------------------------------
 
 /// One full-width sidebar row. A hand-painted nav item rather than a
 /// `selectable_label`/`Button`: no border, no button padding, a tinted bar
 /// with a left accent for the active tab, and a faint fill on hover
-/// (§16 refinement).
+/// (refinement).
 fn sidebar_nav_item(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(
         vec2(ui.available_width(), SIDEBAR_ITEM_H),
@@ -1648,9 +1648,9 @@ fn item_meta(item: &LibraryItem) -> String {
     meta
 }
 
-/// Client-side search (D6): case-insensitive substring over title and
+/// Client-side search: case-insensitive substring over title and
 /// path. An empty or whitespace-only query matches everything — pure,
-/// unit-tested (design-m5-p4 §11.5 V5).
+/// unit-tested.
 fn matches_query(item: &LibraryItem, query: &str) -> bool {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
@@ -1660,7 +1660,7 @@ fn matches_query(item: &LibraryItem, query: &str) -> bool {
 }
 
 /// One grid tile: a large thumbnail, a wrapping title and a wrapping
-/// metadata line inside one `allocate_exact_size` (§16 refinement).
+/// metadata line inside one `allocate_exact_size` (refinement).
 /// Painted by hand so the row's cursor math stays exactly one allocation.
 struct LibraryTile<'a> {
     /// Stable id, used to keep the menu popup anchored to the same widget
@@ -1730,7 +1730,7 @@ impl LibraryTile<'_> {
         // height it actually needs, so a one-line title sits directly on
         // top of the metadata (a 4 pt gap) instead of being pushed down by
         // a fixed two-line reservation. Long titles and codec/fps strings
-        // still wrap instead of truncating (§16 refinement).
+        // still wrap instead of truncating (refinement).
         //
         // CORRECTION 1 (2026-11-22, user-observed): this scope originally
         // inherited the parent's horizontal layout, so the two labels sat
@@ -1796,7 +1796,7 @@ impl LibraryTile<'_> {
         let info = info.on_hover_text("Item actions");
 
         // Hover: the path always; a failed decode adds its reason
-        // (T8) — the placeholder explains itself, never a banner.
+        // the placeholder explains itself, never a banner.
         let tile = match self.failure {
             Some(reason) => tile.on_hover_text(format!("{}\n{}", self.path, reason)),
             None => tile.on_hover_text(self.path),
@@ -1827,9 +1827,9 @@ fn drop_missing_selection(library: &[LibraryItem], selected: &mut Option<String>
     }
 }
 
-// --- worker thread -------------------------------------------------------
+// worker thread -------------------------------------------------------
 
-/// The single IPC thread (D11c): strictly serial, so replies arrive in
+/// The single IPC thread: strictly serial, so replies arrive in
 /// command order and the UI can keep at most one poll in flight.
 fn worker(rx: Receiver<Cmd>, tx: Sender<Reply>) {
     while let Ok(cmd) = rx.recv() {
@@ -1848,7 +1848,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Reply>) {
                     )
                 } else {
                     // The event stream is live and owns the list
-                    // (design-m5-p4 §5): status + settings only.
+                    // status + settings only.
                     (None, ask_data::<Settings>("settings.get", no_data()))
                 };
                 Reply::Snapshot {
@@ -1879,18 +1879,18 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Reply>) {
     }
 }
 
-/// The event subscription thread (design-m5-p4 §5): holds one persistent
+/// The event subscription thread: holds one persistent
 /// connection to `cascade-evt-{session}`, forwards every frame as
 /// [`Reply::Event`], and reports connectivity as [`Reply::EventsLive`].
 /// It never issues a request — the worker keeps its serial command order
-/// (D11c). Reconnects follow `ipc.md` §7: 500 ms doubling to 5 s, never
+/// Reconnects follow: 500 ms doubling to 5 s, never
 /// a spin; a fresh connection means a stateless resync on the UI side.
 ///
 /// `ctx` is woken after every delivery: egui draws only when something
 /// asks for a frame, and the idle schedule is one frame per second —
 /// without the wake an event waits up to `POLL_INTERVAL` before it is
 /// even read (measured 2026-11-21: a library row appeared 0–1000 ms
-/// late, design-m5-p4 §8 V1).
+/// late).
 fn event_reader(tx: Sender<Reply>, ctx: egui::Context) {
     let mut backoff = EVENT_BACKOFF_MIN;
     loop {
@@ -1910,7 +1910,7 @@ fn event_reader(tx: Sender<Reply>, ctx: egui::Context) {
             }
         }
         // No daemon (yet) or the one subscriber slot is taken: back off
-        // and try again — never a spin (`ipc.md` §7).
+        // and try again — never a spin.
         if tx.send(Reply::EventsLive(false)).is_err() {
             return; // the window is gone
         }
@@ -1922,7 +1922,7 @@ fn event_reader(tx: Sender<Reply>, ctx: egui::Context) {
 
 /// One request/response over the pipe, decoded into the shared wire type.
 /// A payload that no longer decodes means the two sides disagree on the
-/// protocol — the same remedy as a version mismatch (ipc.md §7).
+/// protocol — the same remedy as a version mismatch.
 fn ask_data<T: serde::de::DeserializeOwned>(
     cmd: &str,
     data: impl serde::Serialize,
@@ -1936,7 +1936,7 @@ fn ask_ok(cmd: &str, data: impl serde::Serialize) -> Result<(), ClientError> {
     ask_data::<serde_json::Value>(cmd, data).map(|_| ())
 }
 
-/// Start the engine through the same command the CLI uses (D11d):
+/// Start the engine through the same command the CLI uses:
 /// `run --detached` refuses a second instance, spawns the daemon with
 /// `DETACHED_PROCESS` + NUL stdio and returns once the pipe answers.
 /// Runs on the worker thread — the UI never waits for it.
@@ -2031,7 +2031,7 @@ mod tests {
     #[test]
     fn item_meta_is_complete_without_an_ordinal() {
         let library = [item("aa11"), item("bb22")];
-        // §16: the displayed title is the bare file title — no ordinal.
+        // the displayed title is the bare file title — no ordinal.
         assert_eq!(library[0].title, "aa11");
         let meta = item_meta(&library[0]);
         assert!(meta.contains("1920x1080"), "{meta}");
@@ -2041,7 +2041,7 @@ mod tests {
 
     #[test]
     fn palette_matches_the_design_table() {
-        // design-m5 §5.1 — a silent hex drift would change the theme.
+        // a silent hex drift would change the theme.
         assert_eq!(theme::BG, egui::Color32::from_rgb(0x0A, 0x0A, 0x0A));
         assert_eq!(theme::PANEL, egui::Color32::from_rgb(0x14, 0x14, 0x16));
         assert_eq!(theme::SURFACE, egui::Color32::from_rgb(0x1C, 0x1C, 0x20));
@@ -2059,7 +2059,7 @@ mod tests {
         );
     }
 
-    // --- design-m5-p4 §5: event consumption ------------------------------
+    // event consumption ------------------------------
 
     use cascade_core::ipc::{AutostartStatus, HostStatus, LibraryRef, MemoryStatus, MonitorStatus};
     use cascade_core::PROTOCOL_VERSION;
@@ -2264,7 +2264,7 @@ mod tests {
         assert!(app.events_live);
         assert!(
             app.poll_at <= Instant::now(),
-            "events are not replayed: one stateless resync (ipc.md §7)"
+            "events are not replayed: one stateless resync after reconnect"
         );
 
         // A duplicate `true` must not queue extra work.
@@ -2281,14 +2281,14 @@ mod tests {
     fn resync_after_connect_carries_the_initial_library() {
         let mut app = CascadeApp::detached();
         // The daemon already has items when this window opens; events
-        // carry changes, never the initial list (ipc.md §6).
+        // carry changes, never the initial list.
         assert!(
             app.poll_carries_library(),
             "the first poll always fetches the library"
         );
 
         // If the event thread wins the race before that poll is sent,
-        // the resync still has to carry library.list (P4-S2: the UI
+        // the resync still has to carry library.list : the UI
         // opened with 0 videos while the daemon had 17).
         app.apply(Reply::EventsLive(true));
         assert!(
@@ -2356,7 +2356,7 @@ mod tests {
         assert_eq!(app.selected, None);
     }
 
-    // --- design-m5-p4 §11: search + thumbnail state ---------------------
+    // search + thumbnail state ---------------------
 
     #[test]
     fn search_matches_title_and_path_case_insensitively() {
@@ -2385,7 +2385,7 @@ mod tests {
         assert!(app.thumb_pending.contains("bb22"));
 
         // Id set changed: failures clear and requests for gone ids are
-        // dropped — a fresh id gets exactly one fresh attempt (T9).
+        // dropped — a fresh id gets exactly one fresh attempt.
         app.set_library(vec![item("aa11"), item("cc33")], false);
         assert!(app.thumb_failed.is_empty());
         assert!(!app.thumb_pending.contains("bb22"));
@@ -2409,7 +2409,7 @@ mod tests {
         );
     }
 
-    // --- design-m5-p4 §15: Settings surface -------------------------------
+    // Settings surface -------------------------------
 
     #[test]
     fn form_diff_sends_only_edited_fields_and_separates_autostart() {

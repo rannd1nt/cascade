@@ -1,16 +1,16 @@
-//! File-backed operations that need no engine (`design-m5b.md` §3/§4).
+//! File-backed operations that need no engine.
 //!
 //! Two callers, one implementation:
 //!
 //! * the **CLI direct mode** (Pw1) — `settings`/`library` subcommands when
 //!   no Cascade process of ours is running (the routing guard lives in
 //!   `main.rs`; this module never decides *when* it may run);
-//! * the **battery listener** (Pw2) — same operations served over the pipe
+//! * the **battery listener** — same operations served over the pipe
 //!   while the engine is off.
 //!
-//! Rules: never touch user media (AGENTS §3.3 — `remove` edits the list
+//! Rules: never touch user media (`remove` edits the list
 //! only), never start or stop a process, and never watch the files
-//! (AGENTS §3.17). Settings saves are atomic (`config.rs`); the daemon
+//! Settings saves are atomic (`config.rs`); the daemon
 //! remains the single writer whenever its pipe answers.
 
 use std::path::{Path, PathBuf};
@@ -28,15 +28,15 @@ use crate::device;
 use crate::library::{file_proof, LibraryStore};
 use crate::registry;
 
-// --- settings ----------------------------------------------------------------
+// settings ----------------------------------------------------------------
 
 /// `settings.get` with no daemon: the file the daemon reads, with the same
-/// Run-key fill the daemon performs at its wire edge (design-m4 D10).
+/// Run-key fill the daemon performs at its wire edge.
 pub fn settings_get() -> Settings {
     wire(config::load())
 }
 
-/// `settings.set` with no daemon (`design-m5b.md` §3.3): apply the patch
+/// `settings.set` with no daemon: apply the patch
 /// the CLI already validated (`build_patch` — the daemon-path validation)
 /// and persist it. There is no live engine, so nothing applies in-process;
 /// the value takes effect at the next start.
@@ -49,7 +49,7 @@ pub fn settings_apply(patch: SettingsPatch) -> Result<Settings, String> {
 /// The file half of [`settings_apply`], path-injected for tests. A failed
 /// save is an error here: the CLI must never print `key = value` for a
 /// change that did not stick (the daemon keeps its apply-anyway behaviour,
-/// design-m4 §2.6 — different caller, different honesty rule).
+/// different caller, different honesty rule).
 fn apply_at(path: &Path, patch: SettingsPatch) -> Result<Settings, String> {
     let mut settings = config::load_at(path);
     settings.apply_patch(patch);
@@ -58,7 +58,7 @@ fn apply_at(path: &Path, patch: SettingsPatch) -> Result<Settings, String> {
 }
 
 /// The wire view of a `Settings` value: `autostart` is filled from the Run
-/// key, never from the file (design-m4 D10).
+/// key, never from the file.
 fn wire(mut settings: Settings) -> Settings {
     settings.autostart = registry::autostart_state(&exe_path()).registered;
     settings
@@ -68,7 +68,7 @@ fn exe_path() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::new())
 }
 
-// --- library -----------------------------------------------------------------
+// library -----------------------------------------------------------------
 
 /// `library.list` with no daemon: the stored list, in list order.
 pub fn library_list() -> LibraryItemsData {
@@ -85,7 +85,7 @@ pub fn library_add(paths: Vec<String>, probe: &ProbeFn) -> Result<LibraryAddResu
 }
 
 /// `library.remove` with no daemon — edits the list only; the file on disk
-/// is never touched (AGENTS §3.3). `None` = no such id (the caller renders
+/// is never touched. `None` = no such id (the caller renders
 /// the same "run `cascade library ls`" wording as the daemon path).
 pub fn library_remove(item_id: &str) -> Result<Option<LibraryItem>, String> {
     library_remove_with(&LibraryStore::open(), item_id)
@@ -127,12 +127,12 @@ fn library_prune_with(store: &LibraryStore) -> Result<u32, String> {
 }
 
 /// The `library.add` core shared by the daemon and the offline path
-/// (`design-m5b.md` §3.4 — one implementation so the two can never drift):
-/// canonicalise each path, check it is a file, probe its metadata (D13
+/// (one implementation so the two can never drift):
+/// canonicalise each path, check it is a file, probe its metadata (
 /// probe-once through the stored `mtime`+`size` proof), dedupe by canonical
 /// path, and compute the badge assessment for every accepted item.
 /// Rejections are per-path — one bad file never fails the batch, and
-/// nothing is ever copied or modified (AGENTS §3.3).
+/// nothing is ever copied or modified.
 ///
 /// Persistence stays with the caller: the daemon saves best-effort, the
 /// offline wrapper returns the save error to the user.
@@ -200,7 +200,7 @@ pub fn library_add_into(
     }
     // One device collection per batch, only when something got in: the
     // primary monitor is the badge's default target (the GUI passes the
-    // assigned one later, design-m4 §5.4).
+    // assigned one later).
     if !result.added.is_empty() {
         let device = device::collect();
         if let Ok(target) = device::pick_monitor(&device, None) {
@@ -268,7 +268,7 @@ mod tests {
         Box::new(|_path: &Path| Ok(meta()))
     }
 
-    // --- settings ------------------------------------------------------------
+    // settings ------------------------------------------------------------
 
     #[test]
     fn settings_apply_persists_the_patch_and_returns_the_result() {
@@ -316,7 +316,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // --- library: add --------------------------------------------------------
+    // library: add --------------------------------------------------------
 
     #[test]
     fn add_rejects_a_missing_file_without_failing_the_batch() {
@@ -403,7 +403,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // --- library: remove / prune --------------------------------------------
+    // library: remove / prune --------------------------------------------
 
     #[test]
     fn remove_edits_the_list_and_the_file_follows() {
@@ -420,10 +420,7 @@ mod tests {
             .expect("found");
         assert_eq!(removed.path, library.items[0].path);
         assert!(store.load().items.is_empty(), "list updated on disk");
-        assert!(
-            file.exists(),
-            "the media file itself is untouched (AGENTS §3.3)"
-        );
+        assert!(file.exists(), "the media file itself is untouched");
 
         let missing = library_remove_with(&store, "zzzz").expect("second remove");
         assert!(missing.is_none(), "unknown id is None, not an error");
@@ -476,7 +473,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // --- library: list -------------------------------------------------------
+    // library: list -------------------------------------------------------
 
     #[test]
     fn list_reads_the_stored_order() {

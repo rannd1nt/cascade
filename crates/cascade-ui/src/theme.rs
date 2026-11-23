@@ -1,12 +1,12 @@
-//! Dark theme from design-m5 §5.1: flat dark surfaces plus an indigo
+//! Dark theme from: flat dark surfaces plus an indigo
 //! accent, plain `egui::Visuals`/`Style` work — no custom renderer, no
 //! shaders. The palette is the documented "approximate starting
-//! palette"; tune visually against the reference (§5.1), the
-//! general-Windows-11 rule (AGENTS §1) outranks pixel-matching.
+//! palette"; tune visually against the reference, the
+//! general-Windows-11 rule outranks pixel-matching.
 
 use eframe::egui;
 
-// Palette (design-m5 §5.1).
+// Palette.
 pub const BG: egui::Color32 = egui::Color32::from_rgb(0x0A, 0x0A, 0x0A);
 pub const PANEL: egui::Color32 = egui::Color32::from_rgb(0x14, 0x14, 0x16);
 pub const SURFACE: egui::Color32 = egui::Color32::from_rgb(0x1C, 0x1C, 0x20);
@@ -19,7 +19,7 @@ pub const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(0x4F, 0x51, 0xD6
 pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0x22, 0x24, 0x4A);
 
 // Status colours for notices (UI-only; the daemon never sends colours —
-// `status.mode` is a plain string, ipc.md §4).
+// `status.mode` is a plain string).
 pub const WARN: egui::Color32 = egui::Color32::from_rgb(0xE0, 0xA0, 0x3C);
 pub const ERR: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x5C, 0x5C);
 
@@ -27,7 +27,7 @@ pub const ERR: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x5C, 0x5C);
 /// Korean, and other non-Latin scripts) render instead of showing tofu
 /// boxes. egui's bundled font only covers Latin + Cyrillic; the fallback
 /// list is appended *after* it, so Latin text keeps its current look and
-/// the system face is used only when a glyph is missing (§16 refinement).
+/// the system face is used only when a glyph is missing (refinement).
 ///
 /// Files come from `%WINDIR%\Fonts` via `std` path probing only — no font
 /// is bundled with the binary, no new dependency, and no `cascade-win`
@@ -75,7 +75,7 @@ pub fn install_system_fonts(ctx: &egui::Context) {
 }
 
 /// Install the palette on the egui context — called once before the
-/// first frame (design-m5 §5.1).
+/// first frame.
 pub fn apply(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = BG;
@@ -98,7 +98,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.active.bg_fill = ACCENT_HOVER;
     visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, TEXT);
 
-    // egui 0.37 styles per `Theme` (the palette is dark-only, §5.1).
+    // egui 0.37 styles per `Theme` (the palette is dark-only).
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_visuals(visuals);
 

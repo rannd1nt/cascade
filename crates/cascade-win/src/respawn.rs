@@ -1,8 +1,8 @@
-//! Re-exec of this binary after a transition (`design-m2.md` §4,
-//! `design-m5b.md` §4.4 T2/T3).
+//! Re-exec of this binary after a transition (
+//!
 //!
 //! Shared by the full daemon (a respawn-triggering `wallpaper.set`), the
-//! battery listener (T3 — AC confirmed), and the CLI (`main.rs` re-uses
+//! battery listener (AC confirmed), and the CLI (`main.rs` re-uses
 //! [`respawn_child`]). One implementation, one argv contract: the child
 //! inherits everything except `--video` (it reads the new path from
 //! `state.json`) and sets `CASCADE_RESPAWN` so it retries the session
@@ -12,11 +12,11 @@ use std::ffi::OsString;
 
 use crate::dlog;
 
-/// Session-override marker for a transition child (`design-m5b.md` §4.4
-/// T6, micro-decision MD6 in §7). The child keeps `CASCADE_RESPAWN=1` — it
+/// Session-override marker for a transition child (
+/// micro-decision in ). The child keeps `CASCADE_RESPAWN=1` — it
 /// needs the pipe-retry window while this process still owns the session
 /// pipe — but the entry rules must treat it as a **manual session start**
-/// (D1), not as an automatic transition: on battery with `on_battery=stop`
+/// not as an automatic transition: on battery with `on_battery=stop`
 /// it lands FULL with the session override instead of looping back into
 /// the listener.
 pub const SESSION_OVERRIDE_ENV: &str = "CASCADE_SESSION_OVERRIDE";
@@ -29,10 +29,10 @@ pub fn spawn_child(args: Vec<OsString>) -> Result<u32, String> {
     spawn_with(args, false)
 }
 
-/// Spawn the full child for the listener's tray **Start now** (T6): the
+/// Spawn the full child for the listener's tray **Start now**: the
 /// same argv re-exec as [`spawn_child`] plus [`SESSION_OVERRIDE_ENV`], so
-/// the child lands FULL with the D1 session override even while the source
-/// is still battery (`design-m5b.md` §4.4).
+/// the child lands FULL with the session override even while the source
+/// is still battery.
 pub fn spawn_start_now_child() -> Result<u32, String> {
     spawn_with(respawn_args(), true)
 }
@@ -60,7 +60,7 @@ fn spawn_with(args: Vec<OsString>, session_override: bool) -> Result<u32, String
 /// Re-exec this binary after a respawn-triggering event. The child
 /// inherits this process's argv minus `--video`, with `--listen` rewritten
 /// to `run` so a transition child never lands back in the listener
-/// (R3, `design-m5b.md` §7).
+///
 pub fn respawn_child() -> Result<u32, String> {
     spawn_child(respawn_args())
 }
@@ -73,7 +73,7 @@ pub fn respawn_args() -> Vec<OsString> {
 }
 
 /// Drop `--video` and its value from the raw argv. Position anywhere,
-/// other options untouched (`design-m2.md` §4).
+/// other options untouched.
 pub fn filter_video_flag(raw: Vec<OsString>) -> Vec<OsString> {
     let mut out = Vec::with_capacity(raw.len());
     let mut skip_next = false;
@@ -91,7 +91,7 @@ pub fn filter_video_flag(raw: Vec<OsString>) -> Vec<OsString> {
 
 /// Rewrite a leading `--listen` to `run` so a transition child spawned
 /// from the listener takes the full-daemon entry path (`cmd_run`) instead
-/// of looping back into `cmd_listen` (R3, `design-m5b.md` §7). Only the
+/// of looping back into `cmd_listen`. Only the
 /// first argument is checked — `--listen` takes no value, so a later
 /// occurrence is an option value, not the command word.
 pub fn rewrite_listen_flag(raw: Vec<OsString>) -> Vec<OsString> {
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn respawn_filter_drops_video_flag_and_keeps_everything_else() {
         // `--video` and its value go; the child reads `state.json` instead
-        // (design-m2 §4). Position anywhere, other options untouched.
+        // Position anywhere, other options untouched.
         assert_eq!(
             filter_video_flag(raw(&["run", "--video", r"C:\a.mp4", "--repaint", "2"])),
             raw(&["run", "--repaint", "2"])
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn rewrite_listen_flag_rewrites_only_the_leading_command_word() {
-        // R3 (`design-m5b.md` §7): a transition child spawned from the
+        // a transition child spawned from the
         // listener must land in `cmd_run`, never back in `cmd_listen`.
         assert_eq!(rewrite_listen_flag(raw(&["--listen"])), raw(&["run"]));
         assert_eq!(

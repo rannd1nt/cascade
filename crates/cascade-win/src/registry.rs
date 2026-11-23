@@ -27,7 +27,7 @@ pub const STARTUP_APPROVED_KEY: &str =
 pub const AUTOSTART_VALUE: &str = "Cascade";
 
 /// The per-user environment key (`HKCU\Environment`), where the user `Path`
-/// lives (design-m4 §6.1 step 3: user-level only, never the machine PATH).
+/// lives (step 3: user-level only, never the machine PATH).
 pub const ENVIRONMENT_KEY: &str = "Environment";
 pub const PATH_VALUE: &str = "Path";
 
@@ -80,7 +80,7 @@ pub fn read_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
 /// Used for `HKCU\Environment\Path`, which may be `REG_SZ` or
 /// `REG_EXPAND_SZ`; both the kind and the raw text (`%VAR%` intact) must
 /// survive a read-modify-write so we never rewrite another tool's entries
-/// in expanded form (design-m4 §6.1 step 3).
+/// in expanded form (step 3).
 pub fn read_string_raw(root: HKEY, subkey: &str, value: &str) -> Option<(u32, String)> {
     let sub = wide::to_wide(subkey);
     let val = wide::to_wide(value);
@@ -250,7 +250,7 @@ pub fn write_string(subkey: &str, value: &str, data: &str) -> Result<(), u32> {
 
 /// Write a string value under `HKEY_CURRENT_USER` with an explicit kind
 /// (`REG_SZ` or `REG_EXPAND_SZ`), preserving the kind the value already
-/// had (design-m4 §6.1 step 3).
+/// had (step 3).
 pub fn write_string_typed(subkey: &str, value: &str, kind: u32, data: &str) -> Result<(), u32> {
     let key = open_for_write(subkey)?;
     let val = wide::to_wide(value);

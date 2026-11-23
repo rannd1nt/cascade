@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn desktop_mode_labels_are_stable() {
-        // `doctor` prints these; keep them in sync with docs/architecture.md.
+        // `doctor` prints these labels; keep them stable.
         assert_eq!(DesktopMode::WorkerWChild.label(), "workerw_child");
         assert_eq!(
             DesktopMode::LayeredProgmanChild.label(),

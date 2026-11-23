@@ -1,5 +1,5 @@
 //! Named-pipe **server** for the control protocol
-//! (`docs/ipc.md`, design-m4 §2).
+//!
 //!
 //! The **server** runs on its own thread started by `daemon::run`: it owns
 //! the pipe handle and every `ReadFile`/`WriteFile` on it. The render loop
@@ -9,12 +9,12 @@
 //! (`playback.*`, `wallpaper.*`, `settings.set`, `quit`) are handed to the
 //! main loop through a command channel, woken with `WM_APP_PIPE`, and the
 //! thread blocks on the response for at most 2 s before answering `busy`
-//! (design-m4 §2.2).
 //!
-//! The **client** lives in `cascade_core::client` (design-m5 D10 — the
+//!
+//! The **client** lives in `cascade_core::client` (the
 //! UI and the CLI share one transport without depending on this crate):
 //! connect with a bounded retry, one JSON line out, one JSON line in,
-//! close (`ipc.md` §7).
+//! close.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -48,14 +48,14 @@ use crate::offline;
 use crate::registry;
 use crate::wide;
 
-/// Instances the server pre-creates (`ipc.md` §1: small fixed max, not
+/// Instances the server pre-creates : small fixed max, not
 /// `PIPE_UNLIMITED_INSTANCES`). Enough for a CLI call plus the future GUI
 /// and tray; a connect beyond this fails `ERROR_PIPE_BUSY`, which the
 /// client retries.
 const MAX_INSTANCES: u32 = 8;
 const BUFFER_BYTES: u32 = 4096;
 
-/// Server-side bounds (design-m4 §2.2): how long the pipe thread waits for
+/// Server-side bounds: how long the pipe thread waits for
 /// the main loop to answer a forwarded command, and how long the main loop
 /// waits for the `quit` flush ack before quitting anyway (the ack itself
 /// is sent by the pipe thread, so this constant is shared with `daemon`).
@@ -63,17 +63,17 @@ const SUBMIT_DEADLINE: Duration = Duration::from_secs(2);
 pub const QUIT_FLUSH_WAIT: Duration = Duration::from_secs(1);
 
 /// What the main loop publishes to the pipe thread: the parts of `status`
-/// only the render loop owns (`ipc.md` §4), plus the settings the daemon
-/// persists (design-m4 D10). Memory and autostart are read on demand by
+/// only the render loop owns, plus the settings the daemon
+/// persists. Memory and autostart are read on demand by
 /// the pipe thread; they are not part of this snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusSnapshot {
-    /// `paused` | `attached` | `degraded` (design-m4 §2.2).
+    /// `paused` | `attached` | `degraded`.
     pub mode: String,
     pub paused_reasons: Vec<String>,
     pub monitors: Vec<MonitorInfo>,
     /// Playback counters for the one monitor the engine draws on
-    /// (M4 S3b); `None` while no video is loaded and attached.
+    /// `None` while no video is loaded and attached.
     pub playback: Option<PlaybackStatus>,
     pub host_strategy: String,
     pub repaint_level: u32,
@@ -82,18 +82,18 @@ pub struct StatusSnapshot {
     pub settings: Settings,
 }
 
-/// The `monitors[]` row the engine is actually drawing on (`ipc.md` §4).
+/// The `monitors[]` row the engine is actually drawing on.
 ///
 /// Built on the render loop from `MediaBackend::stats()` plus the applied
 /// source. Every field is `Option` for an honest reason: `None` means the
 /// daemon has nothing to report (no library entry, a backend that cannot
 /// observe hardware decode, a counter the engine does not deliver) — never
-/// a placeholder value (M4 S3b).
+/// a placeholder value.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackStatus {
     /// Monitor id of the host window the engine is attached to. The row
     /// with this id gets the fields; every other monitor stays `None`
-    /// (single-surface engine, design-m2 §5).
+    /// (single-surface engine).
     pub monitor: String,
     /// Library entry for the applied path, when the path is in the library.
     pub source: Option<LibraryRef>,
@@ -102,7 +102,7 @@ pub struct PlaybackStatus {
     pub dropped: Option<u64>,
     pub video: Option<VideoSize>,
     /// Media Engine mode (`"frame-server"` / `"rendering"`), when the
-    /// backend reports one (`design-p1-color.md` §4.4).
+    /// backend reports one.
     pub engine: Option<String>,
 }
 
@@ -123,20 +123,20 @@ impl StatusSnapshot {
 }
 
 /// Main loop → pipe thread: a fresh snapshot, or the response to a
-/// forwarded command (design-m4 §2.2). Both travel one channel so the
+/// forwarded command. Both travel one channel so the
 /// thread can absorb snapshot updates while it waits for a response.
 pub enum ServerMsg {
     Snapshot(Arc<StatusSnapshot>),
     Response(Response),
 }
 
-/// Which role the pipe thread serves (`design-m5b.md` §4.5).
+/// Which role the pipe thread serves.
 ///
 /// [`PipeRole::Daemon`] is today's behaviour byte for byte: `ping`/`status`
 /// from the snapshot, mutating commands forwarded to the main loop, the
 /// flush-ack handshake for `quit`. [`PipeRole::Listener`] answers in place —
 /// the listener has no engine and no command loop, so only the commands it
-/// can answer honestly are served (`design-m5b.md` §4.5).
+/// can answer honestly are served.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PipeRole {
     Daemon,
@@ -173,12 +173,12 @@ pub enum Command {
     LibraryList {
         id: u64,
     },
-    /// `library.add` — canonicalise, probe, dedupe, persist (design-m4 §4).
+    /// `library.add` — canonicalise, probe, dedupe, persist.
     LibraryAdd {
         id: u64,
         paths: Vec<String>,
     },
-    /// `library.remove` — edit the list only (AGENTS §3.3).
+    /// `library.remove` — edit the list only.
     LibraryRemove {
         id: u64,
         item_id: String,
@@ -194,7 +194,7 @@ pub enum Command {
         item_id: String,
         monitor: Option<String>,
     },
-    /// `assess` (S5, design-m4 §5): probe-once when the library's
+    /// `assess`: probe-once when the library's
     /// `mtime`+`size` proof is stale, run the pure metric engine, answer
     /// with the report. Read-only — never touches playback.
     Assess {
@@ -228,15 +228,15 @@ impl Command {
     }
 }
 
-/// The channel half the server thread owns (design-m4 §2.2): it receives
+/// The channel half the server thread owns: it receives
 /// snapshots and responses, forwards commands, and acks a response whose
 /// write is done (`quit`, and a respawn-triggering `wallpaper.set` —
-/// design-m2 §4). The main loop keeps the mirrored senders/receivers.
+/// The main loop keeps the mirrored senders/receivers.
 pub struct PipeChannels {
     pub messages: Receiver<ServerMsg>,
     pub commands: Sender<Command>,
     pub flush_acked: Sender<()>,
-    /// The metadata probe for `library.add` (`design-m5b.md` §4.5). The
+    /// The metadata probe for `library.add`. The
     /// listener answers `library.*` in place on this thread, so the probe
     /// rides along; the daemon forwards to its main loop and passes `None`
     /// (its probe lives in the main-loop context).
@@ -244,7 +244,7 @@ pub struct PipeChannels {
 }
 
 /// The server half: created on the main thread (it *is* the single-instance
-/// lock, `ipc.md` §1), then moved into the server thread.
+/// lock), then moved into the server thread.
 pub struct PipeServer {
     handle: HANDLE,
 }
@@ -258,7 +258,7 @@ impl PipeServer {
     pub fn create() -> Result<Self, u32> {
         let name = wide::to_wide(&server_name());
         // SAFETY: `name` is NUL-terminated; null SECURITY_ATTRIBUTES gives
-        // the default DACL (same user only, `ipc.md` §1); buffers are
+        // the default DACL (same user only); buffers are
         // kernel-side sizes, not pointers.
         let handle = unsafe {
             CreateNamedPipeW(
@@ -281,8 +281,8 @@ impl PipeServer {
 
     /// Move the handle into a server thread. The thread is process-scoped:
     /// it blocks in `ConnectNamedPipe`/`ReadFile`, is never joined, and
-    /// dies with the process (design-m4 §2.3, S1 note). `role` selects the
-    /// dispatch behaviour (`design-m5b.md` §4.5). Returns the spawn
+    /// dies with the process (note). `role` selects the
+    /// dispatch behaviour. Returns the spawn
     /// result so the caller can log a failure and keep running without a
     /// control channel — the desktop must stay up regardless.
     pub fn serve(self, channels: PipeChannels, role: PipeRole) -> Result<(), u32> {
@@ -384,7 +384,7 @@ fn serve_connection(
         }
 
         // A line longer than the cap with no newline yet: reject and drop
-        // the connection rather than buffer unbounded data (`ipc.md` §2).
+        // the connection rather than buffer unbounded data.
         if pending.len() > MAX_LINE_BYTES {
             let response = Response::err(
                 0,
@@ -419,7 +419,7 @@ fn dispatch_line(
         }
     };
 
-    // The listener answers in place (`design-m5b.md` §4.5): no command loop
+    // The listener answers in place: no command loop
     // exists on the other side of its channel. Envelope errors above stay
     // shared — both roles see the same protocol edge.
     if role == PipeRole::Listener {
@@ -452,7 +452,7 @@ fn dispatch_line(
         "settings.get" => {
             drain(channels, latest);
             let mut settings = snapshot_or_boot(latest).settings;
-            // Wire edge (design-m4 D10): the Run key, never the file.
+            // Wire edge: the Run key, never the file.
             settings.autostart = registry::autostart_state(&exe_path()).registered;
             match serde_json::to_value(settings) {
                 Ok(value) => Response::ok(request.id, value),
@@ -490,7 +490,7 @@ fn dispatch_line(
                 (None, None) => Response::err(
                     request.id,
                     ipc::ErrorCode::BadRequest,
-                    "wallpaper.set needs {\"path\":\"C:\\\\videos\\\\clip.mp4\"} (library ids arrive with the library, slice S3)",
+                    "wallpaper.set needs {\"path\":\"C:\\\\videos\\\\clip.mp4\"} (library ids arrive with the library)",
                 ),
                 (None, Some(item_id)) => forward(
                     channels,
@@ -624,8 +624,8 @@ fn dispatch_line(
     let written = write_response(handle, &response);
     if response.flush_after {
         // The client has its answer (or is gone): ack so the main loop can
-        // run the exit ladder and respawn (design-m2 §4 — the same flush
-        // handshake as `quit`, design-m4 §2.3). Acking even a failed write
+        // run the exit ladder and respawn (the same flush
+        // handshake as `quit`). Acking even a failed write
         // keeps the decision made in the main loop from stalling on a
         // client that disappeared mid-answer.
         let _ = channels.flush_acked.send(());
@@ -633,8 +633,8 @@ fn dispatch_line(
     written
 }
 
-/// The listener's command set (`design-m5b.md` §4.5): `ping`, `status`,
-/// `quit`, the `settings.*`/`autostart.*`/`library.*` file ops (Pw2-S3,
+/// The listener's command set: `ping`, `status`,
+/// `quit`, the `settings.*`/`autostart.*`/`library.*` file ops (
 /// answered in place with the `offline::*` core), and the honest "no engine
 /// is running" answer for everything else. Returns `false` when the
 /// connection must close (write failed).
@@ -668,7 +668,7 @@ fn dispatch_listener(
                 ),
             }
         }
-        // `design-m5b.md` §4.5: file ops, answered in place with the same
+        // file ops, answered in place with the same
         // `offline::*` core the Pw1 CLI uses — byte-identical payload to
         // the daemon's arms, so scripts cannot tell which role answered.
         "settings.get" => match serde_json::to_value(offline::settings_get()) {
@@ -682,7 +682,7 @@ fn dispatch_listener(
         "settings.set" => match serde_json::from_value::<SettingsPatch>(request.data.clone()) {
             Ok(patch) => match offline::settings_apply(patch) {
                 Ok(settings) => {
-                    // T4 (`design-m5b.md` §4.4): lifting the stop rule
+                    // lifting the stop rule
                     // hands the session over to a full daemon — record the
                     // request, wake the main loop, and answer the client
                     // with the persisted settings first.
@@ -723,7 +723,7 @@ fn dispatch_listener(
             ),
         },
         "library.add" => match serde_json::from_value::<LibraryAddData>(request.data.clone()) {
-            // Same validation and wording as the daemon's arm (§4.5).
+            // Same validation and wording as the daemon's arm.
             Ok(data) if data.paths.is_empty() => Response::err(
                 request.id,
                 ipc::ErrorCode::BadRequest,
@@ -770,7 +770,7 @@ fn dispatch_listener(
             Ok(data) => match offline::library_remove(&data.id) {
                 // Payload identical to the daemon: `ok`, no data.
                 Ok(Some(_)) => Response::ok(request.id, no_data()),
-                // Same wording as the daemon's `NotFound` (§4.5).
+                // Same wording as the daemon's `NotFound`.
                 Ok(None) => Response::err(
                     request.id,
                     ipc::ErrorCode::NotFound,
@@ -803,9 +803,9 @@ fn dispatch_listener(
                 format!("could not prune the library: {err}"),
             ),
         },
-        // `design-m5b.md` §4.5: ok → flush ack → exit, no respawn. The
+        // ok → flush ack → exit, no respawn. The
         // client has its answer before the main loop is asked to stop —
-        // the same handshake as the daemon's `quit` (design-m4 §2.3); the
+        // the same handshake as the daemon's `quit`; the
         // ack itself only reaches a loop that waits for it (the listener's
         // main loop reads it on the wake below).
         "quit" => {
@@ -821,7 +821,7 @@ fn dispatch_listener(
             }
             return written;
         }
-        // Engine-only commands (`design-m5b.md` §4.5): honest text, exact
+        // Engine-only commands: honest text, exact
         // wording — the CLI prints it verbatim.
         _ => Response::err(
             request.id,
@@ -833,9 +833,9 @@ fn dispatch_listener(
     write_response(handle, &response)
 }
 
-/// The listener's `status` (`design-m5b.md` D6): `build_status` fills
+/// The listener's `status`: `build_status` fills
 /// `engine:"running"` for the daemon — the listener has no engine and says
-/// so. The rest of D6 comes from the snapshot itself (`mode:"listening"`,
+/// so. The rest of comes from the snapshot itself (`mode:"listening"`,
 /// `host.strategy:"none"`, monitors without playback, own process counters,
 /// autostart from the Run key).
 fn listener_status(snapshot: &StatusSnapshot) -> Status {
@@ -845,7 +845,7 @@ fn listener_status(snapshot: &StatusSnapshot) -> Status {
 }
 
 /// Hand a mutating command to the main loop and wait for its response
-/// (design-m4 §2.2: 2 s cap, then `busy`). Returns the response to write.
+/// 2 s cap, then `busy`). Returns the response to write.
 fn forward(
     channels: &PipeChannels,
     latest: &mut Option<Arc<StatusSnapshot>>,
@@ -873,7 +873,7 @@ fn submit(
     let id = command.id();
     channels.commands.send(command).ok()?;
     // Wake the main loop so it drains the channel now instead of on the
-    // next watchdog tick (design-m4 §2.2).
+    // next watchdog tick.
     if let Some(hwnd) = control::find_existing() {
         control::post(hwnd, WM_APP_PIPE);
     }
@@ -896,7 +896,7 @@ fn submit(
 
 /// `quit`: submit, write the response, then ack — the main loop starts the
 /// exit ladder only after the client has its answer, so the daemon can
-/// never tear the pipe down mid-write (design-m4 §2.3). A failed submit
+/// never tear the pipe down mid-write. A failed submit
 /// answers `busy` without the ack: the main loop never saw the command.
 fn quit_flow(
     handle: HANDLE,
@@ -942,7 +942,7 @@ fn exe_path() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::new())
 }
 
-/// The Run-key view of autostart (`ipc.md` §3): shared by `status`,
+/// The Run-key view of autostart: shared by `status`,
 /// `settings.get`, and `autostart.*` so all three always agree.
 fn autostart_status() -> AutostartStatus {
     let state = registry::autostart_state(&exe_path());
@@ -953,7 +953,7 @@ fn autostart_status() -> AutostartStatus {
 }
 
 /// `autostart.get` — shared by the daemon dispatch and the listener
-/// dispatch (`design-m5b.md` §4.5: the Run key, handled on the pipe
+/// dispatch : the Run key, handled on the pipe
 /// thread in both roles, no main loop).
 fn autostart_get(id: u64) -> Response {
     match serde_json::to_value(autostart_status()) {
@@ -967,7 +967,7 @@ fn autostart_get(id: u64) -> Response {
 }
 
 /// `autostart.set` — shared by both dispatch halves. Registry work is
-/// cheap and the Run key is the oracle (design-m4 D10): handled right
+/// cheap and the Run key is the oracle: handled right
 /// here, no main loop in either role.
 fn autostart_set(id: u64, request: &ipc::Request) -> Response {
     match serde_json::from_value::<EnabledData>(request.data.clone()) {
@@ -995,7 +995,7 @@ fn autostart_set(id: u64, request: &ipc::Request) -> Response {
 }
 
 /// Assemble `status`: snapshot (render-loop state) + counters this thread
-/// may read on its own (`ipc.md` §4: the daemon fills `memory` itself).
+/// may read on its own : the daemon fills `memory` itself).
 fn build_status(snapshot: &StatusSnapshot) -> Status {
     Status {
         engine: "running".to_string(),
@@ -1007,7 +1007,7 @@ fn build_status(snapshot: &StatusSnapshot) -> Status {
             .map(|monitor| {
                 // Only the monitor the engine is attached to carries
                 // playback fields; the rest keep their `None`s and the
-                // wire omits them (`ipc.md` §4, M4 S3b).
+                // wire omits them.
                 let playback = snapshot
                     .playback
                     .as_ref()
@@ -1034,7 +1034,7 @@ fn build_status(snapshot: &StatusSnapshot) -> Status {
     }
 }
 
-/// This process's working set and private bytes (`ipc.md` §4).
+/// This process's working set and private bytes.
 fn memory_status() -> cascade_core::ipc::MemoryStatus {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
@@ -1117,7 +1117,7 @@ mod tests {
 
     #[test]
     fn listener_status_reports_no_engine_per_d6() {
-        // design-m5b D6: the listener tells the truth about what it is —
+        // the listener tells the truth about what it is —
         // `engine:"stopped"`, `mode:"listening"`, no host, no playback,
         // monitors listed by identity only.
         let snapshot = StatusSnapshot {
@@ -1140,9 +1140,9 @@ mod tests {
 
     #[test]
     fn build_status_fills_only_the_attached_monitor_row() {
-        // M4 S3b: the playback row lands on the monitor the engine is
+        // the playback row lands on the monitor the engine is
         // attached to; every other monitor keeps its `None`s and the wire
-        // omits them (ipc.md §4). An unobservable value stays `None` —
+        // omits them. An unobservable value stays `None` —
         // never a placeholder `false`.
         let monitors = vec![
             MonitorInfo {

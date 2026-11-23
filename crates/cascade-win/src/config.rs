@@ -1,5 +1,5 @@
-//! Persistent settings (`%APPDATA%\Cascade\config.toml`, `architecture.md`
-//! §10, design-m4 D10).
+//! Persistent settings (`%APPDATA%\Cascade\config.toml`,
+//!
 //!
 //! The file holds the **file-backed** subset of the wire `Settings`: the
 //! pause toggles and the power cluster. `autostart` is deliberately absent —
@@ -20,7 +20,7 @@ use cascade_core::PresentationMode;
 use serde::{Deserialize, Serialize};
 
 /// `config.toml` on disk. The table layout mirrors the documented example
-/// in `architecture.md` §10; keep the names in sync when either changes.
+/// in; keep the names in sync when either changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -32,16 +32,16 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct General {
-    /// Stored from S2 with no runtime consumer: the exit ladder always
-    /// restores the desktop (AGENTS §3.1 outranks the flag).
+    /// Stored from with no runtime consumer: the exit ladder always
+    /// restores the desktop (outranks the flag).
     pub restore_wallpaper_on_exit: bool,
-    /// Consumed by the M5 tray.
+    /// Consumed by the tray.
     pub tray: bool,
-    /// Engine route the child builds at start (`design-engine-mode.md` §2):
+    /// Engine route the child builds at start:
     /// `accurate` (default) or `efficient`. Absent in an older file decodes
     /// to `accurate`, so upgrading never changes behaviour on its own.
     pub engine_mode: PresentationMode,
-    /// Audio level 0–100 (`design-volume.md` §2): `0` = muted (default).
+    /// Audio level 0–100: `0` = muted (default).
     /// Absent in an older file decodes to `0`, so upgrading never makes
     /// noise on its own.
     pub volume: u8,
@@ -61,9 +61,9 @@ impl Default for General {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Power {
-    /// D8 default `off`.
+    /// default `off`.
     pub profile: PowerProfile,
-    /// Absent in a hand-written file means "not set" → the D9 preset fills
+    /// Absent in a hand-written file means "not set" → the preset fills
     /// it from the profile on load. Writes from the daemon always emit the
     /// key, so an explicit `on_battery = "off"` is respected, not refilled.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,7 +98,7 @@ pub fn load() -> Settings {
     }
 }
 
-/// Load from an explicit path — the offline CLI (`design-m5b.md` §3) and
+/// Load from an explicit path — the offline CLI and
 /// tests use this so neither touches the real profile. Same rules as
 /// [`load`]: missing file = first run, corrupt file = logged defaults.
 pub(crate) fn load_at(path: &Path) -> Settings {
@@ -156,7 +156,7 @@ impl Config {
     /// Wire view of the file. `autostart` is never stored, so it keeps the
     /// `Settings::default()` placeholder until the daemon fills it from the
     /// registry at the wire edge. A file without an `on_battery` key gets
-    /// the D9 profile preset, exactly like `settings set power_profile`.
+    /// the profile preset, exactly like `settings set power_profile`.
     pub fn into_settings(self) -> Settings {
         let preset = self.power.on_battery.is_none();
         let mut settings = Settings {
@@ -167,7 +167,7 @@ impl Config {
             tray: self.general.tray,
             engine_mode: self.general.engine_mode,
             // A hand-edited `volume = 200` must not reach the engine
-            // (design-volume §3): the CLI and the wire clamp too.
+            // the CLI and the wire clamp too.
             volume: self.general.volume.min(100),
             ..Settings::default()
         };
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn autostart_is_never_written_to_the_file() {
-        // The Run key is the oracle (design-m4 D10): a file copy would drift.
+        // The Run key is the oracle: a file copy would drift.
         let (dir, path) = temp_path("autostart");
         let settings = Settings {
             autostart: true,
@@ -266,13 +266,13 @@ mod tests {
     fn corrupt_file_yields_defaults_and_partial_file_gets_the_preset() {
         let (dir, _path) = temp_path("corrupt");
         // A partial file fills the rest from the documented defaults, and a
-        // profile without an on_battery key gets the D9 preset on load.
+        // profile without an on_battery key gets the preset on load.
         let partial = read("[power]\nprofile = \"battery\"\n");
         assert_eq!(partial.power_profile, PowerProfile::Battery);
         assert_eq!(
             partial.on_battery,
             BatteryAction::Pause,
-            "D9 preset on load"
+            "power-profile preset on load"
         );
         assert_eq!(partial.pause, PauseSettings::default());
         assert!(partial.tray);
@@ -300,11 +300,11 @@ mod tests {
         // …and a file written before volume existed stays silent.
         assert_eq!(loaded.volume, 0, "old files never make noise");
 
-        // An explicit engine_mode is read back (design-engine-mode §5).
+        // An explicit engine_mode is read back.
         let efficient = read("[general]\nengine_mode = \"efficient\"\n");
         assert_eq!(efficient.engine_mode, PresentationMode::Efficient);
 
-        // An explicit volume is read back; above 100 clamps (design-volume §3).
+        // An explicit volume is read back; above 100 clamps.
         let audible = read("[general]\nvolume = 50\n");
         assert_eq!(audible.volume, 50);
         let too_loud = read("[general]\nvolume = 200\n");

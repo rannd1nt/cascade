@@ -31,14 +31,14 @@ pub struct DaemonState {
     pub color: String,
     pub repaint_level: u32,
     pub host_mode: String,
-    /// Last video that played successfully, if any (design-m2 §5): a bare
+    /// Last video that played successfully, if any: a bare
     /// `cascade run` replays it. Additive — `STATE_VERSION` stays 1 and a
     /// `state.json` written before slice 2 still loads (`serde(default)`).
     #[serde(default)]
     pub video: Option<String>,
     /// Monitor the last `wallpaper.set` targeted (`\\.\DISPLAYn`); `None`
-    /// means "first window" (design-m4 §5.4). Additive like `video` — a
-    /// `state.json` written before M4 S2 still loads.
+    /// means "first window". Additive like `video` — a
+    /// `state.json` written before still loads.
     #[serde(default)]
     pub monitor: Option<String>,
 }

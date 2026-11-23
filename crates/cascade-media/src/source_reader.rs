@@ -6,30 +6,30 @@
 //! staging texture → `CopyResource` + `Present` on our own DXGI flip
 //! swapchain on the host HWND.
 //!
-//! E3 experiments (`CASCADE_TIER2_E3*`, off by default): attach MF's DXGI
-//! device manager so decode (DXVA) runs on the GPU. E3a
+//! experiments (`CASCADE_TIER2_E3*`, off by default): attach MF's DXGI
+//! device manager so decode (DXVA) runs on the GPU.
 //! (`CASCADE_TIER2_E3=1`) also had MF do YUV→RGB + resize (XVP) — measured
-//! crashing the Intel driver, kept for the record. E3b
+//! crashing the Intel driver, kept for the record.
 //! (`CASCADE_TIER2_E3B=1`) negotiates NV12 and does the convert + scale
 //! OURSELVES via `ID3D11VideoProcessor` (mpv-style, plain Microsoft APIs),
-//! never touching MF's XVP. Any E3 setup failure falls back to the NV12
+//! never touching MF's XVP. Any setup failure falls back to the NV12
 //! CPU path.
 //!
 //! COM + SourceReader + D3D11 all live on the playback thread (started on
 //! `attach_surface`, stopped on `detach_surface`), so no COM interfaces
-//! cross thread boundaries (AGENTS §4).
+//! cross thread boundaries.
 //!
 //! Dependency direction: `cascade-media` does NOT depend on `cascade-win`.
 //! The swapchain is created here directly via DXGI.
 //!
-//! Design notes (`docs/rnd-tier2-*.md`):
-//! - The swap chain back buffer is a `D3D11_USAGE_DEFAULT` texture and
+//! Design notes ():
+//! The swap chain back buffer is a `D3D11_USAGE_DEFAULT` texture and
 //!   cannot be `Map()`ped; the converter writes into a `STAGING` texture
 //!   which is copied to the back buffer.
-//! - The host surface size (1366x768) usually differs from the video size
+//! The host surface size (1366x768) usually differs from the video size
 //!   (1920x1080); the converter samples the frame with nearest-neighbour
 //!   scaling into the surface rectangle.
-//! - `Present(1, 0)` blocks on vsync, which is the frame pacing. There is
+//! `Present(1, 0)` blocks on vsync, which is the frame pacing. There is
 //!   no `sleep(16)` after a successful present anymore.
 
 use std::mem::ManuallyDrop;
@@ -96,8 +96,8 @@ pub(crate) const MF_SOURCE_READER_FLAG_ERROR: u32 = 0x8;
 
 // H.264 / AVC is the only codec Cascade ships support for in v1. Everything
 // else is rejected with a clear, actionable message. The probe below answers
-// two *different* questions, and M7-P0 keeps them separate because a bool
-// cannot express "we could not tell" (docs/design-m7-p0-honesty.md §3).
+// two *different* questions, and keeps them separate because a bool
+// cannot express "we could not tell".
 
 /// What the H.264 probe could actually prove about this machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,7 +105,7 @@ enum H264Evidence {
     /// A hardware MFT explicitly registered `MFVideoFormat_H264` as input.
     MftRegistered,
     /// Hardware decode may still be active, but no H.264 MFT registration
-    /// proves it. Measured D12: Intel UHD registers only an M-JPEG MFT while
+    /// proves it. Measured: Intel UHD registers only an M-JPEG MFT while
     /// GPU VideoDecode handles H.264. `stats()` must report `None`, never
     /// `Some(false)` — an unobservable capability is not an absent one.
     Unobservable,
@@ -175,14 +175,14 @@ unsafe fn release_activate_array(array: *mut Option<IMFActivate>, count: u32) {
 /// Two questions are answered, and they must not be confused:
 ///
 /// 1. **Load acceptance** (the `Result`): does *any* hardware decoder MFT
-///    exist? This stays unfiltered by subtype because measured D12 case has
+///    exist? This stays unfiltered by subtype because measured case has
 ///    an Intel UHD that registers only M-JPEG while GPU decode is active;
 ///    filtering acceptance by H.264 would reject every video there.
 /// 2. **Evidence** (the returned [`H264Evidence`]): did a hardware MFT
 ///    explicitly register H.264? Only that permits `hwdec: true` on the wire.
 ///
 /// A failure of the second, filtered query is `Unobservable`, not a load
-/// error: the unfiltered call already proved MF works (design note §3 S5).
+/// error: the unfiltered call already proved MF works (design note ).
 fn probe_hw_decoder() -> BackendResult<H264Evidence> {
     // SAFETY: initialised out-params, released below on every success path.
     let (array, count) = unsafe { enum_hw_decoders(None)? };
@@ -238,7 +238,7 @@ fn log_adapter(device: &ID3D11Device) {
     eprintln!("cascade: SourceReader: D3D11 adapter={name}  vram={vram:.1} GB");
 }
 
-/// One-shot guard: log the E3 GPU texture description exactly once.
+/// One-shot guard: log the GPU texture description exactly once.
 static E3_GPU_DESC_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Configuration handed to the playback thread.
@@ -278,7 +278,7 @@ pub struct SourceReaderBackend {
     frames_presented: Arc<AtomicU64>,
     width: AtomicU32,
     height: AtomicU32,
-    /// True when `new()` initialized COM on this thread (AGENTS §4). Only
+    /// True when `new()` initialized COM on this thread. Only
     /// then does `Drop` call `CoUninitialize`.
     com_ours: bool,
 }
@@ -295,7 +295,7 @@ impl SourceReaderBackend {
     pub fn new() -> BackendResult<Self> {
         // COM first, then MF — the same order as `MediaEngineBackend::new`:
         // `MFTEnumEx` in `load()` creates COM objects and needs an apartment
-        // on the calling thread (AGENTS §4: apartment-initialized per
+        // on the calling thread : apartment-initialized per
         // thread). Without either prerequisite the probe can block forever.
         // SAFETY: null reserved pointer is the documented value; `Drop` only
         // uninitializes when this call is the one that initialized COM.
@@ -353,7 +353,7 @@ impl SourceReaderBackend {
     /// into its log file, and a silent early return is what made the first
     /// Tier 2 build show only the host's teal clear colour.
     fn playback_thread(config: PlaybackConfig, cmd_rx: mpsc::Receiver<PlaybackCmd>) {
-        // SAFETY: COM must be initialized on this thread (AGENTS §4).
+        // SAFETY: COM must be initialized on this thread.
         let hr = unsafe {
             windows::Win32::System::Com::CoInitializeEx(
                 None,
@@ -374,11 +374,11 @@ impl SourceReaderBackend {
             return;
         }
 
-        // E3 experiments (docs/rnd-tier2-step5-measurement.md):
-        // - E3a (CASCADE_TIER2_E3): MF does decode + YUV→RGB + resize on the
+        // experiments:
+        // (CASCADE_TIER2_E3): MF does decode + YUV→RGB + resize on the
         //   GPU via its video processor (XVP). Measured dead on this machine
         //   (Intel driver crash, 4/4 — Appendix D).
-        // - E3b (CASCADE_TIER2_E3B): MF only DECODES on the GPU (NV12 out);
+        // (CASCADE_TIER2_E3B): MF only DECODES on the GPU (NV12 out);
         //   convert + scale are ours via ID3D11VideoProcessor, bypassing the
         //   crashing XVP entirely.
         // Any setup failure falls back to the NV12 CPU path.
@@ -402,7 +402,7 @@ impl SourceReaderBackend {
 
         // ── D3D11 device + context (the swapchain owner) ──
         //    Created before the reader so the MF device-manager hook-up
-        //    has it early; behaviour is unchanged without E3. E3 adds
+        // has it early; behaviour is unchanged without. adds
         //    D3D11_CREATE_DEVICE_VIDEO_SUPPORT — the documented flag for
         //    video processing features on the device (MF's XVP / our
         //    D3D11 video processor).
@@ -442,14 +442,14 @@ impl SourceReaderBackend {
         };
 
         // ── Create the SourceReader (hardware decode via D3D manager) ──
-        // E3 experiment (docs/rnd-tier2-step5-measurement.md): when
+        // experiment: when
         // requested, MF gets our D3D device so decode + YUV→RGB + resize
         // run on the GPU. Any setup failure falls back to the NV12 CPU path.
         let e3_plan = e3_manager.as_ref().map(|manager| E3Request {
             manager,
             out_size: (config.width, config.height),
             native: e3_native,
-            // E3b never enables advanced video processing (that is E3a's
+            // never enables advanced video processing (that is 's
             // XVP, measured crashing) and negotiates NV12 instead of RGB32.
             advanced: !e3_no_adv && !e3b,
             nv12_gpu: e3b,
@@ -498,12 +498,12 @@ impl SourceReaderBackend {
             }
         };
 
-        // ── Colour tags from the bitstream (P1 colour fix) ──
-        // MF ignores H.264 VUI colour flags (notes-p1-color-601 D1) and the
-        // canonical gate asset has no `colr` box (E1-1), so the SPS VUI is
-        // the only trustworthy matrix source (design-p1-color §4.1).
+        // ── Colour tags from the bitstream (colour fix) ──
+        // MF ignores H.264 VUI colour flags and the
+        // canonical gate asset has no `colr` box, so the SPS VUI is
+        // the only trustworthy matrix source.
         // Computed once per load: the sequence header belongs to the file,
-        // so the reader reopens below (E3b fallback) do not change it.
+        // so the reader reopens below (fallback) do not change it.
         let colour = sequence_header_tags(&reader);
         eprintln!(
             "cascade: SourceReader: colour tags: matrix={} range={} (VUI matrix_coefficients={})",
@@ -526,7 +526,7 @@ impl SourceReaderBackend {
                 output_subtype(&reader)
             );
         } else {
-            // NV12 (plain, E3a fallback, or E3b: GPU-backed with the manager).
+            // NV12 (plain, fallback, or: GPU-backed with the manager).
             eprintln!(
                 "cascade: SourceReader output subtype before: {}",
                 output_subtype(&reader)
@@ -548,7 +548,7 @@ impl SourceReaderBackend {
         // ── Swapchain + staging texture ──
         // Always BGRA8: flip-model swap chains only accept R16G16B16A16_FLOAT,
         // B8G8R8A8_UNORM, R8G8B8A8_UNORM and R10G10B10A2_UNORM (X8 was
-        // rejected with DXGI_ERROR_INVALID_CALL, measured). E3's X8 texture
+        // rejected with DXGI_ERROR_INVALID_CALL, measured). 's X8 texture
         // is therefore copied across (identical 4-byte layout; the swapchain
         // ignores alpha via DXGI_ALPHA_MODE_IGNORE).
         let surface_format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -569,9 +569,9 @@ impl SourceReaderBackend {
                 return;
             }
         };
-        // E3b renders straight into the back buffer via VideoProcessorBlt;
-        // the staging texture is only needed by the E3a / CPU convert path.
-        // Skip it in pure E3b mode to save ~8-15 MB of private working set.
+        // renders straight into the back buffer via VideoProcessorBlt;
+        // the staging texture is only needed by the / CPU convert path.
+        // Skip it in pure mode to save ~8-15 MB of private working set.
         let staging: Option<ID3D11Texture2D> = if e3b && e3_active {
             None
         } else {
@@ -600,7 +600,7 @@ impl SourceReaderBackend {
             }
         };
 
-        // ── E3b: own D3D11 video processor (NV12 → BGRA + scale on GPU) ──
+        // ── Own D3D11 video processor (NV12 → BGRA + scale on GPU) ──
         // Created after the back buffer (it renders into it). The exact
         // input size is learned from the first frame's texture, so no video
         // dimension assumptions are made here. On any setup failure the
@@ -656,7 +656,7 @@ impl SourceReaderBackend {
         };
 
         // Log video FPS for diagnostics. Query here (works for all paths,
-        // not just E3b) so the startup line always shows the source frame rate.
+        // not just ) so the startup line always shows the source frame rate.
         let video_fps = query_frame_rate(&reader).unwrap_or((0, 1));
         let video_fps_num = if video_fps.1 > 0 {
             video_fps.0 as f32 / video_fps.1 as f32
@@ -679,7 +679,7 @@ impl SourceReaderBackend {
         let mut warned_present = false;
         let mut warned_alloc = false;
         let mut warned_staging = false;
-        // E3: one-shot log of the consume path and of each distinct error.
+        // one-shot log of the consume path and of each distinct error.
         let mut last_e3_path: Option<E3Path> = None;
         let mut last_e3_err: Option<String> = None;
         let mut eos_total: u64 = 0;
@@ -804,7 +804,7 @@ impl SourceReaderBackend {
                                 );
                                 reader = fresh;
                                 stalled_eos = 0;
-                                // E3 already negotiated RGB32 inside open_reader.
+                                // already negotiated RGB32 inside open_reader.
                                 if !e3_active {
                                     if let Err(reason) = negotiate_nv12(&reader) {
                                         eprintln!(
@@ -863,7 +863,7 @@ impl SourceReaderBackend {
             same_ts_streak = 0;
             last_timestamp = timestamp;
 
-            // RND experiment only (docs/rnd-tier2-step5-measurement.md):
+            // RND experiment only:
             // CASCADE_TIER2_SKIP_PRESENT=1 measures decode-only CPU — the
             // convert/upload/present path is skipped, pacing via sleep(16).
             if skip_present {
@@ -875,12 +875,12 @@ impl SourceReaderBackend {
 
             // ── Consume the decoded frame ──
             // `cpu_frame` runs the NV12 CPU converter whenever the frame is
-            // not handled on the GPU: normal Tier 2, E3a fallback, E3b after
-            // a failed setup, or an E3b sample that turned out not to be
+            // not handled on the GPU: normal Tier 2, fallback, after
+            // a failed setup, or an sample that turned out not to be
             // GPU-backed (software decode fallback).
             let mut cpu_frame = !e3_active;
             if e3b && e3_active {
-                // E3b: MF hands us an NV12 DXGI texture; our video
+                // MF hands us an NV12 DXGI texture; our video
                 // processor converts + scales it straight into the back
                 // buffer (never through the CPU). Each distinct error is
                 // logged once.
@@ -918,7 +918,7 @@ impl SourceReaderBackend {
                     None => cpu_frame = true,
                 }
             } else if e3_active {
-                // E3a: RGB32 arrives either as a DXGI texture (GPU path:
+                // RGB32 arrives either as a DXGI texture (GPU path:
                 // CopyResource straight to the back buffer) or as a CPU
                 // buffer (row copy into staging). Each distinct error is
                 // logged once instead of every frame.
@@ -929,7 +929,7 @@ impl SourceReaderBackend {
                     consume_e3_sample(
                         &sample,
                         &context,
-                        staging.as_ref().unwrap(), // E3a path: staging is always Some
+                        staging.as_ref().unwrap(), // path: staging is always Some
                         &back_buffer,
                         out_w,
                         out_h,
@@ -956,8 +956,8 @@ impl SourceReaderBackend {
 
             if cpu_frame {
                 // ── NV12 → BGR8 → copy → present ──
-                // E3b GPU path doesn't use staging; only the CPU fallback
-                // path needs it. If staging is None (pure E3b mode), skip.
+                // GPU path doesn't use staging; only the CPU fallback
+                // path needs it. If staging is None (pure mode), skip.
                 let Some(staging) = &staging else {
                     if !warned_staging {
                         warned_staging = true;
@@ -1061,7 +1061,7 @@ impl SourceReaderBackend {
                     );
                 }
 
-                // RND diagnosis (docs/rnd-tier2-step5-measurement.md): paint the
+                // RND diagnosis: paint the
                 // first 16 staging rows solid red. If the on-screen band turns
                 // red, the band comes from our converted content; if it stays
                 // green, it is added downstream of the staging texture.
@@ -1204,7 +1204,7 @@ impl Drop for SourceReaderBackend {
 
 impl MediaBackend for SourceReaderBackend {
     fn load(&mut self, source: &Path, opts: &PlaybackOptions) -> BackendResult<()> {
-        // M2.5 + M7-P0: prove a hardware decoder exists (unfiltered, the
+        // 5 +: prove a hardware decoder exists (unfiltered, the
         // load gate), then record whether H.264 registration was actually
         // observed. The two answers must not be conflated.
         let evidence = probe_hw_decoder()?;
@@ -1245,7 +1245,7 @@ impl MediaBackend for SourceReaderBackend {
     fn set_volume(&mut self, _level: u8) -> BackendResult<()> {
         // No audio stream exists on this route — every stream but the video
         // is deselected at load (the `--aid=no` equivalent), so there is no
-        // session to adjust (design-volume §6).
+        // session to adjust.
         Ok(())
     }
 
@@ -1253,7 +1253,7 @@ impl MediaBackend for SourceReaderBackend {
         BackendStats {
             // Only a confirmed H.264 MFT registration may answer `true`.
             // `Unobservable` (and no load at all) stays `None` — claiming
-            // `Some(false)` would be a guess, which `ipc.md` forbids.
+            // `Some(false)` would be a guess, which forbids.
             hardware_decode: self.h264_evidence.and_then(H264Evidence::as_backend_report),
             decoded_frames: self.frames_read.load(Ordering::Acquire),
             dropped_frames: 0,
@@ -1263,7 +1263,7 @@ impl MediaBackend for SourceReaderBackend {
             ),
             fps: self.measured_fps.load(Ordering::Acquire) as f32,
             // Not an MF media engine: the `engine` status field is the
-            // engine backend's alone (design-p1-color §4.5.1).
+            // engine backend's alone.
             engine_mode: None,
         }
     }
@@ -1286,7 +1286,7 @@ impl MediaBackend for SourceReaderBackend {
     }
 }
 
-/// E3 setup handed to `open_reader` (experiments, `CASCADE_TIER2_E3*`).
+/// setup handed to `open_reader` (experiments, `CASCADE_TIER2_E3*`).
 #[derive(Clone, Copy)]
 struct E3Request<'a> {
     manager: &'a IMFDXGIDeviceManager,
@@ -1301,7 +1301,7 @@ struct E3Request<'a> {
     /// converter MFT path instead of the XVP (which crashes the Intel
     /// driver on this machine, measured 4/4).
     advanced: bool,
-    /// E3b (`CASCADE_TIER2_E3B=1`): negotiate NV12 instead of RGB32 —
+    /// (`CASCADE_TIER2_E3B=1`): negotiate NV12 instead of RGB32 —
     /// MF only decodes on the GPU; conversion/scaling are ours
     /// (`ID3D11VideoProcessor`), so no XVP is ever created.
     nv12_gpu: bool,
@@ -1309,12 +1309,12 @@ struct E3Request<'a> {
 
 /// Open the file and return a reader with only the video stream selected.
 ///
-/// `e3` (E3 experiment): attaches MF's DXGI device manager (hardware
+/// `e3` (experiment): attaches MF's DXGI device manager (hardware
 /// decode + GPU processing) and negotiates RGB32 output, so MF does
-/// YUV→RGB (and optionally the resize) on the GPU. Any E3 failure is an
+/// YUV→RGB (and optionally the resize) on the GPU. Any failure is an
 /// error so the caller can reopen WITHOUT the D3D manager — a reader that
 /// keeps the manager while we consume NV12 on the CPU produces GPU-backed
-/// samples whose `Lock` fails (measured, E2).
+/// samples whose `Lock` fails (measured).
 ///
 /// Used both at startup and as the loop-rewind fallback when a seek is a
 /// silent no-op (a fresh reader always starts at position 0).
@@ -1339,7 +1339,7 @@ fn open_reader(source: &Path, e3: Option<E3Request<'_>>) -> Result<IMFSourceRead
         );
     }
 
-    // E3: hand MF our D3D device. Per the MF_SOURCE_READER_D3D_MANAGER
+    // hand MF our D3D device. Per the MF_SOURCE_READER_D3D_MANAGER
     // docs this — not MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS — is the
     // switch that makes the source reader decode on the GPU.
     if let Some(req) = e3 {
@@ -1376,8 +1376,8 @@ fn open_reader(source: &Path, e3: Option<E3Request<'_>>) -> Result<IMFSourceRead
         );
     }
 
-    // E3a output: RGB32 — MF scales on the GPU (or converts only, when the
-    // native-size diagnostic knob is set). E3b (nv12_gpu) keeps NV12: the
+    // output: RGB32 — MF scales on the GPU (or converts only, when the
+    // native-size diagnostic knob is set). (nv12_gpu) keeps NV12: the
     // caller negotiates it below and our own video processor does convert +
     // scale, so RGB32 (and with it the crashing XVP) is never requested.
     if let Some(req) = e3 {
@@ -1407,7 +1407,7 @@ fn open_reader(source: &Path, e3: Option<E3Request<'_>>) -> Result<IMFSourceRead
 }
 
 /// Open the file for a CPU-side one-frame consumer (the thumbnail
-/// reader, design-m5-p4 §11): video stream selected, no D3D manager,
+/// reader): video stream selected, no D3D manager,
 /// no output negotiation — the caller negotiates its own output type.
 /// `pub(crate)` wrapper so `E3Request` stays private.
 pub(crate) fn open_reader_plain(source: &Path) -> Result<IMFSourceReader, String> {
@@ -1451,7 +1451,7 @@ fn frame_rate_from_u64(packed: u64) -> (u32, u32) {
     ((packed >> 32) as u32, packed as u32)
 }
 
-/// Read `MF_MT_FRAME_RATE` from the native video type for the E3b video
+/// Read `MF_MT_FRAME_RATE` from the native video type for the video
 /// processor content description. `None` when the file does not report one.
 pub(crate) fn query_frame_rate(reader: &IMFSourceReader) -> Option<(u32, u32)> {
     // SAFETY: stream/type indices are the documented video-stream defaults.
@@ -1488,8 +1488,8 @@ fn subtype_name(mt: &IMFMediaType) -> String {
 /// Only NV12 is supported by the CPU converter; anything else is a hard
 /// error so the daemon log shows exactly what happened.
 /// `pub(crate)`: the thumbnail reader (thumbnail.rs) uses the same
-/// proven output type (design-m5-p4 §11 T3 amendment — RGB32 is a
-/// measured dead end on this machine, rnd-tier2-step5 D.3).
+/// proven output type (amendment — RGB32 is a
+/// measured dead end on this machine, D.3).
 pub(crate) fn negotiate_nv12(reader: &IMFSourceReader) -> Result<(), String> {
     // SAFETY: plain COM object creation.
     let mt = unsafe { MFCreateMediaType() }
@@ -1504,10 +1504,10 @@ pub(crate) fn negotiate_nv12(reader: &IMFSourceReader) -> Result<(), String> {
         .map_err(|err| format!("SetCurrentMediaType(NV12): {}", err.message()))
 }
 
-/// Which path an E3 frame took: `"cpu-buffer"` or `"gpu-texture"`.
+/// Which path an frame took: `"cpu-buffer"` or `"gpu-texture"`.
 type E3Path = &'static str;
 
-/// E3: create an MF DXGI device manager bound to `device`.
+/// create an MF DXGI device manager bound to `device`.
 ///
 /// The manager is attached to the SourceReader as
 /// `MF_SOURCE_READER_D3D_MANAGER` — per the Microsoft docs that is the
@@ -1530,7 +1530,7 @@ pub(crate) fn create_dxgi_device_manager(
     Ok(manager)
 }
 
-/// E3: ask the reader for RGB32 frames at `out_w x out_h`.
+/// ask the reader for RGB32 frames at `out_w x out_h`.
 ///
 /// With advanced video processing enabled the reader inserts MF's video
 /// processor (XVP): YUV→RGB conversion and the resize both run on the GPU,
@@ -1539,7 +1539,7 @@ pub(crate) fn create_dxgi_device_manager(
 /// A missing native rate is tolerated — the reader may still accept the
 /// type without it.
 /// `pub(crate)`: the thumbnail reader (thumbnail.rs) reuses it at native
-/// size (design-m5-p4 §11 T3).
+/// size.
 pub(crate) fn negotiate_rgb32(
     reader: &IMFSourceReader,
     out_w: u32,
@@ -1585,7 +1585,7 @@ pub(crate) fn negotiate_rgb32(
 /// are a whole number of `out_h` rows of at least `out_w * 4` bytes.
 /// Returns `None` when the size cannot cover the surface.
 /// `pub(crate)`: the thumbnail reader validates its locked buffer the same
-/// way (design-m5-p4 §11).
+/// way.
 pub(crate) fn rgb32_stride(buf_len: usize, out_w: usize, out_h: usize) -> Option<usize> {
     if out_w == 0 || out_h == 0 {
         return None;
@@ -1604,11 +1604,11 @@ pub(crate) fn rgb32_stride(buf_len: usize, out_w: usize, out_h: usize) -> Option
     None
 }
 
-/// Consume one E3 sample and put the finished frame on screen.
+/// Consume one sample and put the finished frame on screen.
 ///
 /// Two layouts are possible and the reader decides which:
-/// - CPU buffer: RGB32 rows are copied into the staging texture.
-/// - DXGI texture (GPU): `CopyResource` straight into the back buffer —
+/// CPU buffer: RGB32 rows are copied into the staging texture.
+/// DXGI texture (GPU): `CopyResource` straight into the back buffer —
 ///   the pixel data never leaves the GPU (the mpv-style zero-copy path).
 ///
 /// Returns the path taken, or a human-readable reason to skip the frame;
@@ -1756,7 +1756,7 @@ unsafe fn copy_rgb32_rows_to_staging(
     Ok(())
 }
 
-/// E3 GPU path: forward the sample's DXGI texture straight to the back
+/// GPU path: forward the sample's DXGI texture straight to the back
 /// buffer. The pixels never leave the GPU (mpv-style zero-copy present).
 ///
 /// # Safety
@@ -1821,10 +1821,10 @@ unsafe fn e3_consume_gpu(
     Ok("gpu-texture")
 }
 
-/// Path label of the E3b consume mode (E3Path value, one-shot logged).
+/// Path label of the consume mode (E3Path value, one-shot logged).
 const E3B_PATH: E3Path = "e3b-video-processor";
 
-/// Why one E3b frame could not be consumed on the GPU.
+/// Why one frame could not be consumed on the GPU.
 pub(crate) enum E3bFrame {
     /// The sample buffer is not a DXGI texture (software decode fallback):
     /// the caller should use the NV12 CPU path for this frame instead.
@@ -1854,20 +1854,20 @@ struct E3bCore {
     out_view: ID3D11VideoProcessorOutputView,
 }
 
-/// E3b: our own D3D11 video processor — NV12 → BGRA8 conversion and the
+/// our own D3D11 video processor — NV12 → BGRA8 conversion and the
 /// resize, both on the GPU, straight into the swapchain back buffer.
 ///
 /// This is the mpv-style architecture built from plain Microsoft APIs: MF
 /// only decodes (DXVA via the DXGI device manager); MF's own video
 /// processor (XVP) is never created — it crashes the Intel driver on this
-/// machine (measured 4/4, docs/rnd-tier2-step5-measurement.md Appendix D).
+/// machine (measured 4/4, Appendix D).
 ///
 /// The enumerator + processor are built lazily from the FIRST frame's real
 /// texture description, so a macroblock-padded or otherwise unexpected
 /// decoder surface size cannot desynchronize the pipeline.
 ///
 /// All methods run on the playback thread; no COM interface here crosses
-/// a thread boundary (AGENTS §4).
+/// a thread boundary.
 pub(crate) struct E3bPipeline {
     /// The video-device view of the D3D11 device: `CreateVideoProcessor*`
     /// lives here, not on `ID3D11Device`.
@@ -1879,11 +1879,11 @@ pub(crate) struct E3bPipeline {
     out_size: (u32, u32),
     /// Colour tags parsed from the SPS/VUI (`sequence_header_tags`): the
     /// matrix + range the video processor must be told
-    /// (`design-p1-color.md` §4.1).
+    ///
     colour: ColourTags,
-    /// How the video is fitted into `out_size` (`design-p1-color.md`
-    /// §4.5.1). Defaults to the full-rect behaviour Tier 2 has always had
-    /// (frozen, D1); the engine backend calls [`E3bPipeline::set_fit`].
+    /// How the video is fitted into `out_size` (
+    /// Defaults to the full-rect behaviour Tier 2 has always had
+    /// (frozen); the engine backend calls [`E3bPipeline::set_fit`].
     fit: Fit,
     core: Option<E3bCore>,
     /// Input views cached per texture pointer (MF pools a handful).
@@ -1892,7 +1892,7 @@ pub(crate) struct E3bPipeline {
 
 impl E3bPipeline {
     /// Create the fixed part: video context + video device. A failure here
-    /// fails the whole E3b attempt (the caller reopens the reader without
+    /// fails the whole attempt (the caller reopens the reader without
     /// the D3D manager).
     pub(crate) fn create(
         device: &ID3D11Device,
@@ -1923,7 +1923,7 @@ impl E3bPipeline {
         })
     }
 
-    /// Choose the fit mode (`design-p1-color.md` §4.5.1). Takes effect at
+    /// Choose the fit mode. Takes effect at
     /// the next (re)build of the processor core; dropping the core here
     /// makes that unconditional even if a frame was already blitted.
     pub(crate) fn set_fit(&mut self, fit: Fit) {
@@ -2000,7 +2000,7 @@ impl E3bPipeline {
         let out_view = out_view
             .ok_or_else(|| "CreateVideoProcessorOutputView returned no object".to_string())?;
         // Colour space: matrix + range from the SPS/VUI parser for THIS
-        // stream (design-p1-color §4.1) — never assumed BT.709 + limited.
+        // stream — never assumed BT.709 + limited.
         // The BGRA back buffer takes full-range RGB in every case.
         let color = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
             _bitfield: color_space_bits(self.colour.matrix, self.colour.range),
@@ -2012,7 +2012,7 @@ impl E3bPipeline {
         };
         // Explicit source/destination rects (that is the scaling), from the
         // pure fit math (`fit.rs`): full frame by default, letterboxed or
-        // cropped per the requested mode (`quality.md` §4.7: never distort).
+        // cropped per the requested mode : never distort).
         let (src, dst) = fit_rects(self.fit, (in_w, in_h), (out_w, out_h));
         // SAFETY: live processor; rects fit in i32 (video/surface sizes).
         unsafe {
@@ -2071,7 +2071,7 @@ impl E3bPipeline {
     /// processor for the texture's size, then `VideoProcessorBlt` with the
     /// explicit colour space and the fit rects. Shared by the Tier 2 sample
     /// path and the engine's `TransferVideoFrame` destination
-    /// (`design-p1-color.md` §4.5.1); both callers hand over a live NV12
+    /// both callers hand over a live NV12
     /// texture on this thread.
     pub(crate) fn blit_texture(&mut self, texture: &ID3D11Texture2D) -> Result<(), E3bFrame> {
         let mut desc: D3D11_TEXTURE2D_DESC = unsafe { std::mem::zeroed() };
@@ -2191,9 +2191,9 @@ impl E3bPipeline {
 
 /// Colour tags for the loaded stream: parse `MF_MT_MPEG_SEQUENCE_HEADER`
 /// (Annex-B / avcC SPS+PPS) with our own SPS/VUI parser
-/// (`design-p1-color.md` §4.1). Media Foundation ignores H.264 VUI colour
-/// flags on build 26200.9711 (`notes-p1-color-601.md` D1) and the canonical
-/// gate asset carries no `colr` box (E1-1), so the bitstream is the only
+/// Media Foundation ignores H.264 VUI colour
+/// flags on build 26200.9711 and the canonical
+/// gate asset carries no `colr` box, so the bitstream is the only
 /// trustworthy matrix source. Any failure — attribute absent, blob
 /// unreadable, malformed SPS — yields [`ColourTags::default`] (BT.709 +
 /// limited range), identical to the pre-fix hardcode, so a missing blob can
@@ -2230,8 +2230,8 @@ pub(crate) fn sequence_header_tags(reader: &IMFSourceReader) -> ColourTags {
 /// bit2 YCbCr_Matrix (0 = BT.601, 1 = BT.709), bit3 YCbCr_xvYCC=0
 /// (conventional), bits4-5 Nominal_Range (0 = full range, 1 = 16-235
 /// limited). Matrix and nominal range come from the SPS/VUI parser
-/// (`design-p1-color.md` §4.1) instead of the old hardcoded
-/// "HD H.264 = BT.709 + limited" assumption (F7 / `quality.md` §2).
+/// instead of the old hardcoded
+/// "HD H.264 = BT.709 + limited" assumption.
 fn color_space_bits(matrix: VideoMatrix, range: VideoRange) -> u32 {
     let mut bits = 0u32; // Usage = playback, RGB_Range = full, xvYCC off
     if matrix == VideoMatrix::Bt709 {
@@ -2245,7 +2245,7 @@ fn color_space_bits(matrix: VideoMatrix, range: VideoRange) -> u32 {
 
 /// Create D3D11 device + context.
 ///
-/// `video_support` adds `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` (E3): MF's
+/// `video_support` adds `D3D11_CREATE_DEVICE_VIDEO_SUPPORT`: MF's
 /// video processor runs on this device and the flag is the documented
 /// switch for video-processing features.
 pub(crate) fn create_d3d11(
@@ -2281,7 +2281,7 @@ pub(crate) fn create_d3d11(
 
 /// Create a DXGI flip swapchain on `hwnd`.
 ///
-/// `format` is `B8G8R8A8_UNORM` normally and `B8G8R8X8_UNORM` under E3:
+/// `format` is `B8G8R8A8_UNORM` normally and `B8G8R8X8_UNORM` under:
 /// MF tags its RGB32 output as X8 (measured `DXGI_FORMAT(88)`), so matching
 /// it makes the consume `CopyResource` an identical-format copy.
 pub(crate) fn create_swapchain(
@@ -2378,7 +2378,7 @@ fn create_staging(
 /// content is allocated as 1088 rows and the chroma plane starts after row
 /// 1088. Assuming the display height shifted the chroma plane by 8 rows and
 /// rendered the first ~11 output rows from luma padding (solid green band,
-/// measured 2026-11-04, docs/rnd-tier2-step5-measurement.md).
+/// measured 2026-11-04).
 ///
 /// Returns `video_h` when the buffer size does not divide into whole NV12
 /// frames at `video_w` (unknown layout -> assume tight packing).
@@ -2405,7 +2405,7 @@ pub(crate) fn nv12_alloc_height(buf_len: usize, video_w: usize, video_h: usize) 
 /// `src` must hold at least `uv_plane_offset + video_w * video_h / 2`
 /// readable bytes and `dst` must hold `out_h` rows of `row_pitch` bytes.
 /// `pub(crate)`: the thumbnail reader (thumbnail.rs) reuses this
-/// unit-tested converter (design-m5-p4 §11 T3).
+/// unit-tested converter.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn convert_nv12_to_bgr8(
     src: *const u8,
@@ -2422,9 +2422,9 @@ pub(crate) unsafe fn convert_nv12_to_bgr8(
         return;
     }
     let uv_plane = src.add(uv_plane_offset);
-    // Matrix + range come from the SPS/VUI parser (design-p1-color §4.1);
+    // Matrix + range come from the SPS/VUI parser;
     // this converter used to hardcode BT.601 limited while the GPU path
-    // hardcoded BT.709 limited (F9) — both now read the same ColourTags.
+    // hardcoded BT.709 limited — both now read the same ColourTags.
     let (y_offset, luma_k, kr, kg_r, kg_b, kb) = yuv_to_rgb_coeffs(colour);
 
     for oy in 0..out_h {
@@ -2461,12 +2461,12 @@ pub(crate) unsafe fn convert_nv12_to_bgr8(
 /// `(luma_k * (Y - y_offset) [+/-] w * (Cb/Cr - 128) + 128) >> 8`.
 /// Standard 8-bit forms (ITU-R BT.601 / BT.709):
 ///
-/// | matrix | range   | y_offset | luma_k | kr  | kg_r | kg_b | kb  |
+/// | matrix | range | y_offset | luma_k | kr | kg_r | kg_b | kb |
 /// |--------|---------|----------|--------|-----|------|------|-----|
-/// | 601    | limited | 16       | 298    | 409 | 100  | 208  | 516 |
-/// | 601    | full    | 0        | 256    | 359 | 88   | 183  | 454 |
-/// | 709    | limited | 16       | 298    | 459 | 55   | 136  | 541 |
-/// | 709    | full    | 0        | 256    | 403 | 48   | 120  | 475 |
+/// | 601 | limited | 16 | 298 | 409 | 100 | 208 | 516 |
+/// | 601 | full | 0 | 256 | 359 | 88 | 183 | 454 |
+/// | 709 | limited | 16 | 298 | 459 | 55 | 136 | 541 |
+/// | 709 | full | 0 | 256 | 403 | 48 | 120 | 475 |
 ///
 /// The full-range chroma weights are the limited-range ones scaled by
 /// 224/255 (the limited→full chroma amplitude ratio), rounded to nearest —
@@ -2490,10 +2490,10 @@ fn yuv_to_rgb_coeffs(colour: ColourTags) -> (i32, i32, i32, i32, i32, i32) {
 ///
 /// ASCII specials are percent-encoded; **non-ASCII travels raw**. Measured
 /// on the target machine (Windows 11 build 26200, 2026-11-10): MF does
-/// NOT decode percent-encoded UTF-8 as UTF-8 — a URL with `%E8%92%BC…`
+/// NOT decode percent-encoded UTF-8 as UTF-8 — a URL with `%%92%BC…`
 /// fails with `0x80070002` ("cannot find the file") while the same URL
 /// with the raw characters (`蒼のワルツ…`, a bare path) opens fine
-/// (`mf-url-variants.ps1`, V1 vs V2/V3). The URL string reaches MF as
+/// (`mf-url-variants.ps1`, vs ). The URL string reaches MF as
 /// UTF-16, so the raw characters survive intact.
 pub(crate) fn file_url(path: &Path) -> String {
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -2565,8 +2565,8 @@ mod tests {
     #[test]
     fn file_url_keeps_non_ascii_raw() {
         // MF does NOT decode percent-encoded UTF-8 (measured 2026-11-10,
-        // Windows 11 build 26200: `%E8%92%BC…` -> 0x80070002, raw `蒼…` ->
-        // S_OK — see the `file_url` doc comment). The GUI (M5) will hand
+        // Windows 11 build 26200: `%%92%BC…` -> 0x80070002, raw `蒼…` ->
+        // S_OK — see the `file_url` doc comment). The GUI will hand
         // us arbitrary Unicode paths, so non-ASCII must travel raw while
         // ASCII specials stay percent-encoded.
         assert_eq!(
@@ -2689,8 +2689,8 @@ mod tests {
 
     #[test]
     fn cpu_converter_applies_stream_matrix_to_yellow_bar() {
-        // Measured SMPTE yellow from `bars.mp4` (notes §9 NV12 row:
-        // Y=162 Cb=44 Cr=142, limited range) — the exact P1 signature.
+        // Measured SMPTE yellow from `bars.mp4` (notes NV12 row:
+        // Y=162 Cb=44 Cr=142, limited range) — the exact signature.
         // BT.601 → (192,191,1); BT.709 → (195,181,0). The 601 result must
         // land within tolerance of the ffmpeg auto (VUI=601) reference
         // (192,190,0), the 709 result near the forced-709 reference.

@@ -69,14 +69,14 @@ pub struct DaemonOptions {
     pub repaint_level: u32,
     pub shell_timeout: Duration,
     pub host_mode: host::HostModePreference,
-    /// `--video <path>` (design-m2 §2.2). Not `Copy` any more: a `PathBuf`
+    /// `--video <path>`. Not `Copy` any more: a `PathBuf`
     /// rides along. `None` means "replay the persisted path, if any".
     pub video: Option<PathBuf>,
-    /// The D1 session override (`design-m5b.md` §4.3): a manual start on
+    /// The session override: a manual start on
     /// battery with `on_battery=stop` stays FULL for this session — the
     /// stop rule only governs automatic paths. Set by the binary's entry
-    /// rules (or the T6 `CASCADE_SESSION_OVERRIDE` child); cleared inside
-    /// the loop when AC is confirmed (T10) or when the process exits.
+    /// rules (or the `CASCADE_SESSION_OVERRIDE` child); cleared inside
+    /// the loop when AC is confirmed or when the process exits.
     pub session_override: bool,
 }
 
@@ -94,33 +94,33 @@ impl Default for DaemonOptions {
 }
 
 /// Runtime-only playback flags — deliberately separate from the persisted
-/// `Settings` (design-m4 D10). `user_paused` lives for this session only,
-/// exactly like the M3 lock behaviour: it never touches `config.toml`.
+/// `Settings`. `user_paused` lives for this session only,
+/// exactly like the lock behaviour: it never touches `config.toml`.
 #[derive(Clone, Copy, Debug, Default)]
 struct Flags {
     user_paused: bool,
-    /// Confirmed power source from the S2b collector (design-m4 §2.6).
+    /// Confirmed power source from the collector.
     /// Runtime-only, and it stays `false` while the collector is gated
-    /// off (D8: `on_battery == off` means no read, no subscription).
+    /// off : `on_battery == off` means no read, no subscription).
     on_battery: bool,
-    /// The D1 session override carried into the loop
-    /// (`design-m5b.md` §4.3): while set, `power_step`'s `Unload` arm is
-    /// held (T9 — playback uninterrupted) and the pause oracle treats
+    /// The session override carried into the loop
+    /// while set, `power_step`'s `Unload` arm is
+    /// held (playback uninterrupted) and the pause oracle treats
     /// `on_battery=stop` as if it were `continue` (the stop rule only
     /// governs automatic paths). Cleared when the collector settles on AC
-    /// (T10) or at process exit.
+    /// or at process exit.
     session_override: bool,
 }
 
 /// Builds a media backend on demand — the first `wallpaper.set` on a
 /// daemon that started without a video needs one. `cascade-win` may not
-/// depend on `cascade-media` (AGENTS §4), so the binary passes this
+/// depend on `cascade-media`, so the binary passes this
 /// factory in. The path lets the binary choose per source later; `None`
 /// means no backend is available and the desktop keeps its colour.
 pub type BackendFactory = Box<dyn Fn(&Path) -> Option<Box<dyn MediaBackend>> + Send>;
-/// Metadata probe injected by the binary (design-m4 §4), the same way the
+/// Metadata probe injected by the binary, the same way the
 /// backend factory is: `cascade-win` may not depend on `cascade-media`
-/// (AGENTS §4), and the library entry type lives in `cascade-core`.
+/// and the library entry type lives in `cascade-core`.
 pub type ProbeFn = Box<dyn Fn(&Path) -> Result<VideoMetadata, String> + Send>;
 
 #[derive(Debug)]
@@ -217,7 +217,7 @@ pub(crate) struct ExitSignal;
 
 impl Drop for ExitSignal {
     fn drop(&mut self) {
-        // design-m5-p4 §4.3: tell every subscriber the daemon is going
+        // tell every subscriber the daemon is going
         // away while the pipe is still open; bounded flush, then the
         // normal exit handshake. No-op when nothing listens (listener,
         // tests) — the desktop teardown never waits on a client.
@@ -310,7 +310,7 @@ fn reattach(monitors: &[MonitorInfo], opts: &DaemonOptions) -> Option<(ShellSurf
 }
 
 /// The `monitors[]` playback row for the monitor the engine is drawing on
-/// (`ipc.md` §4, M4 S3b).
+///
 ///
 /// `None` unless a video is loaded **and** currently attached: a detached
 /// backend has no host window to name, and a colour-only desktop has no
@@ -361,7 +361,7 @@ fn playback_status(
 }
 
 /// Everything `refresh_status` reads off the render loop. Grouped into one
-/// value because the playback row (M4 S3b) added the backend, the
+/// value because the playback row added the backend, the
 /// persisted state, and the library — ten loose parameters would sit well
 /// past clippy's limit and read worse than this name does.
 struct StatusInputs<'a> {
@@ -376,9 +376,9 @@ struct StatusInputs<'a> {
 }
 
 /// Build the render-loop half of a `status` snapshot from current state.
-/// Mode and reasons come from the one pause oracle (design-m4 §2.6);
+/// Mode and reasons come from the one pause oracle;
 /// memory and autostart are read on demand by the pipe thread instead
-/// (`design-m4` §2.2), so this stays cheap enough for the 2 s watchdog.
+/// so this stays cheap enough for the 2 s watchdog.
 fn current_snapshot(inputs: &StatusInputs) -> StatusSnapshot {
     let desired = RuleEngine::evaluate(session_state(
         inputs.settings,
@@ -427,9 +427,9 @@ fn refresh_status(
     if published.as_ref().is_some_and(|prev| **prev == *next) {
         return;
     }
-    // design-m5-p4 §4.5: `state` fires only on a semantic change —
+    // `state` fires only on a semantic change —
     // mode, pause reasons, playback identity. fps/dropped/memory tick
-    // continuously and stay on the 1 s `status` poll (`design-m5.md` §8).
+    // continuously and stay on the 1 s `status` poll.
     if published
         .as_ref()
         .is_some_and(|prev| !same_state(prev, &next))
@@ -446,7 +446,7 @@ fn refresh_status(
 
 /// The playback identity a `state` event cares about: *which* video on
 /// *which* monitor with *which* decode route. fps/dropped are excluded
-/// on purpose — they change every watchdog tick (design-m5-p4 §4.5).
+/// on purpose — they change every watchdog tick.
 fn playback_identity(
     playback: &PlaybackStatus,
 ) -> (
@@ -506,7 +506,7 @@ fn watchdog_tick(
     }
 
     // Detach backend before destroying host windows so engine Shutdown()
-    // runs while its playback HWND is still alive (design-m2 §3.3).
+    // runs while its playback HWND is still alive.
     derr!("[wd] p5: before backend.detach_surface()");
     if let Err(err) = backend.detach_surface() {
         derr!("watchdog: backend detach failed: {err}");
@@ -542,22 +542,22 @@ fn watchdog_tick(
 }
 
 /// Owns the optional media backend so Media Foundation is shut down on
-/// every exit path (design-m2 §3.2: `MFStartup` runs in the constructor).
+/// every exit path : `MFStartup` runs in the constructor).
 struct BackendGuard {
     backend: Option<Box<dyn MediaBackend>>,
     /// True only after `load` succeeded. Without a validated source the
     /// backend stays out of the host path entirely, so a run with no video
-    /// behaves exactly like M1 (design-m2 §2.2).
+    /// behaves exactly like.
     loaded: bool,
     /// HWND the engine is currently bound to, set only after a successful
     /// `attach_surface` and cleared by every detach/take. `wallpaper.set`
     /// uses it to recognise "already playing this file on this window"
-    /// and skip the load entirely (design-m2 §4).
+    /// and skip the load entirely.
     attached_hwnd: Option<isize>,
     /// Successful `load`s in this process (the startup load counts as 1).
     /// Every load pipeline retains ~50 MB until process exit
-    /// (design-m4 §8.3), so once this is ≥ 1 a different-file set restarts
-    /// the daemon instead of loading again (design-m2 §4).
+    /// so once this is ≥ 1 a different-file set restarts
+    /// the daemon instead of loading again.
     session_loads: u32,
 }
 
@@ -571,8 +571,8 @@ impl BackendGuard {
     /// Detach the backend from its current surface without dropping it.
     /// Called before `host.detach()` in repair paths so the engine's
     /// `Shutdown()` runs while its playback HWND is still alive
-    /// (design-m2 §3.3 ordering). Without this, reattach-with-video wedges
-    /// the main thread (benchmark-m2.md §7.1).
+    /// (ordering). Without this, reattach-with-video wedges
+    /// the main thread.
     fn detach_surface(&mut self) -> BackendResult<()> {
         self.attached_hwnd = None;
         if let Some(backend) = self.backend.as_mut() {
@@ -604,7 +604,7 @@ fn host_surface(window: &host::HostWindow) -> HostSurface {
 
 /// Attach the backend to the host window `wallpaper.set` assigned — or
 /// the first window when the assignment is `None` or its monitor is gone
-/// (design-m2 §5: one engine, the other monitors keep colour). Failures
+/// one engine, the other monitors keep colour). Failures
 /// are logged, never fatal — the desktop must stay up even when the
 /// engine cannot draw.
 fn attach_backend(backend: &mut BackendGuard, host: &mut Host, assigned: Option<&str>) {
@@ -617,10 +617,10 @@ fn attach_backend(backend: &mut BackendGuard, host: &mut Host, assigned: Option<
     let Some(surface) = window.map(host_surface) else {
         return;
     };
-    // Gate experiment B (`CASCADE_GATE=B`, design-m2 §4): keep our swap
+    // Gate experiment B (`CASCADE_GATE=B`): keep our swap
     // chain to observe the fight. Default A releases it first so the engine
     // owns the client area; the last presented pixels (the colour) stay on
-    // screen meanwhile, so the desktop is never blank (AGENTS §3.1).
+    // screen meanwhile, so the desktop is never blank.
     let keep_presenter = std::env::var("CASCADE_GATE").is_ok_and(|value| value == "B");
     if !keep_presenter {
         host.release_presenter();
@@ -631,18 +631,18 @@ fn attach_backend(backend: &mut BackendGuard, host: &mut Host, assigned: Option<
     let hwnd = surface.hwnd;
     if let Err(err) = engine.attach_surface(surface) {
         derr!("backend: attach failed: {err}");
-        // Ownership table (design-m2 §4): video failure returns the client
+        // Ownership table: video failure returns the client
         // area to the colour presenter.
         host.restore_presenter();
     } else {
-        // Reuse bookkeeping (design-m2 §4 reload amendment): only a
+        // Reuse bookkeeping (reload amendment): only a
         // successful attach makes the engine eligible for the same-HWND
         // reload path in `set_wallpaper`.
         backend.attached_hwnd = Some(hwnd);
     }
 }
 
-/// The one pause oracle's inputs (design-m4 §2.6): persisted settings +
+/// The one pause oracle's inputs: persisted settings +
 /// runtime flags + the session lock. The lock is passed in rather than
 /// read from the process-global control state so unit tests never touch
 /// it; every caller passes `control::session_locked()`.
@@ -652,9 +652,9 @@ fn session_state(settings: &Settings, flags: &Flags, session_locked: bool) -> Se
         user_paused: flags.user_paused,
         power_profile: settings.power_profile,
         pause_settings: settings.pause,
-        // D1 (`design-m5b.md` §4.3): the stop rule only governs automatic
+        // the stop rule only governs automatic
         // paths. With the session override held, `on_battery=stop` must
-        // not pause the engine this manual start deliberately began (T9:
+        // not pause the engine this manual start deliberately began :
         // playback uninterrupted). Every other action — `pause`,
         // `continue`, `off` — stays exactly as the user set it.
         battery_action: if flags.session_override && settings.on_battery == BatteryAction::Stop {
@@ -662,8 +662,8 @@ fn session_state(settings: &Settings, flags: &Flags, session_locked: bool) -> Se
         } else {
             settings.on_battery
         },
-        // The collector's confirmed state (S2b); `false` while the gate is
-        // off, which is exactly what D8 promises: no read at the default.
+        // The collector's confirmed state; `false` while the gate is
+        // off, which is exactly what promises: no read at the default.
         on_battery: flags.on_battery,
         ..SessionState::default()
     }
@@ -673,7 +673,7 @@ fn session_state(settings: &Settings, flags: &Flags, session_locked: bool) -> Se
 /// every state change (lock transition, pause/resume, settings, video
 /// set). It always evaluates and always calls `play()`/`pause()` — both
 /// are idempotent on the engine, so there is no change-detection to drift
-/// out of sync (design-m4 S2).
+/// out of sync.
 fn apply_playback(
     backend: &mut BackendGuard,
     settings: &Settings,
@@ -708,7 +708,7 @@ fn apply_playback(
     }
 }
 
-/// Everything one `power_step` may touch (design-m4 §2.6). Grouped into
+/// Everything one `power_step` may touch. Grouped into
 /// one value for the same reason as `StatusInputs`: eight loose parameters
 /// would sit well past clippy's limit.
 struct PowerStep<'a> {
@@ -718,19 +718,19 @@ struct PowerStep<'a> {
     flags: &'a mut Flags,
     backend: &'a mut BackendGuard,
     /// Read-only: only `state.video.is_some()` matters here — a stop keeps
-    /// the file reference (AGENTS §3.3) so the AC return reloads it in the
-    /// fresh process (`design-m5b.md` §4.4 T3).
+    /// the file reference so the AC return reloads it in the
+    /// fresh process.
     state: &'a DaemonState,
     registration: &'a mut Option<isize>,
     hysteresis: &'a mut power::Hysteresis,
     collector_on: &'a mut bool,
 }
 
-/// One turn of the power collector (design-m4 §2.6, D8/D9), run on every
+/// One turn of the power collector, run on every
 /// main-loop wake — the watchdog timeout is its only tick, so there is no
 /// timer and no per-tick hardware read:
 ///
-/// 1. **Gate** — subscribe only while `on_battery != off` (D8: at the
+/// 1. **Gate** — subscribe only while `on_battery != off` : at the
 ///    default the daemon never reads the power source). One seed read on
 ///    enable, unregister + reset on disable.
 /// 2. **Sample** — feed the raw broadcast through the 3 s [`power::Hysteresis`]
@@ -739,20 +739,18 @@ struct PowerStep<'a> {
 ///    nothing; a state change re-evaluates the rules (they are idempotent).
 ///
 /// Returns `true` when this process must stop and respawn — **both**
-/// arms leave through the same `power_respawn` exit ladder
-/// (`design-m5b.md` §4.4):
+/// arms leave through the same `power_respawn` exit ladder:
 ///
 /// * `Reload` — the video must come back and this process has already
 ///   loaded once; a second in-process load would retain another ~50 MB
-///   pipeline (§8.3), so the reload runs in a fresh process.
+///   pipeline, so the reload runs in a fresh process.
 /// * `Unload` — `on_battery=stop` on battery with a loaded engine. The
 ///   ladder repaints the **real** wallpaper before the child starts, so
-///   the desktop is never Cascade's teal host on battery
-///   (`design-m5b.md` §1.2), and the child lands in the battery listener
-///   (§4.3) with `state.video` kept for the AC return.
+///   the desktop is never Cascade's teal host on battery, and the child
+///   lands in the battery listener with `state.video` kept for the AC return.
 ///
 /// There is deliberately **no in-place unload** any more: it is what made
-/// "stop" a coloured pause with ≈90 MB retained (AGENTS §3.15).
+/// "stop" a coloured pause with ≈90 MB retained.
 fn power_step(step: PowerStep<'_>) -> bool {
     let PowerStep {
         hwnd,
@@ -767,7 +765,7 @@ fn power_step(step: PowerStep<'_>) -> bool {
     let action = settings.on_battery;
     let mut changed = false;
 
-    // 1. The D8 gate.
+    // 1. The gate.
     let want = action != BatteryAction::Off;
     if want && !*collector_on {
         *collector_on = true;
@@ -802,7 +800,7 @@ fn power_step(step: PowerStep<'_>) -> bool {
 
     // 2. Raw sample → hysteresis → confirmed state. Broadcast first; when
     //    none is pending, fall back to a direct hardware read
-    //    (design-m5b §4.2 amendment 2026-11-20, §9: build 26200 delayed or
+    // (amendment 2026-11-20,: build 26200 delayed or
     //    skipped AC broadcasts — a push-only collector can confirm a state
     //    the hardware left minutes ago). A stale broadcast is dropped by
     //    the disable path's `reset` above.
@@ -819,9 +817,9 @@ fn power_step(step: PowerStep<'_>) -> bool {
             flags.on_battery = confirmed;
             changed = true;
         }
-        // T10 (`design-m5b.md` §4.3): the source settled on AC with no
+        // the source settled on AC with no
         // candidate pending — the session override ends here, so the *next*
-        // battery cycle applies the normal stop rules (T2) again. Checked
+        // battery cycle applies the normal stop rules again. Checked
         // on the settled state rather than on a transition, so an override
         // created moments before the first hysteresis promotion still
         // clears (an entry read of "battery" that turned out stale).
@@ -833,7 +831,7 @@ fn power_step(step: PowerStep<'_>) -> bool {
 
     // 3. Reconcile the engine with the confirmed state. Both "must go"
     //    arms return `true`: the loop's `power_respawn` path runs the exit
-    //    ladder and hands over to a fresh process (design-m5b §4.4) — the
+    // ladder and hands over to a fresh process — the
     //    in-place unload branch is gone with it.
     match power::reconcile(
         flags.on_battery,
@@ -841,13 +839,13 @@ fn power_step(step: PowerStep<'_>) -> bool {
         backend.loaded,
         state.video.is_some(),
     ) {
-        // T9 (`design-m5b.md` §4.4): a manual session start on battery
+        // a manual session start on battery
         // stays full — the stop rule governs automatic paths only. Logged
         // on the transition into battery, never per tick (the arm would
         // otherwise match every wake for the whole session).
         power::Reconcile::Unload if flags.session_override => {
             if changed {
-                dlog!("power: on battery with the session override; staying full (T9)");
+                dlog!("power: on battery with the session override; staying full");
             }
         }
         power::Reconcile::Reload | power::Reconcile::Unload => return true,
@@ -863,8 +861,8 @@ fn exe_path() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::new())
 }
 
-/// Tray "Open Cascade" (design-m5 §6, P3): spawn the same `cascade ui`
-/// command the CLI runs, with null stdio (AGENTS §1 — the menu only
+/// Tray "Open Cascade": spawn the same `cascade ui`
+/// command the CLI runs, with null stdio (the menu only
 /// opens existing CLI paths; there is no console to inherit from).
 fn spawn_ui() {
     let exe = exe_path();
@@ -884,9 +882,9 @@ fn spawn_ui() {
     }
 }
 
-/// Perform one tray menu choice on the main loop (design-m5 §6). Quit
+/// Perform one tray menu choice on the main loop. Quit
 /// uses the shared quit function — the normal exit ladder runs on the
-/// next loop condition check, repaint first (§4, AGENTS §13).
+/// next loop condition check, repaint first.
 fn run_tray_action(
     action: TrayAction,
     flags: &mut Flags,
@@ -920,7 +918,7 @@ fn run_tray_action(
     }
 }
 
-/// Everything one command drain may touch (design-m4 §2.2). The borrow is
+/// Everything one command drain may touch. The borrow is
 /// scoped to the drain: afterwards the loop publishes a fresh snapshot and
 /// only then writes the responses, so a `status` asked right after
 /// `pause` already sees the pause.
@@ -936,7 +934,7 @@ struct Loop<'a> {
     state: &'a mut DaemonState,
     store: &'a Store,
     factory: &'a BackendFactory,
-    /// In-memory library (design-m4 §4): the main loop is its single
+    /// In-memory library: the main loop is its single
     /// writer, so the pipe thread never sees it.
     library: &'a mut Library,
     lib_store: &'a LibraryStore,
@@ -944,8 +942,8 @@ struct Loop<'a> {
 }
 
 /// Result of one drain: responses to write after the snapshot refresh,
-/// plus the `quit` flush-ack handshake flag (design-m4 §2.3) and the
-/// restart decision for a different-file `wallpaper.set` (design-m2 §4).
+/// plus the `quit` flush-ack handshake flag and the
+/// restart decision for a different-file `wallpaper.set`.
 #[derive(Default)]
 struct Pending {
     responses: Vec<Response>,
@@ -1002,7 +1000,7 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
                 // costs durability, not the setting itself.
                 derr!("settings: {err}");
             }
-            // Settings are state (design-m4 §2.6): re-evaluate the oracle
+            // Settings are state: re-evaluate the oracle
             // so a rule toggle (`on_battery`, `pause.*`) takes effect now,
             // not at the next unrelated event. Idempotent like every other
             // `apply_playback` call site.
@@ -1012,8 +1010,8 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
                 ctx.flags,
                 control::session_locked(),
             );
-            // Volume is a property of the **live** engine (design-volume
-            // §3): no rebuild, no load pipeline, so AGENTS §3.15 does not
+            // Volume is a property of the **live** engine (
+            // no rebuild, no load pipeline, so does not
             // apply — the change goes to the running engine in-process and
             // the PID stays. Without a backend the value simply waits for
             // the next load, which primes the engine from settings.
@@ -1030,10 +1028,10 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
                     );
                 }
             }
-            // AGENTS §3.15 + `design-engine-mode.md` §3: a changed
+            // +: a changed
             // `engine_mode` means the engine must be *built* differently,
             // and building it is a load pipeline — every load retains ≈50 MB
-            // until process exit (`design-m4.md` §8.3, the bug that made
+            // until process exit (the bug that made
             // every `wallpaper.set` restart). So: persist as plain state,
             // answer the client, then the exit ladder respawns and the child
             // reads config.toml and builds the engine exactly once, in the
@@ -1041,7 +1039,7 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
             let action =
                 engine_mode_action(previous_mode, ctx.settings.engine_mode, ctx.backend.loaded);
             let mut payload = *ctx.settings;
-            // Wire edge for this response (design-m4 D10): Run key, not file.
+            // Wire edge for this response: Run key, not file.
             payload.autostart = registry::autostart_state(&exe_path()).registered;
             let mut response = match serde_json::to_value(payload) {
                 Ok(value) => Response::ok(id, value),
@@ -1055,7 +1053,7 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
                 PresentationModeAction::Restart => {
                     // The client gets this answer first; the flush ack then
                     // runs the exit ladder — the same handshake as a
-                    // `wallpaper.set` restart (design-m2 §4).
+                    // `wallpaper.set` restart.
                     response.flush_after = true;
                     dlog!(
                         "settings: engine_mode → {}; restarting to build the engine in that mode",
@@ -1092,7 +1090,7 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
         }
         Command::LibraryAdd { id, paths } => {
             // The core lives in `offline::library_add_into` so the daemon
-            // and the offline CLI share one implementation (design-m5b §3.4);
+            // and the offline CLI share one implementation;
             // the daemon keeps its best-effort persist.
             let result = offline::library_add_into(ctx.library, ctx.probe, paths);
             persist_library(ctx);
@@ -1150,8 +1148,8 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
             }
         }
         Command::Assess { id, path, monitor } => {
-            // Read-only diagnosis (design-m4 §3/§5): collect the device
-            // fresh (D13 — no cached profile can go stale), resolve the
+            // Read-only diagnosis: collect the device
+            // fresh (no cached profile can go stale), resolve the
             // descriptor probe-once, run the pure metric engine. An
             // `error` severity here is a diagnosis, not a refusal.
             let device = crate::device::collect();
@@ -1223,7 +1221,7 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
     }
 }
 
-/// D13: the descriptor for a path — reuse the library's stored metadata
+/// the descriptor for a path — reuse the library's stored metadata
 /// while its `mtime`+`size` proof still matches the file on disk, else
 /// probe the container (the SourceReader dies inside that call; plain
 /// data comes back) and refresh the stored entry so the new proof and
@@ -1231,8 +1229,8 @@ fn handle_command(ctx: &mut Loop, command: Command, pending: &mut Pending) {
 ///
 /// Returns the descriptor plus whether an entry was refreshed — the
 /// caller persists the library only then. Never a load, never a retained
-/// MF object (D13 leak rules: the 2026-11-08 ~50 MB/load leak stays
-/// closed, design-m4 §8.3).
+/// MF object (leak rules: the 2026-11-08 ~50 MB/load leak stays
+/// closed).
 fn descriptor_for(ctx: &mut Loop, path: &str) -> Result<(VideoMetadata, bool), String> {
     let (mtime, size) = file_proof(Path::new(path));
     if let Some(entry) = ctx.library.find_by_path(path) {
@@ -1264,7 +1262,7 @@ fn descriptor_for(ctx: &mut Loop, path: &str) -> Result<(VideoMetadata, bool), S
     Ok((meta, refreshed))
 }
 
-/// The device facts an `assess` response carries (`ipc.md` §3).
+/// The device facts an `assess` response carries.
 fn device_summary(device: &DeviceProfile) -> DeviceSummary {
     DeviceSummary {
         gpu_decode: device
@@ -1294,16 +1292,16 @@ fn persist_library(ctx: &Loop) {
     if let Err(err) = ctx.lib_store.save(ctx.library) {
         derr!("library: {err}");
     }
-    // design-m5-p4 §4.5: the single choke point every mutation site
+    // the single choke point every mutation site
     // calls (add/remove/prune). The payload is the full list, so a
     // coalesced burst still delivers the newest state.
     events::emit_library_changed(&ctx.library.items);
 }
 
-/// `wallpaper.set` (design-m4 S2). Order matters: validate the monitor,
+/// `wallpaper.set`. Order matters: validate the monitor,
 /// check the file, and hand the client area back to the colour presenter
 /// *before* any playback surgery — every failure path then leaves the
-/// desktop painted (AGENTS §3.1).
+/// desktop painted.
 ///
 /// Is the backend already bound to exactly the window this set would
 /// attach to? A `None` target (no host window) never qualifies.
@@ -1311,13 +1309,13 @@ fn reuse_surface(loaded: bool, attached: Option<isize>, target: Option<isize>) -
     loaded && target.is_some() && attached == target
 }
 
-/// What one `wallpaper.set` does in this process (design-m2 §4):
+/// What one `wallpaper.set` does in this process:
 ///
-/// | Action   | When | Cost |
+/// | Action | When | Cost |
 /// |----------|------|------|
-/// | `Skip`   | same file already playing on the very window | none — no load, no restart, PID unchanged |
-/// | `Restart`| any other set after this process has loaded once | exit ladder + respawn; each load pipeline retains ~50 MB until process exit (design-m4 §8.3), so only a fresh process stays flat |
-/// | `Load`   | first load of a fresh process (or before anything loaded) | one pipeline, the baseline cost |
+/// | `Skip` | same file already playing on the very window | none — no load, no restart, PID unchanged |
+/// | `Restart`| any other set after this process has loaded once | exit ladder + respawn; each load pipeline retains ~50 MB until process exit, so only a fresh process stays flat |
+/// | `Load` | first load of a fresh process (or before anything loaded) | one pipeline, the baseline cost |
 ///
 /// `Restart` wins over `Load` once `session_loads ≥ 1` regardless of path:
 /// a failed or cleared earlier load still left retention behind, and an
@@ -1340,13 +1338,13 @@ fn set_action(same_path: bool, reusable: bool, session_loads: u32) -> SetAction 
 }
 
 /// What a `settings set` that touched `engine_mode` must do next
-/// (`design-engine-mode.md` §3, AGENTS §3.15: never rebuild an engine
+/// never rebuild an engine
 /// inside a live daemon — a load pipeline retains ≈50 MB until exit,
-/// `design-m4.md` §8.3).
 ///
-/// | `Keep`       | value unchanged | nothing happened: no restart, no log |
+///
+/// | `Keep` | value unchanged | nothing happened: no restart, no log |
 /// | `PersistOnly`| changed, no engine loaded | plain state; the next load builds with it |
-/// | `Restart`    | changed while an engine holds the old route | answer, exit ladder, respawn — the child builds the engine once |
+/// | `Restart` | changed while an engine holds the old route | answer, exit ladder, respawn — the child builds the engine once |
 #[derive(Debug, PartialEq, Eq)]
 enum PresentationModeAction {
     Keep,
@@ -1395,8 +1393,8 @@ fn set_wallpaper(
         ));
         return;
     }
-    // 2b. S5 (design-m4 §5.3): probe — staleness-aware via the library's
-    //     `mtime`+`size` proof (D13), data only, never a load — and assess
+    // 2b: probe — staleness-aware via the library's
+    // `mtime`+`size` proof, data only, never a load — and assess
     //     BEFORE the response is built: a different file restarts this
     //     process right after the client has the answer, so the warnings
     //     must already be in it. An `error` (codec policy) rejects here;
@@ -1441,7 +1439,7 @@ fn set_wallpaper(
         // claims rather than refuse it (never invent a measurement).
         dlog!("set: no display profile; skipping the assessment");
     }
-    // 3. Skip / restart / load decision (design-m2 §4). The same file
+    // 3. Skip / restart / load decision. The same file
     //    already playing on the very window: a pure no-op — no load, no
     //    restart, no growth. Anything else once this process has loaded:
     //    restart it (the client is answered first; the flush ack then runs
@@ -1470,7 +1468,7 @@ fn set_wallpaper(
         }
         SetAction::Restart => {
             // Persist the new path first: the child process reads it back
-            // on start (design-m2 §4). The client receives this answer, the
+            // on start. The client receives this answer, the
             // flush ack runs the exit ladder (repaint included), then the
             // process respawns and the child loads the file with flat RAM.
             ctx.state.video = Some(path.clone());
@@ -1495,13 +1493,13 @@ fn set_wallpaper(
         SetAction::Load => dlog!("set: loading {}", path),
     }
     // 4. Detach the engine while its playback HWND is still alive, then
-    //    take the client area back for the colour presenter (design-m2 §4).
+    // take the client area back for the colour presenter.
     if let Err(err) = ctx.backend.detach_surface() {
         derr!("set: backend detach failed: {err}");
     }
     ctx.host.restore_presenter();
     // 5. Build a backend on demand: `cascade-win` may not depend on
-    //    `cascade-media` (AGENTS §4), so the binary provides the factory.
+    // `cascade-media`, so the binary provides the factory.
     if ctx.backend.backend.is_none() {
         match (ctx.factory)(Path::new(&path)) {
             Some(built) => ctx.backend.backend = Some(built),
@@ -1523,7 +1521,7 @@ fn set_wallpaper(
     //    drops the broken path so the next start does not replay it.
     let failure = match ctx.backend.backend.as_mut() {
         // The requested engine route rides the existing boundary
-        // (`design-engine-mode.md` §4): read here, once, per load.
+        // read here, once, per load.
         Some(backend) => backend
             .load(
                 Path::new(&path),
@@ -1544,7 +1542,7 @@ fn set_wallpaper(
         if let Err(err) = ctx.store.save(ctx.state) {
             derr!("state: {err}");
         }
-        // design-m5-p4 §4.5: the caller's error response reaches only
+        // the caller's error response reaches only
         // the client that issued the set — the `log` event surfaces the
         // failure once to every subscriber (the UI shows a notice).
         events::emit_log(
@@ -1559,10 +1557,10 @@ fn set_wallpaper(
         return;
     }
     ctx.backend.loaded = true;
-    // One more pipeline retained ~50 MB (design-m4 §8.3): from now on this
-    // process restarts itself instead of loading again (design-m2 §4).
+    // One more pipeline retained ~50 MB: from now on this
+    // process restarts itself instead of loading again.
     ctx.backend.session_loads += 1;
-    // 7. Persist so the next start replays this file (design-m2 §5).
+    // 7. Persist so the next start replays this file.
     ctx.state.video = Some(path.clone());
     ctx.state.monitor = monitor;
     if let Err(err) = ctx.store.save(ctx.state) {
@@ -1579,7 +1577,7 @@ fn set_wallpaper(
     push_set_ok(pending, id, report);
 }
 
-/// The `wallpaper.set` success payload (S5): the assessment that ran
+/// The `wallpaper.set` success payload: the assessment that ran
 /// before the answer. A serialization failure of plain data is logged
 /// and answered with an empty ok — the video is applied by then and an
 /// internal error must not claim otherwise.
@@ -1594,7 +1592,7 @@ fn push_set_ok(pending: &mut Pending, id: u64, report: SetReport) {
 }
 
 /// `wallpaper.clear`: unload the video and hand the desktop back to the
-/// colour presenter. The file itself is never touched (AGENTS §3.3).
+/// colour presenter. The file itself is never touched.
 fn clear_wallpaper(ctx: &mut Loop, id: u64, monitor: Option<String>, pending: &mut Pending) {
     if let Some(target) = &monitor {
         if !ctx.monitors.iter().any(|info| &info.id == target) {
@@ -1651,7 +1649,7 @@ fn run_restore(
     }
 }
 
-/// How `run()` ended (design-m2 §4). `Exit` is any normal stop; `Respawn`
+/// How `run()` ended. `Exit` is any normal stop; `Respawn`
 /// means a different-file `wallpaper.set` was answered, the exit ladder
 /// has run, and the caller must re-exec this binary so the child loads
 /// the new file with flat memory.
@@ -1662,7 +1660,7 @@ pub enum RunExit {
 }
 
 /// How long a respawn child waits for its parent to release the session
-/// pipe (design-m2 §4): the parent only runs its exit ladder and returns
+/// pipe: the parent only runs its exit ladder and returns
 /// from `main`, so seconds are ample — and a hang here still degrades to
 /// the normal single-instance error, never to a second daemon.
 const RESPAWN_PIPE_WAIT: Duration = Duration::from_secs(5);
@@ -1691,18 +1689,18 @@ fn create_respawn_pipe() -> Result<PipeServer, DaemonError> {
     }
 }
 
-/// Create the session pipe — the primary single-instance lock (`ipc.md` §1):
+/// Create the session pipe — the primary single-instance lock:
 /// the first instance creates it with `FILE_FLAG_FIRST_PIPE_INSTANCE`, a
 /// second one fails here. The control window check stays as the fallback
 /// for an older instance that has no pipe yet. On any failure `pipe` drops
 /// and closes the handle, so nothing is left behind.
 ///
 /// Shared by the full daemon ([`run`]) and the battery listener
-/// (`listener::run`, design-m5b §4.2): one name, one lock — a listener and
+/// (`listener::run`): one name, one lock — a listener and
 /// a daemon can never coexist, and each takes over from the other only
 /// through a clean exit.
 ///
-/// A respawn child (design-m2 §4) spawns while its parent still owns
+/// A respawn child spawns while its parent still owns
 /// the pipe, so contention is expected, not a second daemon: retry
 /// until the parent's exit ladder finishes instead of failing fast.
 pub(crate) fn create_session_pipe() -> Result<PipeServer, DaemonError> {
@@ -1740,7 +1738,7 @@ pub fn run(
     let _exit = ExitSignal;
     // Declared second, therefore dropped before `_exit`: an early return
     // still shuts the engine down, and the normal exit path takes it out
-    // explicitly first (design-m2 §3.3 ordering: shutdown → detach → repaint).
+    // explicitly first (ordering: shutdown → detach → repaint).
     let mut backend_guard = BackendGuard {
         backend,
         loaded: false,
@@ -1750,7 +1748,7 @@ pub fn run(
 
     let pipe = create_session_pipe()?;
 
-    // design-m5-p4 §4.4: the event stream starts only after the control
+    // the event stream starts only after the control
     // pipe (the single-instance guard) is ours. Every failure degrades
     // to poll-only clients with a log line — never to a broken desktop.
     events::init();
@@ -1759,7 +1757,7 @@ pub fn run(
 
     let store = Store::open();
     let previous = store.load();
-    // The library (design-m4 §4): loaded once, pruned on start so a file
+    // The library: loaded once, pruned on start so a file
     // deleted while the daemon was down disappears from the list.
     let lib_store = LibraryStore::open();
     let mut library = lib_store.load();
@@ -1777,12 +1775,12 @@ pub fn run(
             path.display()
         );
     }
-    // Persisted settings (design-m4 D10): a missing or corrupt
+    // Persisted settings: a missing or corrupt
     // `config.toml` decodes to the documented defaults and never blocks.
     let mut settings = config::load();
     // Runtime-only flags: a manual pause lives for this session only.
-    // D1 (`design-m5b.md` §4.3): the entry rule's session override rides
-    // into the loop; T9 holds the stop arm, T10 clears it on confirmed AC.
+    // the entry rule's session override rides
+    // into the loop; holds the stop arm, clears it on confirmed AC.
     let mut flags = Flags {
         session_override: opts.session_override,
         ..Flags::default()
@@ -1794,13 +1792,13 @@ pub fn run(
     // there is no console attached (the autostart case).
     unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 1) };
 
-    // M3 slice: session lock pauses playback (design-m3 §3). A failure only
+    // slice: session lock pauses playback. A failure only
     // disables pause-on-lock; the daemon must run either way.
     if let Err(code) = control::register_session_notifications(control.hwnd()) {
         derr!("session notifications unavailable (error {code}); pause-on-lock disabled");
     }
 
-    // Tray icon on the control window (design-m5 §6, P3): gated by the
+    // Tray icon on the control window: gated by the
     // persisted `settings.tray`; a failure logs and continues — the
     // desktop never depends on a notification-area icon.
     let mut tray = Tray::new(control.hwnd(), settings.tray, TrayMode::Full);
@@ -1832,23 +1830,23 @@ pub fn run(
     );
 
     // Resolve the video source before anything is drawn: `--video` wins,
-    // otherwise the last successful path replays (design-m2 §5). A load
+    // otherwise the last successful path replays. A load
     // failure degrades to the colour background — never a blank desktop
-    // (AGENTS §3.1) — and does not persist the broken path.
+    // and does not persist the broken path.
     let video = opts.video.clone().or_else(|| {
         previous
             .as_ref()
             .and_then(|state| state.video.as_ref())
             .map(PathBuf::from)
     });
-    // The monitor the last `wallpaper.set` targeted (design-m4 §5.4);
+    // The monitor the last `wallpaper.set` targeted;
     // `attach_backend` falls back to the first window if it is gone.
     let assigned = previous.as_ref().and_then(|state| state.monitor.clone());
     if let Some(source) = &video {
         match backend_guard.backend.as_mut() {
             // The startup load carries the persisted route too: the child
             // of a mode-toggle respawn builds the engine once, in it
-            // (`design-engine-mode.md` §3).
+            //
             Some(backend) => match backend.load(
                 source,
                 &PlaybackOptions {
@@ -1861,7 +1859,7 @@ pub fn run(
                     dlog!("  video: {}", source.display());
                     backend_guard.loaded = true;
                     // The startup pipeline counts: any later set must
-                    // restart instead of loading again (design-m2 §4).
+                    // restart instead of loading again.
                     backend_guard.session_loads += 1;
                 }
                 Err(err) => derr!("video: {err}; continuing with the colour background"),
@@ -1892,7 +1890,7 @@ pub fn run(
     print_attach(&host);
     attach_backend(&mut backend_guard, &mut host, assigned.as_deref());
     // Apply the pause rules to the just-attached engine: a session that
-    // starts locked must not start playing (design-m4 §2.6).
+    // starts locked must not start playing.
     apply_playback(
         &mut backend_guard,
         &settings,
@@ -1900,7 +1898,7 @@ pub fn run(
         control::session_locked(),
     );
 
-    // Only a source that actually loaded is persisted (design-m2 §5): a
+    // Only a source that actually loaded is persisted: a
     // failed path must not come back on the next start.
     let persisted_video = backend_guard
         .loaded
@@ -1926,7 +1924,7 @@ pub fn run(
     );
 
     // The render loop publishes state to the pipe thread through one
-    // message channel (snapshots and command responses, design-m4 §2.2);
+    // message channel (snapshots and command responses);
     // commands travel the other way and wake the loop with `WM_APP_PIPE`.
     // Send the first snapshot before spawning so an early `status` never
     // sees the `boot` fallback.
@@ -1956,7 +1954,7 @@ pub fn run(
             commands: cmd_tx,
             flush_acked: flush_tx,
             // The daemon forwards `library.add` to its main loop, whose
-            // context owns the probe (`design-m5b.md` §4.5).
+            // context owns the probe.
             probe: None,
         },
         PipeRole::Daemon,
@@ -1969,17 +1967,17 @@ pub fn run(
 
     let mut msg = MSG::default();
     // Set when a `wallpaper.set` decided this process must re-exec; read
-    // once after the exit ladder to pick the `run()` result (design-m2 §4).
+    // once after the exit ladder to pick the `run()` result.
     let mut respawn_after = false;
-    // S2b power collector (design-m4 §2.6): registration handle, the pure
-    // hysteresis state, the D8 gate, and a pending reload-respawn. All four
+    // power collector: registration handle, the pure
+    // hysteresis state, the gate, and a pending reload-respawn. All four
     // are inert while `settings.on_battery == off` — no read, no subscribe.
     let mut power_registration: Option<isize> = None;
     let mut power_hysteresis = power::Hysteresis::default();
     let mut collector_on = false;
     let mut power_respawn = false;
     while !control::quit_requested() {
-        // Commands from the pipe thread first (design-m4 §2.2): apply
+        // Commands from the pipe thread first: apply
         // every queued mutation, publish the resulting snapshot, and only
         // then write the responses — a client that asks `status` right
         // after `pause` must already see the pause.
@@ -2034,10 +2032,10 @@ pub fn run(
         }
         if quit || respawn.is_some() || power_respawn {
             // The pipe thread flushes its write to the client, then acks;
-            // only then does the exit ladder start (design-m4 §2.3 — a
+            // only then does the exit ladder start (a
             // respawn-triggering `wallpaper.set` shares that handshake,
-            // design-m2 §4). A missing ack must not keep the daemon alive.
-            // A power respawn (S2b) has no client waiting, so it must not
+            // A missing ack must not keep the daemon alive.
+            // A power respawn has no client waiting, so it must not
             // sit through the flush timeout either.
             if quit || respawn.is_some() {
                 if let Err(err) = flush_rx.recv_timeout(QUIT_FLUSH_WAIT) {
@@ -2054,7 +2052,7 @@ pub fn run(
             break;
         }
 
-        // Tray (design-m5 §6, P3), turn 1 of 2: reconcile the icon with
+        // Tray, turn 1 of 2: reconcile the icon with
         // the live `settings.tray` (applies here, without waiting for a
         // window message) and run a menu choice recorded during the
         // previous message drain.
@@ -2062,7 +2060,7 @@ pub fn run(
             run_tray_action(action, &mut flags, &settings, &mut backend_guard);
         }
 
-        // S2b: one collector turn per iteration (design-m4 §2.6) — gate,
+        // one collector turn per iteration — gate,
         // raw sample through the 3 s hysteresis, reconcile. Placed before
         // the wait so a broadcast dispatched at the end of the previous
         // iteration is consumed immediately and a `settings set` that just
@@ -2079,11 +2077,11 @@ pub fn run(
             hysteresis: &mut power_hysteresis,
             collector_on: &mut collector_on,
         }) {
-            // Either "the engine must go away" arm (`design-m5b.md` §4.4):
+            // Either "the engine must go away" arm:
             // head straight for the quit block at the top — no wait. The
             // ladder repaints the real wallpaper and the child does the
-            // reload with flat memory (§8.3), landing in the listener when
-            // the source is still battery (§4.3).
+            // reload with flat memory, landing in the listener when
+            // the source is still battery.
             power_respawn = true;
             continue;
         }
@@ -2147,7 +2145,7 @@ pub fn run(
             }
         }
 
-        // Tray (design-m5 §6, P3), turn 2 of 2: a click or a
+        // Tray, turn 2 of 2: a click or a
         // `TaskbarCreated` broadcast was recorded during the drain above.
         if let Some(action) = tray.step(settings.tray, flags.user_paused) {
             run_tray_action(action, &mut flags, &settings, &mut backend_guard);
@@ -2222,18 +2220,18 @@ pub fn run(
     // function. The desktop must be repainted and the state saved before
     // anything else, including logging.
     dlog!("stopping");
-    // The tray icon goes first (design-m5 §6): the user sees the daemon
+    // The tray icon goes first: the user sees the daemon
     // leave the notification area immediately, and the control window is
     // still alive below for NIM_DELETE — including a respawn exit, so the
     // child's own icon is the only one left.
     tray.remove();
-    // S2b: drop the power subscription while the control window it points
-    // at is still alive (design-m4 §2.6). The OS would reclaim it on
+    // drop the power subscription while the control window it points
+    // at is still alive. The OS would reclaim it on
     // process exit anyway; doing it here keeps the respawn path symmetric.
     if let Some(handle) = power_registration.take() {
         power::unregister(handle);
     }
-    // design-m2 §3.3: the engine releases its playback window first, then
+    // the engine releases its playback window first, then
     // the host dies, then the repaint ladder runs.
     if let Some(backend) = backend_guard.take() {
         backend.shutdown();
@@ -2353,12 +2351,12 @@ mod tests {
         };
         let flags = Flags::default();
 
-        // Documented default: `pause.session_lock = true` (ipc.md §5).
+        // Documented default: `pause.session_lock = true`.
         apply_playback(&mut backend, &Settings::default(), &flags, true);
         assert_eq!(pauses.load(Ordering::SeqCst), 1);
         assert_eq!(plays.load(Ordering::SeqCst), 0);
 
-        // The S2 settings toggle is honoured (design-m4 §2.6): with the
+        // The settings toggle is honoured: with the
         // toggle off a locked session plays instead of pausing.
         let relaxed = Settings {
             pause: PauseSettings {
@@ -2453,8 +2451,8 @@ mod tests {
             ),
             PresentationModeAction::Keep
         );
-        // Changed with an engine holding the old route: respawn (AGENTS
-        // §3.15 — never rebuild in-process).
+        // Changed with an engine holding the old route: respawn (
+        // never rebuild in-process).
         assert_eq!(
             engine_mode_action(
                 PresentationMode::Accurate,
@@ -2505,11 +2503,11 @@ mod tests {
                 state.battery_action,
                 cascade_core::rule_engine::BatteryAction::Off
             ),
-            "D8 default: off"
+            "power handling defaults to off"
         );
         assert!(
             !state.on_battery,
-            "D8 default: no collector ran, so the confirmed source is off"
+            "no collector ran, so the confirmed source is off"
         );
 
         flags.user_paused = true;
@@ -2519,7 +2517,7 @@ mod tests {
         assert!(state.session_locked);
         assert!(
             state.on_battery,
-            "the collector's confirmed source reaches the oracle (S2b)"
+            "the collector's confirmed source reaches the rule engine"
         );
     }
 
@@ -2541,7 +2539,7 @@ mod tests {
 
     #[test]
     fn default_options_match_the_documented_baseline() {
-        // docs/architecture.md: level 1, 60 s shell discovery, teal, auto.
+        // level 1, 60 s shell discovery, teal, auto.
         let options = DaemonOptions::default();
         assert_eq!(options.repaint_level, 1);
         assert_eq!(options.shell_timeout, Duration::from_secs(60));
@@ -2551,7 +2549,7 @@ mod tests {
         assert!(options.video.is_none());
     }
 
-    // --- design-m5-p4 §4.5: `state` event semantics ---------------------
+    // `state` event semantics ---------------------
 
     fn event_snapshot(
         mode: &str,
@@ -2585,7 +2583,7 @@ mod tests {
     fn state_events_fire_on_semantics_and_never_on_counters() {
         let base = event_snapshot("attached", Vec::new(), Some(event_playback(Some(60.0))));
 
-        // fps/dropped tick on every watchdog tick — poll-only (design-m5 §8).
+        // fps/dropped tick on every watchdog tick — poll-only.
         let mut counters = base.clone();
         if let Some(playback) = counters.playback.as_mut() {
             playback.fps = Some(144.0);

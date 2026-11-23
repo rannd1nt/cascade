@@ -1,4 +1,4 @@
-//! GUI window icon (design-m5-p4 §13, I1).
+//! GUI window icon.
 //!
 //! The executable resource and the tray already use `img/cascade.ico`
 //! (resource id 1), but winit 0.30 registers its window class with a null
@@ -22,7 +22,7 @@ use eframe::egui::IconData;
 use image::imageops::FilterType;
 
 /// Embedded at compile time so the release stays a single executable
-/// (AGENTS §3.10) and cannot drift from the shipped binary.
+/// and cannot drift from the shipped binary.
 const PNG: &[u8] = include_bytes!("../../../img/cascade.png");
 
 /// egui wants a square whose edges are multiples of 4; 256 is also the

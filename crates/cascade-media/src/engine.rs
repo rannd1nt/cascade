@@ -1,29 +1,29 @@
-//! Media Foundation playback backend (design-m2 §2, design-p1-color §4.2).
+//! Media Foundation playback backend.
 //!
 //! Default mode is the **frame-server**: an `IMFMediaEngine` created
 //! *without* `MF_MEDIA_ENGINE_PLAYBACK_HWND`, bound to a dedicated
 //! decode-side D3D11 device through `MF_MEDIA_ENGINE_DXGI_MANAGER`. Frames
 //! leave the engine through `TransferVideoFrame` as raw NV12 on that device
 //! and cross to the render device through a CPU staging bridge
-//! (`design-p1-color.md` §4.5.2 — decode and 3D must not share one device,
-//! `notes-p1-color-601.md` §11), then are converted + scaled by our own
+//! (decode and 3D must not share one device,
+//! then are converted + scaled by our own
 //! D3D11 video processor (`E3bPipeline`) with the matrix/range from the
 //! SPS/VUI parser — Media Foundation ignores H.264 VUI colour flags on
 //! every layer reachable on build 26200.9711, so the YUV→RGB step must be
-//! ours (`notes-p1-color-601.md`, `design-p1-color.md` §2).
+//! ours.
 //!
 //! If frame-server initialisation or the frame pipeline fails repeatedly,
 //! the backend retries once in **rendering** mode — the proven
 //! `MF_MEDIA_ENGINE_PLAYBACK_HWND` variant-A path: video stays visible with
-//! the known wrong colour on BT.601 content (documented in `README.md`,
-//! reported as `engine` in `status`, `design-p1-color.md` §4.4).
+//! the known wrong colour on BT.601 content (documented in,
+//! reported as `engine` in `status`).
 //!
 //! All engine interaction runs on a dedicated playback thread behind a
 //! command channel (the `source_reader.rs` pattern): the main thread only
 //! sends commands and reads published atomics — no COM on the main thread
-//! (AGENTS §4, design-m2 §3.1). `attach_surface` binds only the swapchain;
+//! `attach_surface` binds only the swapchain;
 //! the engine itself does not depend on the host HWND, so a re-attach never
-//! recreates or reloads the engine (`design-p1-color.md` §4.5, U4).
+//! recreates or reloads the engine.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -73,9 +73,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Best-effort probe line on stderr (mirrors `derr!` in `cascade-win`;
-/// `cascade-media` may not depend on it — AGENTS §4). Never panics: these
+/// `cascade-media` may not depend on it — ). Never panics: these
 /// probes run on detach/exit paths where a failed write during `CTRL_CLOSE`
-/// must not skip the repaint ladder (AGENTS §3.1).
+/// must not skip the repaint ladder.
 macro_rules! probe {
     ($($arg:tt)*) => {{
         use std::io::Write as _;
@@ -93,24 +93,24 @@ const LOAD_POLL: Duration = Duration::from_millis(20);
 /// engine creation), so the readiness budget is unchanged from when the
 /// engine ran on the main thread.
 const ACK_TIMEOUT: Duration = Duration::from_secs(7);
-/// No-new-frame / rendering-mode pump cadence (E3 probe used the same 2 ms).
+/// No-new-frame / rendering-mode pump cadence (probe used the same 2 ms).
 const TICK_POLL: Duration = Duration::from_millis(2);
-/// Detached or paused cadence: nothing to draw, stay cheap (design §4.5.1).
+/// Detached or paused cadence: nothing to draw, stay cheap.
 const IDLE_POLL: Duration = Duration::from_millis(5);
 /// Refresh interval of the engine's own frame counters (rendering mode).
 const STATS_POLL: Duration = Duration::from_secs(1);
 /// Consecutive frame-pipeline failures before the one-way trip to rendering
-/// mode (design-p1-color §4.4).
+/// mode.
 const FALLBACK_ERRORS: u32 = 3;
 /// Frame rate handed to the video processor when the stream does not say.
 const DEFAULT_FRAME_RATE: (u32, u32) = (60, 1);
 
-/// Published `BackendStats::engine_mode` values (design §4.5.1 "status").
+/// Published `BackendStats::engine_mode` values (design "status").
 const MODE_NONE: u8 = 0;
 const MODE_FRAME_SERVER: u8 = 1;
 const MODE_RENDERING: u8 = 2;
 
-/// RAII COM apartment for a Cascade thread (AGENTS §4: apartment per
+/// RAII COM apartment for a Cascade thread : apartment per
 /// thread, released before thread exit).
 struct ComInit {
     /// `false` when COM was already initialized in a different apartment
@@ -121,8 +121,8 @@ struct ComInit {
 impl ComInit {
     /// Initialize COM with the requested apartment mode. The daemon main
     /// thread runs STA (it owns windows); the playback thread runs STA too
-    /// (design-m2 §3.3 — the MTA experiment failed, notes §11.1, so the
-    /// freeze fix is the split decode/render device, §4.5.2).
+    /// (the MTA experiment failed, so the
+    /// freeze fix is the split decode/render device).
     fn new(apartment: COINIT) -> BackendResult<Self> {
         // SAFETY: null reserved pointer is the documented value; Drop only
         // uninitializes when this call is the one that initialized COM.
@@ -151,14 +151,14 @@ impl Drop for ComInit {
     }
 }
 
-/// RAII `MFStartup`/`MFShutdown` pair (design-m2 §3.2). The playback
+/// RAII `MFStartup`/`MFShutdown` pair. The playback
 /// thread constructs its own pair as well; MF refcounts the startup.
 struct MfStartup;
 
 impl MfStartup {
     fn new() -> BackendResult<Self> {
         // SAFETY: documented pairing; MFSTARTUP_FULL is required by the
-        // media engine (design-m2 §3.2).
+        // media engine.
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }
             .map_err(|err| BackendError::Mf(format!("MFStartup: {}", err.message())))?;
         Ok(Self)
@@ -174,8 +174,8 @@ impl Drop for MfStartup {
 
 /// Required event sink (MSDN: `MF_MEDIA_ENGINE_CALLBACK` is required in
 /// every mode; without it `CreateInstance` returns `MF_E_ATTRIBUTENOTFOUND`
-/// — measured on build 26200.9711). Events are not consumed here: readiness
-/// and errors are polled (design-m2 §3.1), so the sink only has to exist
+/// measured on build 26200.9711). Events are not consumed here: readiness
+/// and errors are polled, so the sink only has to exist
 /// and be safe to call from any thread.
 #[implement(IMFMediaEngineNotify)]
 struct EngineNotify;
@@ -187,9 +187,9 @@ impl IMFMediaEngineNotify_Impl for EngineNotify_Impl {
 }
 
 /// The `MediaBackend` implementation over a playback thread that owns the
-/// `IMFMediaEngine` (design-p1-color §4.2). The main thread keeps only the
+/// `IMFMediaEngine`. The main thread keeps only the
 /// remembered source/options and the published atomics — `stats()` never
-/// touches COM (design §4.5.1).
+/// touches COM.
 pub struct MediaEngineBackend {
     /// Remembered by `load`; consumed when the playback thread spawns or
     /// reloads.
@@ -200,7 +200,7 @@ pub struct MediaEngineBackend {
     /// a detach paused the engine).
     want_playing: bool,
     /// Command channel to the playback thread; `None` before the first
-    /// `attach_surface`, which spawns it (design §4.5.1 "spawn").
+    /// `attach_surface`, which spawns it (design "spawn").
     cmd_tx: Option<Sender<EngineCmd>>,
     thread: Option<JoinHandle<()>>,
     /// Published by the playback thread, read here only.
@@ -208,16 +208,16 @@ pub struct MediaEngineBackend {
     dropped: Arc<AtomicU64>,
     video_size: Arc<AtomicU64>,
     engine_mode: Arc<AtomicU8>,
-    /// Last frame count behind the measured `fps` (M4 S3b): frames over the
+    /// Last frame count behind the measured `fps`: frames over the
     /// wall time between two `stats()` calls, which the render loop makes
     /// on its 1–2 s watchdog tick. `Cell` because `stats(&self)` takes
     /// `&self`; the backend lives on the daemon's main thread only
-    /// (design-m2 §3.1), so no synchronisation is needed.
+    /// so no synchronisation is needed.
     fps_sample: Cell<Option<(u64, Instant)>>,
     // Declaration order = drop order: `Drop` stops the playback thread
     // first (it releases its engine before its own MFShutdown/COM), then
     // `_mf` runs MFShutdown, then `_com` runs CoUninitialize on this thread
-    // (design-m2 §3.3).
+    //
     _mf: MfStartup,
     _com: ComInit,
 }
@@ -225,7 +225,7 @@ pub struct MediaEngineBackend {
 impl MediaEngineBackend {
     /// Construct the COM + MF runtime on the calling (main) thread.
     /// `MFStartup` runs here and again on the playback thread
-    /// (design-m2 §3.2; MF refcounts it).
+    /// (; MF refcounts it).
     pub fn new() -> BackendResult<Self> {
         let com = ComInit::new(COINIT_APARTMENTTHREADED)?;
         let mf = MfStartup::new()?;
@@ -246,7 +246,7 @@ impl MediaEngineBackend {
     }
 
     /// Frames per second over the interval since the previous `stats()`
-    /// call (M4 S3b). The arithmetic lives in [`fps_rate`]; this half only
+    /// call. The arithmetic lives in [`fps_rate`]; this half only
     /// owns the sample cell (`stats(&self)` takes `&self`).
     fn measured_fps(&self, frames: u64) -> f32 {
         let now = Instant::now();
@@ -255,7 +255,7 @@ impl MediaEngineBackend {
         rate
     }
 
-    /// Ask the playback thread to stop and wait for it (design §4.5.1
+    /// Ask the playback thread to stop and wait for it (design
     /// teardown): the thread releases its engine before its own
     /// MFShutdown/CoUninitialize, so the join is the ordering barrier.
     fn stop_thread(&mut self) {
@@ -288,7 +288,7 @@ impl Drop for MediaEngineBackend {
     fn drop(&mut self) {
         // Stop the playback thread first: it releases its engine, then its
         // own MFShutdown/CoUninitialize. `_mf` and `_com` drop afterwards
-        // in declaration order (design-m2 §3.3).
+        // in declaration order.
         self.stop_thread();
     }
 }
@@ -296,7 +296,7 @@ impl Drop for MediaEngineBackend {
 impl MediaBackend for MediaEngineBackend {
     fn load(&mut self, source: &Path, opts: &PlaybackOptions) -> BackendResult<()> {
         // Validate before touching playback: a missing file degrades to the
-        // colour background and never blanks the desktop (AGENTS §3.1).
+        // colour background and never blanks the desktop.
         std::fs::metadata(source).map_err(|err| BackendError::Open {
             path: source.display().to_string(),
             reason: err.to_string(),
@@ -304,7 +304,7 @@ impl MediaBackend for MediaEngineBackend {
         self.source = Some(source.to_path_buf());
         self.opts = opts.clone();
         self.want_playing = true;
-        // Running thread: ack'd reload (design §4.5.1). No thread yet: the
+        // Running thread: ack'd reload. No thread yet: the
         // source is only remembered — `attach_surface` spawns and loads it
         // (today's contract).
         let (ack_tx, ack_rx) = mpsc::channel();
@@ -353,7 +353,7 @@ impl MediaBackend for MediaEngineBackend {
     fn set_volume(&mut self, level: u8) -> BackendResult<()> {
         // Remembered even with no thread yet (applied when the playback
         // thread spawns) and mirrored into the running engine — a live
-        // property change, never a reload (design-volume §3).
+        // property change, never a reload.
         self.opts.volume = level;
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.send(EngineCmd::SetVolume(level));
@@ -362,7 +362,7 @@ impl MediaBackend for MediaEngineBackend {
     }
 
     fn stats(&self) -> BackendStats {
-        // Atomics only — no COM on the main thread (design §4.5.1).
+        // Atomics only — no COM on the main thread.
         // Hardware decode stays `None`: the engine cannot observe it and
         // the probe is slice 4, so `status` never prints a guess.
         let frames = self.frames.load(Ordering::Acquire);
@@ -384,8 +384,8 @@ impl MediaBackend for MediaEngineBackend {
     fn attach_surface(&mut self, surface: HostSurface) -> BackendResult<()> {
         let (width, height) = (surface.rect.w as u32, surface.rect.h as u32);
         // Running thread: rebind the surface only. A frame-server engine
-        // survives the reattach untouched — this is the U4 bet
-        // (design §4.5); a rendering engine is rebuilt on the new HWND.
+        // survives the reattach untouched — this is the bet
+        // a rendering engine is rebuilt on the new HWND.
         if self.thread.is_some() {
             let (ack_tx, ack_rx) = mpsc::channel();
             let cmd = EngineCmd::Attach {
@@ -402,7 +402,7 @@ impl MediaBackend for MediaEngineBackend {
             }
         }
         // First attach (or respawn): the source is required — the
-        // `attach before load` error is kept (design §4.5.1).
+        // `attach before load` error is kept.
         let source = self
             .source
             .clone()
@@ -427,7 +427,7 @@ impl MediaBackend for MediaEngineBackend {
         self.thread = Some(thread);
         // Spawn handshake: `Ok` once an engine is ready to draw (either
         // mode), `Err` when neither could start — attach keeps today's
-        // synchronous error contract (design §4.5.1 "spawn").
+        // synchronous error contract (design "spawn").
         wait_ack(&ack_rx, "attach")
     }
 
@@ -440,7 +440,7 @@ impl MediaBackend for MediaEngineBackend {
         match sent {
             // Acked after the swapchain is released (and the frame-server
             // engine paused), so the caller may destroy the HWND right
-            // after — the watchdog/display paths do (design §4.5.1).
+            // after — the watchdog/display paths do.
             Some(Ok(())) => wait_ack(&ack_rx, "detach"),
             Some(Err(_)) => {
                 self.stop_thread();
@@ -452,7 +452,7 @@ impl MediaBackend for MediaEngineBackend {
 
     fn shutdown(self: Box<Self>) {
         // `Drop` stops the playback thread (engine release), then
-        // MFShutdown, then CoUninitialize — in that order (design-m2 §3.3).
+        // MFShutdown, then CoUninitialize — in that order.
         drop(self);
     }
 }
@@ -460,7 +460,7 @@ impl MediaBackend for MediaEngineBackend {
 /// Command sent from the daemon main thread to the playback thread.
 /// `Play`/`Pause`/`SetLooping` are fire-and-forget (the `source_reader`
 /// pattern); the ack'd variants exist so the caller may destroy or rebuild
-/// the HWND right after the answer (design §4.5.1).
+/// the HWND right after the answer.
 enum EngineCmd {
     Attach {
         hwnd: isize,
@@ -479,7 +479,7 @@ enum EngineCmd {
     Play,
     Pause,
     SetLooping(bool),
-    /// Audio level 0–100 applied to the live engine (`design-volume.md` §3).
+    /// Audio level 0–100 applied to the live engine.
     SetVolume(u8),
     Stop,
 }
@@ -502,13 +502,13 @@ struct ServerConfig {
 }
 
 /// Playback thread entry point. Everything COM/D3D11/MF happens here —
-/// no interface crosses a thread boundary (AGENTS §4).
+/// no interface crosses a thread boundary.
 fn playback_thread(config: ServerConfig, cmd_rx: Receiver<EngineCmd>) {
     // COM first, then MF; declared in this order so the reverse-order
-    // scope exit runs MFShutdown before CoUninitialize (design-m2 §3.3).
-    // STA as designed: the MTA experiment (notes §11.1) reproduced
+    // scope exit runs MFShutdown before CoUninitialize.
+    // STA as designed: the MTA experiment reproduced
     // byte-identical freeze stacks, so the apartment is not the variable —
-    // the fix under test is the split decode/render device (§4.5.2).
+    // the fix under test is the split decode/render device.
     let com = match ComInit::new(COINIT_APARTMENTTHREADED) {
         Ok(com) => com,
         Err(err) => {
@@ -540,7 +540,7 @@ fn playback_thread(config: ServerConfig, cmd_rx: Receiver<EngineCmd>) {
     drop(com);
 }
 
-/// Active presentation mode of the playback thread (design §4.4).
+/// Active presentation mode of the playback thread.
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     /// NV12 `TransferVideoFrame` + our video processor + our swapchain.
@@ -550,14 +550,14 @@ enum Mode {
     Rendering,
 }
 
-/// Frame-server frame path across the two D3D11 devices (design §4.5.2):
+/// Frame-server frame path across the two D3D11 devices:
 /// transfer destination + CPU-read staging on the decode device, CPU-write
 /// staging + video-processor input on the render device. One frame crosses
 /// as: `TransferVideoFrame` → GPU copy → `Map(READ)` (barrier) → plane
 /// `memcpy` → `Unmap` → GPU copy into `dst`.
 struct Nv12Bridge {
     /// NV12 destination of `TransferVideoFrame` (decode device). Bind
-    /// flags mirror the E3 probe: RENDER_TARGET first (the engine's blit
+    /// flags mirror the probe: RENDER_TARGET first (the engine's blit
     /// wants it), plain 0 as the measured fallback.
     src: ID3D11Texture2D,
     /// `IUnknown` view of `src` (the API takes `IUnknown`).
@@ -585,10 +585,10 @@ struct Server {
     engine: Option<IMFMediaEngine>,
     /// Playback HWND of the *rendering* engine; `0` for a frame-server
     /// engine, which has none (this is also the `shutdown_or_release`
-    /// switch that selects the release path — U5).
+    /// switch that selects the release path — ).
     engine_hwnd: isize,
     /// Colour tags from the SPS/VUI and the stream frame rate: read from a
-    /// bare source reader *before* the engine is built (design §4.2).
+    /// bare source reader *before* the engine is built.
     colour: ColourTags,
     frame_rate: (u32, u32),
     device: ID3D11Device,
@@ -600,22 +600,22 @@ struct Server {
     size: (u32, u32),
     swapchain: Option<IDXGISwapChain1>,
     /// Render-target view of the back buffer: the black clear outside the
-    /// video's destination rect (letterbox bars, `quality.md` §4.8).
+    /// video's destination rect (letterbox bars).
     rtv: Option<ID3D11RenderTargetView>,
     pipeline: Option<E3bPipeline>,
-    /// Decode-side device + context (design §4.5.2): MF's DXGI manager,
+    /// Decode-side device + context: MF's DXGI manager,
     /// the transfer destination and the read staging live here, so decode
-    /// and 3D never share one device (the freeze, notes §11). Created
+    /// and 3D never share one device (the freeze, notes ). Created
     /// lazily on the first frame-server start; idle in rendering mode.
     mf_device: Option<ID3D11Device>,
     mf_context: Option<ID3D11DeviceContext>,
-    /// The two-device frame bridge (design §4.5.2); `None` while no
+    /// The two-device frame bridge; `None` while no
     /// frame-server engine exists.
     bridge: Option<Nv12Bridge>,
     /// Native video size, mirrored into `video_size_pub`.
     video_size: (u32, u32),
     /// Consecutive frame-pipeline failures; ≥ [`FALLBACK_ERRORS`] trips
-    /// the one-way fallback to rendering mode (design §4.4).
+    /// the one-way fallback to rendering mode.
     errors: u32,
     /// Last `FRAMES_RENDERED` poll (rendering-mode stats, ~1 s).
     stat_tick: Instant,
@@ -625,13 +625,13 @@ struct Server {
     engine_mode_pub: Arc<AtomicU8>,
 }
 
-/// Route to start for **one load** (`design-engine-mode.md` §4), in order:
+/// Route to start for **one load**, in order:
 /// the dev A/B evidence knob `CASCADE_ENGINE_RENDER=1` (precedent
 /// `CASCADE_GATE=B`) forces rendering regardless of the setting, then the
 /// user's `engine_mode` decides — `efficient` renders directly, `accurate`
 /// takes the frame-server with its own one-way fallback. Pure so the rule is
 /// unit-testable without a GPU; the route is decided here once and never
-/// changes on a running engine (AGENTS §3.15).
+/// changes on a running engine.
 fn start_mode(requested: PresentationMode, forced_by_env: bool) -> Mode {
     if forced_by_env || requested == PresentationMode::Efficient {
         Mode::Rendering
@@ -642,7 +642,7 @@ fn start_mode(requested: PresentationMode, forced_by_env: bool) -> Mode {
 
 impl Server {
     /// Build the device and start an engine on `config.hwnd`, preferring
-    /// frame-server mode and falling back to rendering (design §4.4). Any
+    /// frame-server mode and falling back to rendering. Any
     /// failure here fails the spawn handshake, i.e. `attach_surface`.
     fn new(config: ServerConfig) -> Result<Self, String> {
         let (device, context) = create_d3d11(true).map_err(|err| err.to_string())?;
@@ -673,8 +673,8 @@ impl Server {
             video_size_pub: config.video_size,
             engine_mode_pub: config.engine_mode,
         };
-        // Mode selection, once per load (`start_mode`, design-engine-mode
-        // §4): the A/B knob or an `efficient` request starts rendering
+        // Mode selection, once per load (`start_mode`,
+        // the A/B knob or an `efficient` request starts rendering
         // directly; `accurate` (default) falls through to the frame-server
         // with its documented one-way fallback to rendering.
         let forced = std::env::var("CASCADE_ENGINE_RENDER").is_ok_and(|value| value == "1");
@@ -715,7 +715,7 @@ impl Server {
     }
 
     /// Frame-server start: colour tags + frame rate from a bare source
-    /// reader **before** the engine exists (design §4.2), then the engine,
+    /// reader **before** the engine exists, then the engine,
     /// then the GPU surface.
     fn start_frame_server(&mut self, hwnd: isize, width: u32, height: u32) -> Result<(), String> {
         self.start_frame_server_engine()?;
@@ -726,7 +726,7 @@ impl Server {
     /// for a reload or a reattach after a failed reload (no surface).
     fn start_frame_server_engine(&mut self) -> Result<(), String> {
         // Bare reader (no D3D manager): the bitstream is the only
-        // trustworthy matrix source (notes D1). It is dropped before the
+        // trustworthy matrix source. It is dropped before the
         // engine opens the file again, so no handle is held across.
         let (colour, frame_rate) = stream_info(&self.source)?;
         self.colour = colour;
@@ -740,11 +740,11 @@ impl Server {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "<absent>".to_string())
         );
-        // Decode-side device (design §4.5.2): MF's engine, the transfer
+        // Decode-side device: MF's engine, the transfer
         // texture and the read staging live on their own device, so the
         // driver never runs decode and 3D work on one device (the freeze,
-        // notes §11). Created lazily; a failure here is a frame-server
-        // init failure and falls back to rendering like any other (§4.4).
+        // notes ). Created lazily; a failure here is a frame-server
+        // init failure and falls back to rendering like any other.
         // The device stays alive for the Server's lifetime (idle devices
         // do no GPU work) and is reused across reloads.
         if self.mf_device.is_none() {
@@ -759,7 +759,7 @@ impl Server {
         let engine = create_frame_server_engine(mf_device, self.opts.volume)?;
         if let Err(reason) = run_source(&engine, &self.source, self.opts.looping, self.want_playing)
         {
-            // Frame-server engine: no HWND → the release path (U5).
+            // Frame-server engine: no HWND → the release path.
             shutdown_or_release(engine, 0);
             return Err(reason);
         }
@@ -773,7 +773,7 @@ impl Server {
 
     /// Rendering start (fallback and rendering reload): the proven
     /// variant-A engine bound to `hwnd`, primed with the configured volume
-    /// before any source can make a sound (design-m2 §5, design-volume §4).
+    /// before any source can make a sound.
     fn start_rendering(&mut self, hwnd: isize) -> Result<(), String> {
         let engine = create_rendering_engine(hwnd, self.opts.volume)?;
         if let Err(reason) = run_source(&engine, &self.source, self.opts.looping, self.want_playing)
@@ -807,9 +807,9 @@ impl Server {
     }
 
     /// Build the four textures of the two-device frame bridge (design
-    /// §4.5.2): NV12 transfer destination + CPU-read staging on the decode
+    /// NV12 transfer destination + CPU-read staging on the decode
     /// device, CPU-write staging + NV12 video-processor input on the
-    /// render device. NV12 bind flags mirror the E3 probe: RENDER_TARGET
+    /// render device. NV12 bind flags mirror the probe: RENDER_TARGET
     /// first (the video processor input view wants it), plain 0 as the
     /// measured fallback.
     fn create_bridge(&mut self) -> Result<(), String> {
@@ -866,7 +866,7 @@ impl Server {
 
     /// Bind (or rebind) the host surface: swapchain + video processor for
     /// `hwnd` at `width`×`height`. Releases any previous surface first
-    /// (reattach = new swapchain only — U4).
+    /// (reattach = new swapchain only — ).
     fn bind_surface(&mut self, hwnd: isize, width: u32, height: u32) -> Result<(), String> {
         self.release_surface();
         let swapchain = create_swapchain(
@@ -916,7 +916,7 @@ impl Server {
     }
 
     /// Tear the frame-server side down completely: engine (release path —
-    /// no HWND, U5), surface, frame bridge. Used by the fallback and by
+    /// no HWND), surface, frame bridge. Used by the fallback and by
     /// `Drop`.
     fn release_frame_server(&mut self) {
         if let Some(engine) = self.engine.take() {
@@ -927,9 +927,9 @@ impl Server {
         self.bridge = None;
     }
 
-    /// One-way trip to rendering mode (design §4.4): release the
+    /// One-way trip to rendering mode: release the
     /// frame-server side, then start the proven engine on the current HWND
-    /// — or defer to the next attach when detached.
+    /// or defer to the next attach when detached.
     fn fallback_to_rendering(&mut self, reason: &str) {
         probe!("[p1] frame-server -> rendering fallback: {reason}");
         self.release_frame_server();
@@ -1029,7 +1029,7 @@ impl Server {
                 // reattach/reload must not go back to the old level), then
                 // applied to the live one. A failure is logged, never
                 // fatal — same fire-and-forget contract as Play/Pause
-                // (design-volume §3).
+                //
                 self.opts.volume = level;
                 if let Some(engine) = &self.engine {
                     if let Err(reason) = apply_volume(engine, level) {
@@ -1056,7 +1056,7 @@ impl Server {
             EngineCmd::Reload { source, opts, ack } => {
                 let result = self.on_reload(source, opts);
                 if result.is_err() && matches!(self.mode, Mode::FrameServer) {
-                    // Reload failure = frame-server init failure (§4.4):
+                    // Reload failure = frame-server init failure:
                     // one-way trip to rendering; the file may simply be
                     // broken, in which case rendering fails too and the
                     // desktop keeps the last frame (never blank).
@@ -1068,8 +1068,8 @@ impl Server {
         }
     }
 
-    /// Rebind the host surface (design §4.5.1): a frame-server engine is
-    /// untouched — only the swapchain is rebuilt (the U4 reattach bet) —
+    /// Rebind the host surface: a frame-server engine is
+    /// untouched — only the swapchain is rebuilt (the reattach bet) —
     /// while a rendering engine dies with its window and is rebuilt.
     fn on_attach(&mut self, hwnd: isize, width: u32, height: u32) -> Result<(), String> {
         self.size = (width, height);
@@ -1106,14 +1106,14 @@ impl Server {
         }
     }
 
-    /// Release the surface; keep the engine (design §4.5.1).
+    /// Release the surface; keep the engine.
     fn on_detach(&mut self) -> Result<(), String> {
         match self.mode {
             Mode::FrameServer => {
                 // Stop decoding while nothing is drawn, but keep the engine
-                // and its source alive: reattach = swapchain only (U4).
+                // and its source alive: reattach = swapchain only.
                 // The file stays open across a detach — open item measured
-                // during the `docs/reliability.md` §12 re-run.
+                // during the re-run.
                 if let Some(engine) = &self.engine {
                     // SAFETY: live engine on this thread.
                     if let Err(err) = unsafe { engine.Pause() } {
@@ -1126,7 +1126,7 @@ impl Server {
             }
             Mode::Rendering => {
                 // Variant-A parity: the rendering engine dies with its
-                // window (its `Shutdown()` needs a live HWND — R2/R3) and
+                // window (its `Shutdown()` needs a live HWND — ) and
                 // releases the file with it.
                 if let Some(engine) = self.engine.take() {
                     shutdown_or_release(engine, self.engine_hwnd);
@@ -1138,7 +1138,7 @@ impl Server {
         }
     }
 
-    /// Swap the source (design §4.5.1 reload row).
+    /// Swap the source (design reload row).
     fn on_reload(&mut self, source: PathBuf, opts: PlaybackOptions) -> Result<(), String> {
         self.source = source;
         self.opts = opts;
@@ -1160,8 +1160,8 @@ impl Server {
             }
             Mode::FrameServer => {
                 // Release the old engine first — that is what frees the
-                // file (design §4.5.1) — then rebuild from the bare-reader
-                // colour tags (§4.2).
+                // file — then rebuild from the bare-reader
+                // colour tags.
                 if let Some(old) = self.engine.take() {
                     shutdown_or_release(old, 0);
                     self.engine_hwnd = 0;
@@ -1180,7 +1180,7 @@ impl Server {
         }
     }
 
-    /// Frame-server tick (design §4.3): `OnVideoStreamTick` per vblank,
+    /// Frame-server tick: `OnVideoStreamTick` per vblank,
     /// S_OK → transfer NV12 → blit → `Present(1, 0)`; S_FALSE → drain and
     /// wait; failures count toward the rendering fallback.
     fn tick_frame_server(&mut self) {
@@ -1194,7 +1194,7 @@ impl Server {
         // blank; S_OK = new frame ready → `TransferVideoFrame`. The safe
         // wrapper cannot tell S_OK from S_FALSE (both are success
         // HRESULTs and `HRESULT::ok` accepts both), so the raw HRESULT is
-        // read from the vtable (the E3 probe's exact call).
+        // read from the vtable (the probe's exact call).
         let hr = self.engine.as_ref().map(|engine| {
             let mut pts: i64 = 0;
             // SAFETY: live engine on this thread; the call fills `pts`.
@@ -1230,8 +1230,8 @@ impl Server {
     }
 
     /// One frame: transfer the decoded NV12 on the decode device, bridge
-    /// it across to the render device through CPU staging (design §4.5.2),
-    /// then video processor → back buffer → present (§4.3). Any error is a
+    /// it across to the render device through CPU staging,
+    /// then video processor → back buffer → present. Any error is a
     /// fallback candidate.
     fn present_frame(&mut self) -> Result<(), String> {
         let (width, height) = self.video_size;
@@ -1255,11 +1255,11 @@ impl Server {
             .ok_or_else(|| String::from("no engine"))?;
         // SAFETY: engine and destination are live on this thread; the full
         // frame rect is the destination (native size — MSDN
-        // TransferVideoFrame; E3-3 proved the NV12 bytes are the raw
+        // TransferVideoFrame; proved the NV12 bytes are the raw
         // decode, so the matrix is still ours to apply below).
         unsafe { engine.TransferVideoFrame(&bridge.src_view, None, &rect, None) }
             .map_err(|err| format!("TransferVideoFrame: {}", err.message()))?;
-        // Decode-device half of the bridge (design §4.5.2): GPU-copy the
+        // Decode-device half of the bridge: GPU-copy the
         // transferred frame into CPU-read staging, then map it. `Map(READ)`
         // blocks in the kernel until that copy completes — this is the
         // frame barrier (no polling, no `DO_NOT_WAIT`, no busy-wait).
@@ -1326,7 +1326,7 @@ impl Server {
                 .CopyResource(&bridge.dst, &bridge.staging_write)
         };
         // Letterbox bars are the black clear outside the destination rect
-        // (opaque window, quality.md §4.8). Only Contain can leave any
+        // (opaque window). Only Contain can leave any
         // uncovered area; Cover/Stretch fill the surface.
         if self.opts.fit == Fit::Contain {
             if let Some(rtv) = &self.rtv {
@@ -1359,7 +1359,7 @@ impl Server {
 
     /// Count a frame-pipeline failure: log the first few and then every
     /// ~2 s, and trip the fallback after [`FALLBACK_ERRORS`] in a row
-    /// (design §4.4).
+    ///
     fn note_error(&mut self, reason: String) {
         self.errors = self.errors.saturating_add(1);
         if self.errors <= FALLBACK_ERRORS || self.errors.is_multiple_of(120) {
@@ -1372,7 +1372,7 @@ impl Server {
 
     /// Rendering tick: the engine presents into its own HWND; this thread
     /// only drains the STA queue (its callbacks) and refreshes the
-    /// published counters about once a second (design §4.4).
+    /// published counters about once a second.
     fn tick_rendering(&mut self) {
         pump_messages();
         if self.engine.is_none() {
@@ -1402,7 +1402,7 @@ impl Drop for Server {
         // Rendering engines take their real HWND (`Shutdown()` when the
         // window is alive, plain release when it is dead — variant-A
         // parity); frame-server engines pass 0 → always the release path
-        // (the E3-proven teardown, U5). Then the surface objects go with
+        // (the -proven teardown). Then the surface objects go with
         // the swapchain they belong to.
         if let Some(engine) = self.engine.take() {
             shutdown_or_release(engine, self.engine_hwnd);
@@ -1415,7 +1415,7 @@ impl Drop for Server {
 /// Colour tags + frame rate for `source` from a **bare** source reader:
 /// no D3D manager, no output negotiation — container attributes only.
 /// The reader (and the file handle it holds) dies inside this call, so the
-/// engine can open the same file right after (design §4.2).
+/// engine can open the same file right after.
 fn stream_info(source: &Path) -> Result<(ColourTags, (u32, u32)), String> {
     let url = file_url(source);
     let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1428,9 +1428,9 @@ fn stream_info(source: &Path) -> Result<(ColourTags, (u32, u32)), String> {
     Ok((colour, frame_rate))
 }
 
-/// One NV12 texture with explicit usage/bind/cpu-access flags — the E3
+/// One NV12 texture with explicit usage/bind/cpu-access flags — the
 /// probe's `tex()` pattern (`probe.rs`), parameterised over the device so
-/// both sides of the bridge can use it (design §4.5.2).
+/// both sides of the bridge can use it.
 fn nv12_texture(
     device: &ID3D11Device,
     width: u32,
@@ -1462,7 +1462,7 @@ fn nv12_texture(
 }
 
 /// Copy one NV12 frame between two mapped staging textures: the Y plane
-/// first, then interleaved UV at `RowPitch * Height` — the E3 readback
+/// first, then interleaved UV at `RowPitch * Height` — the readback
 /// layout (`probe.rs`), reversed. Both planes store `width` bytes per row
 /// (one UV pair per luma pixel column); the UV plane has half the rows.
 fn copy_nv12_planes(
@@ -1513,10 +1513,10 @@ fn copy_nv12_plane(
     }
 }
 
-/// The frame-server engine — the exact E3-1 setup (design §4.2): no
+/// The frame-server engine — the exact setup: no
 /// `MF_MEDIA_ENGINE_PLAYBACK_HWND`, the DXGI manager bound to `device`,
 /// the mandatory callback sink, primed with the configured volume before a
-/// source can make a sound (design-m2 §5, design-volume §4).
+/// source can make a sound.
 fn create_frame_server_engine(device: &ID3D11Device, volume: u8) -> Result<IMFMediaEngine, String> {
     let manager = create_dxgi_device_manager(device)?;
     let attrs = new_engine_attrs()?;
@@ -1535,7 +1535,7 @@ fn create_frame_server_engine(device: &ID3D11Device, volume: u8) -> Result<IMFMe
     Ok(engine)
 }
 
-/// The rendering engine (the proven variant-A path, design §4.4).
+/// The rendering engine (the proven variant-A path, design ).
 fn create_rendering_engine(hwnd: isize, volume: u8) -> Result<IMFMediaEngine, String> {
     let attrs = new_engine_attrs()?;
     // SAFETY: the HWND travels as a UINT64 (Microsoft docs:
@@ -1579,7 +1579,7 @@ fn instantiate_engine(attrs: &IMFAttributes) -> Result<IMFMediaEngine, String> {
         .map_err(|err| format!("CreateInstance: {}", err.message()))
 }
 
-/// The audible state for a `0..=100` level (`design-volume.md` §2):
+/// The audible state for a `0..=100` level:
 /// `(muted, linear gain)` — `0` is muted (the documented default), anything
 /// else plays at `level / 100`. Levels above 100 cannot arrive through the
 /// CLI or the wire (both validate/clamp), but a hand-edited `config.toml`
@@ -1592,8 +1592,8 @@ fn engine_volume(level: u8) -> (bool, f64) {
 
 /// Apply an audio level to a live engine: `SetMuted` first (so a level of
 /// 0 is silent before anything else happens), then `SetVolume`. Runs at
-/// engine construction — before `SetSource`, design-m2 §5 — and on every
-/// runtime `EngineCmd::SetVolume` (design-volume §3). The caller decides
+/// engine construction — before `SetSource`, — and on every
+/// runtime `EngineCmd::SetVolume`. The caller decides
 /// whether a failure tears the engine down (construction) or is only
 /// logged (runtime).
 fn apply_volume(engine: &IMFMediaEngine, level: u8) -> Result<(), String> {
@@ -1633,7 +1633,7 @@ fn run_source(
 
 /// Bounded wait for the first decodable frame. Readiness is polled through
 /// `GetReadyState` instead of consumed from the sink: one code path, and
-/// the nested pump keeps this thread's queue drained (design-m2 §3.1).
+/// the nested pump keeps this thread's queue drained.
 fn wait_ready(engine: &IMFMediaEngine) -> Result<(), String> {
     let deadline = Instant::now() + LOAD_TIMEOUT;
     loop {
@@ -1698,14 +1698,14 @@ fn pump_messages() {
 
 /// Shut the engine down — or release it without `Shutdown()` when its
 /// playback HWND no longer exists (or when it has none at all: a
-/// frame-server engine always takes that branch — U5).
+/// frame-server engine always takes that branch — ).
 ///
-/// Measured on build 26200.9711 (`docs/notes-s7-shellrestart.md` R2/R3):
+/// Measured on build 26200.9711:
 /// `IMFMediaEngine::Shutdown()` blocks **forever** once the
 /// `MF_MEDIA_ENGINE_PLAYBACK_HWND` window is dead — the shell can destroy
 /// that window before any of our detach paths runs, and the STA render
 /// thread cannot pump messages from inside the blocking call. A plain
-/// `Release` returns promptly and leaves no file lock behind (R4: probes
+/// `Release` returns promptly and leaves no file lock behind : probes
 /// `m3`/`m4`, reattach reloaded the same file, all gates green).
 /// Every `Shutdown()` call site goes through this helper.
 fn shutdown_or_release(engine: IMFMediaEngine, hwnd: isize) {
@@ -1715,7 +1715,7 @@ fn shutdown_or_release(engine: IMFMediaEngine, hwnd: isize) {
     probe!("[wd] m1: MediaEngine::Shutdown enter (hwnd={hwnd}, IsWindow={alive})");
     if alive {
         // SAFETY: created by us on this thread; releases the playback
-        // window first (design-m2 §3.3).
+        // window first.
         let _ = unsafe { engine.Shutdown() };
         probe!("[wd] m2: MediaEngine::Shutdown returned");
     } else {
@@ -1725,7 +1725,7 @@ fn shutdown_or_release(engine: IMFMediaEngine, hwnd: isize) {
     }
 }
 
-/// The measured `fps` behind `BackendStats::fps` (M4 S3b): frames over the
+/// The measured `fps` behind `BackendStats::fps`: frames over the
 /// wall time between two samples. In frame-server mode the counter is our
 /// transfer count; in rendering mode it is the engine's own
 /// `FRAMES_RENDERED`, refreshed by the playback thread (~1 s).
@@ -1779,7 +1779,7 @@ mod tests {
 
     #[test]
     fn engine_volume_maps_levels_and_clamps_the_top() {
-        // design-volume §2: 0 is muted (the default), 1–100 is the gain.
+        // 0 is muted (the default), 1–100 is the gain.
         assert_eq!(engine_volume(0), (true, 0.0), "default is silent");
         assert_eq!(
             engine_volume(1),
@@ -1795,7 +1795,7 @@ mod tests {
 
     #[test]
     fn start_mode_follows_env_then_the_requested_route() {
-        // `design-engine-mode.md` §4 order: the dev A/B knob first, then
+        // order: the dev A/B knob first, then
         // the user's setting; `accurate` (the default) is the frame-server.
         assert_eq!(
             start_mode(PresentationMode::Accurate, false),

@@ -1,7 +1,7 @@
 //! Native multi-select file picker (`IFileOpenDialog`).
 //!
-//! `architecture.md` §9 and AGENTS §2: the GUI uses the *native* dialog —
-//! never a custom file browser. No `rfd` (design-m5 D11b): the `windows`
+//! and: the GUI uses the *native* dialog —
+//! never a custom file browser. No `rfd`: the `windows`
 //! crate the workspace already carries exposes the same COM API, so this
 //! crate gains no extra dependency for one dialog sequence.
 
@@ -93,7 +93,7 @@ fn wide_to_string(ptr: PWSTR) -> String {
 }
 
 /// COM apartment for the calling thread: initialized on entry, released
-/// on drop — RAII, never leaked (AGENTS §4).
+/// on drop — RAII, never leaked.
 struct ComScope {
     /// `true` when this call initialized COM and therefore owns the
     /// matching `CoUninitialize`.

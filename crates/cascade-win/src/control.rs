@@ -6,7 +6,7 @@
 //! * shutdown/logoff notifications,
 //! * a place to run emergency cleanup from the window procedure.
 //!
-//! The real named-pipe protocol replaces the stop/restore messages in M4; the
+//! The real named-pipe protocol replaces the stop/restore messages in; the
 //! window itself stays useful for session notifications.
 
 // `HWND` is a raw pointer; callers pass handles returned by `find_existing` or
@@ -38,13 +38,13 @@ pub const CONTROL_TITLE: &str = "Cascade";
 pub const WM_CASCADE_RESTORE: u32 = WM_APP + 1;
 
 /// Wake the main loop because the pipe thread queued a command
-/// (design-m4 §2.2). The window procedure does nothing else with it — the
+/// The window procedure does nothing else with it — the
 /// command travels through the channel; this message only makes
 /// `MsgWaitForMultipleObjectsEx` return instead of waiting for the next
 /// watchdog tick.
 pub const WM_APP_PIPE: u32 = WM_APP + 2;
 
-/// Notify-icon callback from the shell (design-m5 §6, P3): `wParam` is
+/// Notify-icon callback from the shell: `wParam` is
 /// the icon id, `lParam` the mouse message. Legacy semantics — no
 /// `NIM_SETVERSION`. The window procedure only records a menu request;
 /// the main loop shows the menu.
@@ -76,7 +76,7 @@ pub fn quit_requested() -> bool {
 
 /// Request the graceful stop from inside the daemon (the pipe thread's
 /// `quit` command). The main loop runs the normal exit ladder — never
-/// `process::exit` (AGENTS §13).
+/// `process::exit`.
 pub fn request_quit() {
     QUIT_REQUESTED.store(true, Ordering::Release);
 }
@@ -92,7 +92,7 @@ static SESSION_LOCKED: AtomicBool = AtomicBool::new(false);
 static SESSION_CHANGED: AtomicBool = AtomicBool::new(false);
 
 /// Register the control window for session lock/unlock notifications
-/// (M3 pause slice, design-m3 §3). Returns the Win32 error on failure; the
+/// (pause slice). Returns the Win32 error on failure; the
 /// caller degrades to running without pause-on-lock.
 ///
 /// The registration is keyed to this window and is never unregistered: like
@@ -103,7 +103,7 @@ static SESSION_CHANGED: AtomicBool = AtomicBool::new(false);
 pub fn register_session_notifications(hwnd: HWND) -> Result<(), u32> {
     // SAFETY: `hwnd` is our own live control window on this thread;
     // NOTIFY_FOR_THIS_SESSION limits events to the console session Cascade
-    // draws into (design-m3 §3).
+    // draws into.
     let ok = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
     if ok == 0 {
         // SAFETY: reads the thread's last-error value.
@@ -120,7 +120,7 @@ fn set_session_lock(locked: bool) {
 
 /// Consume a pending lock/unlock transition and return the new state, or
 /// `None` when nothing changed since the last call. The main loop applies
-/// the rule (design-m3 §3).
+/// the rule.
 pub fn take_session_lock() -> Option<bool> {
     if SESSION_CHANGED.swap(false, Ordering::AcqRel) {
         Some(SESSION_LOCKED.load(Ordering::Acquire))
@@ -130,7 +130,7 @@ pub fn take_session_lock() -> Option<bool> {
 }
 
 /// Current lock state without consuming the transition — what the IPC
-/// `status` snapshot reports (M4 S1).
+/// `status` snapshot reports.
 pub fn session_locked() -> bool {
     SESSION_LOCKED.load(Ordering::Acquire)
 }
@@ -221,12 +221,12 @@ impl ControlWindow {
     }
 }
 
-/// The window dies with its owner. Required by the T8 fall-through
-/// (`design-m5b.md` §4.8): the listener and the full daemon that replaces
+/// The window dies with its owner. Required by the fall-through
+/// the listener and the full daemon that replaces
 /// it run in the *same* process, so a window left alive by a plain drop
 /// would make the successor's single-instance probe refuse to start
 /// (`Cascade is already running (control window 0x…)` — seen on target,
-/// §9). The wndproc answers `WM_DESTROY` with `PostQuitMessage(0)` and
+/// The wndproc answers `WM_DESTROY` with `PostQuitMessage(0)` and
 /// `QUIT_REQUESTED = true`: correct for a stop exit, poison for the
 /// successor — its first `GetMessageW` would return the stale `WM_QUIT`
 /// and its loop would see a quit it never asked for. Both are undone here.
@@ -273,7 +273,7 @@ unsafe extern "system" fn control_wndproc(
             DISPLAY_CHANGED.store(true, Ordering::Release);
             0
         }
-        // Session lock/unlock (M3 pause slice, design-m3 §3): flags only —
+        // Session lock/unlock (pause slice): flags only —
         // the main loop evaluates the rule and calls into the backend.
         // `wParam` is the change code, `lParam` the session id (Win32 doc).
         WM_WTSSESSION_CHANGE => {
@@ -284,7 +284,7 @@ unsafe extern "system" fn control_wndproc(
             }
             0
         }
-        // S2b power collector (design-m4 §2.6): record the raw AC/DC sample
+        // power collector: record the raw AC/DC sample
         // into atomics; the main loop feeds it to the hysteresis on its next
         // wake. The window procedure never touches engine state — the same
         // rule as the session-lock flags above. Returning 1 marks the
@@ -308,11 +308,11 @@ unsafe extern "system" fn control_wndproc(
             RESTORE_REQUESTED.store(true, Ordering::Release);
             0
         }
-        // Wake-only message from the pipe thread (design-m4 §2.2): the
+        // Wake-only message from the pipe thread: the
         // command itself rides the channel; returning 0 just unblocks the
         // main loop's wait so it can drain the channel now.
         WM_APP_PIPE => 0,
-        // Tray click (design-m5 §6, P3): record only — the main loop
+        // Tray click: record only — the main loop
         // builds the menu and performs the action, the same rule as the
         // session-lock and power flags above.
         WM_APP_TRAY => {
@@ -322,7 +322,7 @@ unsafe extern "system" fn control_wndproc(
             }
             0
         }
-        // Explorer restarted (broadcast, design-m5 §6): the shell dropped
+        // Explorer restarted (broadcast): the shell dropped
         // the tray icon; the main loop re-adds it. The id is registered
         // by `tray::Tray::new` — 0 (not registered yet) never matches.
         msg if msg == tray::taskbar_created_id() && msg != 0 => {
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn pipe_wake_message_does_not_collide() {
-        // Design-m4 §2.2: the wake-up must be a distinct app message.
+        // Design-m4: the wake-up must be a distinct app message.
         assert_ne!(WM_APP_PIPE, WM_CASCADE_RESTORE);
         assert_ne!(WM_APP_PIPE, WM_CASCADE_STOP);
         // Const values must be asserted in a const block (clippy).
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn tray_callback_message_does_not_collide() {
-        // P3 (design-m5 §6): the shell's callback must be its own app
+        // the shell's callback must be its own app
         // message, distinct from every other control-window message.
         assert_ne!(WM_APP_TRAY, WM_APP_PIPE);
         assert_ne!(WM_APP_TRAY, WM_CASCADE_RESTORE);

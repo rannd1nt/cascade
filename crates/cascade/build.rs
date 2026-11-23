@@ -9,7 +9,7 @@
 //!
 //! Toolchain discovery, fail-loud: `CASCADE_LLVM_RC` env override, then
 //! `llvm-rc` on PATH, then the locally extracted Ubuntu package at
-//! `~/.local/llvm15` (no sudo; see docs/spike-m0.md §10 icon notes).
+//! `~/.local/llvm15` (no sudo; see icon notes).
 //!
 //! Non-Windows targets skip embedding entirely, so `cargo check`/`clippy`
 //! of the workspace on the Linux host never needs the resource toolchain.

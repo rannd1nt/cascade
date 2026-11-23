@@ -1,11 +1,11 @@
-//! IPC protocol types and JSONL framing (`docs/ipc.md`).
+//! IPC protocol types and JSONL framing.
 //!
 //! Pure data plus encode/decode: no Win32, no I/O, no threads — the wire is
-//! newline-delimited JSON, UTF-8, one message per line (`ipc.md` §1–2).
+//! newline-delimited JSON, UTF-8, one message per line.
 //! The daemon-side pipe server and the CLI client live in `cascade-win`;
 //! this module is what both sides (and the future GUI) agree on.
 //!
-//! Naming (design-m4 §2.5): the pipe name is a machine-global namespace, so
+//! Naming: the pipe name is a machine-global namespace, so
 //! it carries the brand (`PIPE_PREFIX`); protocol constants and error-code
 //! strings are our own vocabulary — subsystem prefix, no brand, and in JSON
 //! the field itself is the namespace.
@@ -16,19 +16,19 @@ use serde_json::Value;
 use crate::rule_engine::{BatteryAction, PauseSettings, PowerProfile};
 use crate::{PresentationMode, PROTOCOL_VERSION};
 
-/// Hard cap per line in bytes (`ipc.md` §2: 1 MiB, larger → `too_large`).
+/// Hard cap per line in bytes : 1 MiB, larger → `too_large`).
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// Named-pipe prefix; the session id is appended
-/// (`ProcessIdToSessionId`, `ipc.md` §1).
+/// (`ProcessIdToSessionId`).
 pub const PIPE_PREFIX: &str = r"\\.\pipe\cascade-ctl-";
 
-/// Server→client event-stream pipe prefix (`ipc.md` §1, design-m5-p4 §3):
+/// Server→client event-stream pipe prefix:
 /// same session suffix as the control pipe, separate namespace so the
 /// control path (CLI-first) never shares a connection with event push.
 pub const EVENT_PIPE_PREFIX: &str = r"\\.\pipe\cascade-evt-";
 
-/// Error codes (`ipc.md` §8). Serialized as their wire strings.
+/// Error codes. Serialized as their wire strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
     #[serde(rename = "bad_request")]
@@ -67,7 +67,7 @@ impl ErrorCode {
     }
 }
 
-/// Error payload of a failed response (`ipc.md` §2).
+/// Error payload of a failed response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireError {
     pub code: ErrorCode,
@@ -75,7 +75,7 @@ pub struct WireError {
     pub message: String,
 }
 
-/// Request envelope (`ipc.md` §2).
+/// Request envelope.
 ///
 /// Unknown fields are ignored by serde, which is the forward-compatibility
 /// rule of the protocol: a newer client may add fields an older daemon
@@ -89,7 +89,7 @@ pub struct Request {
     pub data: Value,
 }
 
-/// Response envelope (`ipc.md` §2). Exactly one of `data`/`error` is set.
+/// Response envelope. Exactly one of `data`/`error` is set.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Response {
     pub v: u32,
@@ -101,8 +101,8 @@ pub struct Response {
     pub error: Option<WireError>,
     /// In-process handshake flag: the daemon set a different-file
     /// `wallpaper.set` and will restart itself right after the client has
-    /// this answer (design-m2 §4). Never on the wire — it is daemon-side
-    /// bookkeeping, so `ipc.md` §2 is unchanged.
+    /// this answer. Never on the wire — it is daemon-side
+    /// bookkeeping, so is unchanged.
     #[serde(skip)]
     pub flush_after: bool,
 }
@@ -134,7 +134,7 @@ impl Response {
     }
 }
 
-/// Server-initiated event (`ipc.md` §6). No `id`, may arrive at any time.
+/// Server-initiated event. No `id`, may arrive at any time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub v: u32,
@@ -143,7 +143,7 @@ pub struct Event {
 }
 
 /// Why a line could not be turned into a [`Request`], with the code the
-/// server must report (`ipc.md` §8).
+/// server must report.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// Line longer than [`MAX_LINE_BYTES`] (measured in bytes, not chars).
@@ -151,7 +151,7 @@ pub enum DecodeError {
     /// Not valid JSON, or not a valid envelope.
     BadRequest(String),
     /// `v` is not [`PROTOCOL_VERSION`]; the client must tell the user to
-    /// restart Cascade rather than guess (`ipc.md` §2).
+    /// restart Cascade rather than guess.
     VersionMismatch,
 }
 
@@ -210,7 +210,7 @@ pub fn no_data() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
-/// `ping` payload (`ipc.md` §3).
+/// `ping` payload.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Ping {
     pub pong: bool,
@@ -218,7 +218,7 @@ pub struct Ping {
     pub uptime_ms: u64,
 }
 
-// --- Command data shapes (ipc.md §3) -----------------------------------------
+// Command data shapes -----------------------------------------
 
 /// `autostart.get` / `autostart.set` request data. `autostart.get` ignores
 /// it; `autostart.set` requires it (`{"enabled":true}`).
@@ -228,10 +228,10 @@ pub struct EnabledData {
 }
 
 /// `wallpaper.set` request data: exactly one of `path` (play this file
-/// directly — S2) or `id` (library item — S3), plus an optional target
+/// directly — ) or `id` (library item — ), plus an optional target
 /// monitor. The server rejects `path` + `id` together and a payload with
 /// neither (`bad_request`); an `id` alone answers `not_found` until the
-/// library lands (design-m4 S3).
+/// library lands.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,7 +243,7 @@ pub struct SetData {
 }
 
 /// `wallpaper.clear` request data: an optional monitor. The engine is
-/// single-surface in M4 (design-m2 §5), so the value is validated but the
+/// single-surface in, so the value is validated but the
 /// one surface is cleared regardless.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorData {
@@ -251,7 +251,7 @@ pub struct MonitorData {
     pub monitor: Option<String>,
 }
 
-// --- Library shapes (ipc.md §3, design-m4 §4) --------------------------------
+// Library shapes --------------------------------
 
 /// `library.add` request data: one or more file paths. The server
 /// canonicalises, checks existence, probes metadata, and dedupes — the
@@ -261,7 +261,7 @@ pub struct LibraryAddData {
     pub paths: Vec<String>,
 }
 
-/// `library.remove` request data: the 4-hex entry id (`ipc.md` §3). The
+/// `library.remove` request data: the 4-hex entry id. The
 /// CLI resolves a path argument to an id via `library.list` first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryRemoveData {
@@ -287,24 +287,24 @@ pub struct RejectedPath {
 pub struct LibraryAddResult {
     pub added: Vec<crate::library::LibraryItem>,
     pub rejected: Vec<RejectedPath>,
-    /// Per-added-entry assessment (S5, design-m4 §5.3 step 5). Omitted
-    /// while empty so pre-S5 payloads stay byte-identical.
+    /// Per-added-entry assessment (step 5). Omitted
+    /// while empty so pre- payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assessments: Vec<ItemAssessment>,
 }
 
 /// `library.prune` response: how many entries were dropped because their
-/// file no longer exists (design-m4 §4).
+/// file no longer exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryPruneResult {
     pub removed: u32,
 }
 
-// --- Assessment shapes (ipc.md §3, design-m4 §5, S5) ------------------------
+// Assessment shapes ------------------------
 
 /// `assess` request data: an optional file and an optional target monitor.
 /// Neither = device profile + recommendation for the primary monitor
-/// (design-m4 §3). Read-only; works while nothing is playing.
+/// Read-only; works while nothing is playing.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssessRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -331,7 +331,7 @@ pub struct MonitorSummary {
 /// with no file, and what `--json` scripts and the GUI read.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeviceSummary {
-    /// Sorted decode labels from the D12 union (D3D11 GPU profiles ∪
+    /// Sorted decode labels from the union (D3D11 GPU profiles ∪
     /// hardware MFT input types), e.g. `["av01","h264","hevc", …]`.
     pub gpu_decode: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -339,7 +339,7 @@ pub struct DeviceSummary {
     pub monitors: Vec<MonitorSummary>,
 }
 
-/// `assess` response (`ipc.md` §3): the selected monitor, the device
+/// `assess` response: the selected monitor, the device
 /// facts, the recommendation for that monitor, and — when a file was
 /// named — its descriptor plus the structured warnings. `warnings` is
 /// always present (empty without a file); an `error` severity here is a
@@ -355,8 +355,8 @@ pub struct AssessReport {
     pub warnings: Vec<crate::assess::Warning>,
 }
 
-/// One added library entry's assessment (design-m4 §5.3 step 5): the badge
-/// data the M5 GUI renders per item, computed at the moment it enters the
+/// One added library entry's assessment (step 5): the badge
+/// data the GUI renders per item, computed at the moment it enters the
 /// library. Additive field on `library.add` — old clients ignore it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ItemAssessment {
@@ -366,7 +366,7 @@ pub struct ItemAssessment {
     pub recommendation: crate::assess::Recommendation,
 }
 
-/// `wallpaper.set` success data (additive, design-m4 §5.3): the assessment
+/// `wallpaper.set` success data (additive): the assessment
 /// that ran **before** the answer went out — `error` severities never
 /// appear here (they were rejected instead). `recommendation` is `None`
 /// only when the device reported no monitor to recommend for.
@@ -380,10 +380,10 @@ pub struct SetReport {
     pub recommendation: Option<crate::assess::Recommendation>,
 }
 
-// --- Status shape (ipc.md §4) ------------------------------------------------
+// Status shape ------------------------------------------------
 
 /// Per-monitor row of [`Status`]. Fields that only exist once the library
-/// and the engine report them (M4 S3+) are omitted while unset, so the
+/// and the engine report them are omitted while unset, so the
 /// shape stays stable for clients.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MonitorStatus {
@@ -403,13 +403,13 @@ pub struct MonitorStatus {
     /// Active engine mode of the Media Engine backend: `"frame-server"`
     /// (NV12 transfer + our converter, correct colour) or `"rendering"`
     /// (HWND path, known-wrong colour on BT.601 content — the documented
-    /// fallback, `design-p1-color.md` §4.4). `None` while no playback
-    /// thread runs (omitted on the wire, `ipc.md` §4).
+    /// fallback). `None` while no playback
+    /// thread runs (omitted on the wire).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
 }
 
-/// Library entry a monitor is playing (`ipc.md` §4).
+/// Library entry a monitor is playing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryRef {
     pub id: String,
@@ -423,7 +423,7 @@ pub struct VideoSize {
 }
 
 /// The daemon's own process counters — filled by the daemon, never guessed
-/// by the client (`ipc.md` §4).
+/// by the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryStatus {
     pub working_set_mb: u64,
@@ -433,7 +433,7 @@ pub struct MemoryStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostStatus {
     /// `workerw_child` | `layered_progman_child` (diagnostic gold when
-    /// debugging "desktop went blank", `ipc.md` §4).
+    /// debugging "desktop went blank").
     pub strategy: String,
     pub repaint_level: u32,
 }
@@ -444,7 +444,7 @@ pub struct AutostartStatus {
     pub windows_disabled: bool,
 }
 
-/// Full `status` payload (`ipc.md` §4).
+/// Full `status` payload.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Status {
     pub engine: String,
@@ -458,38 +458,38 @@ pub struct Status {
     pub autostart: AutostartStatus,
 }
 
-// --- Settings shape (ipc.md §5) ---------------------------------------------
+// Settings shape ---------------------------------------------
 
-/// Full `settings.get` / `settings.set` response payload (`ipc.md §5`).
+/// Full `settings.get` / `settings.set` response payload.
 ///
 /// `autostart` is reported here for wire completeness but is **not** file
-/// backed: the Run key is the single oracle (design-m4 D10) and the daemon
+/// backed: the Run key is the single oracle and the daemon
 /// fills this field from the registry at the wire edge. `settings.set` does
 /// not carry it — that is `autostart.set`'s job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// D8 default `off`: no profile, no power reads.
+    /// default `off`: no profile, no power reads.
     pub power_profile: PowerProfile,
     pub pause: PauseSettings,
-    /// D8 default `off`: the power collector stays dark until opted in.
+    /// default `off`: the power collector stays dark until opted in.
     pub on_battery: BatteryAction,
-    /// Stored from S2; the exit ladder always restores the desktop anyway
-    /// (AGENTS §3.1 outranks the flag — no runtime consumer yet).
+    /// Stored from; the exit ladder always restores the desktop anyway
+    /// (outranks the flag — no runtime consumer yet).
     pub restore_wallpaper_on_exit: bool,
-    /// Stored from S2; consumed by the M5 tray.
+    /// Stored from; consumed by the tray.
     pub tray: bool,
     /// Filled from the Run key at the wire edge; never persisted to
-    /// `config.toml` (design-m4 D10).
+    /// `config.toml`.
     pub autostart: bool,
-    /// **Requested** engine route (`design-engine-mode.md` §2): `accurate`
+    /// **Requested** engine route: `accurate`
     /// (default) or `efficient`. The route actually running is reported by
     /// `status.monitors[].engine` — the two can legitimately differ (the
     /// frame-server's one-way fallback, the dev A/B knob).
     pub engine_mode: PresentationMode,
-    /// Audio level 0–100 (`design-volume.md` §2): `0` = muted — **the
+    /// Audio level 0–100: `0` = muted — **the
     /// default**, `1–100` = audible at `level / 100`. Applied to the live
-    /// engine without a restart (§3.15 does not apply — no load pipeline).
+    /// engine without a restart (does not apply — no load pipeline).
     pub volume: u8,
 }
 
@@ -520,10 +520,10 @@ pub struct PausePatch {
     pub remote_session: Option<bool>,
 }
 
-/// Partial `settings.set` payload (`ipc.md §3`): only the present keys
+/// Partial `settings.set` payload: only the present keys
 /// change. Unknown keys are dropped by serde — the forward-compatibility
 /// rule — so the CLI validates keys strictly before sending
-/// (design-m4 §3: unknown flag → error, not ignored).
+/// unknown flag → error, not ignored).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SettingsPatch {
@@ -532,16 +532,16 @@ pub struct SettingsPatch {
     pub on_battery: Option<BatteryAction>,
     pub restore_wallpaper_on_exit: Option<bool>,
     pub tray: Option<bool>,
-    /// Engine route change (`design-engine-mode.md` §3): the daemon applies
+    /// Engine route change: the daemon applies
     /// it by respawning, never by rebuilding the engine in-process.
     pub engine_mode: Option<PresentationMode>,
-    /// Audio level change (`design-volume.md` §3): the daemon applies it to
+    /// Audio level change: the daemon applies it to
     /// the **live** engine — no rebuild, no respawn.
     pub volume: Option<u8>,
 }
 
 impl Settings {
-    /// The D9 **preset**: while `on_battery` is still the `off` default
+    /// The **preset**: while `on_battery` is still the `off` default
     /// ("not set"), a profile suggests its default action. Explicit user
     /// values always win, so this never overwrites a non-`off` choice.
     pub fn apply_profile_preset(&mut self) {
@@ -555,8 +555,8 @@ impl Settings {
         }
     }
 
-    /// Apply a partial update, then let `power_profile` act as the D9
-    /// preset (design-m4 §2.6): it fills `on_battery` only while that value
+    /// Apply a partial update, then let `power_profile` act as the
+    /// preset: it fills `on_battery` only while that value
     /// is still `off` and this patch did not touch it.
     pub fn apply_patch(&mut self, patch: SettingsPatch) {
         if let Some(profile) = patch.power_profile {
@@ -597,18 +597,18 @@ impl Settings {
         if let Some(level) = patch.volume {
             // Wire input is clamped here (the CLI already rejects >100):
             // a hand-crafted pipe client can send anything, and the engine
-            // must only ever see 0..=100 (design-volume.md §3).
+            // must only ever see 0..=100.
             self.volume = level.min(100);
         }
 
-        // Preset fill (design-m4 §2.6): only when this patch changed the
+        // Preset fill: only when this patch changed the
         // profile and did not touch `on_battery` itself.
         if patch.power_profile.is_some() && patch.on_battery.is_none() {
             self.apply_profile_preset();
         }
     }
 
-    /// A contradictory-but-allowed combination (design-m4 §2.6): the
+    /// A contradictory-but-allowed combination: the
     /// precedence table already makes it deterministic, so `settings set`
     /// applies the value and the caller prints this warning instead of
     /// blocking. `None` means no conflict.
@@ -719,7 +719,7 @@ mod tests {
 
     #[test]
     fn error_code_wire_strings_are_stable() {
-        // Renaming these breaks every client (docs/ipc.md §8).
+        // Renaming these breaks every client.
         assert_eq!(ErrorCode::BadRequest.as_str(), "bad_request");
         assert_eq!(ErrorCode::UnknownCommand.as_str(), "unknown_command");
         assert_eq!(ErrorCode::NotFound.as_str(), "not_found");
@@ -786,30 +786,30 @@ mod tests {
 
     #[test]
     fn pipe_prefix_is_the_branded_global_namespace() {
-        // Design-m4 §2.5: pipe names are machine-global → brand required.
+        // Design-m4: pipe names are machine-global → brand required.
         assert_eq!(PIPE_PREFIX, r"\\.\pipe\cascade-ctl-");
-        // design-m5-p4 §3: the event stream shares the brand + session
+        // the event stream shares the brand + session
         // suffix but not the control namespace.
         assert_eq!(EVENT_PIPE_PREFIX, r"\\.\pipe\cascade-evt-");
         assert_ne!(EVENT_PIPE_PREFIX, PIPE_PREFIX);
     }
 
     #[test]
-    fn settings_defaults_match_d8_and_the_documented_shape() {
+    fn settings_defaults_match_the_documented_shape() {
         let settings = Settings::default();
-        assert_eq!(settings.power_profile, PowerProfile::Off, "D8");
-        assert_eq!(settings.on_battery, BatteryAction::Off, "D8");
+        assert_eq!(settings.power_profile, PowerProfile::Off, "default");
+        assert_eq!(settings.on_battery, BatteryAction::Off, "default");
         assert!(settings.restore_wallpaper_on_exit);
         assert!(settings.tray);
         assert!(
             !settings.autostart,
             "filled from the registry at the wire edge"
         );
-        // Honest colour is the default route (design-engine-mode §2).
+        // Honest colour is the default route.
         assert_eq!(settings.engine_mode, PresentationMode::Accurate);
-        // Silent by default (design-volume §1).
+        // Silent by default.
         assert_eq!(settings.volume, 0);
-        // ipc.md §5 documented pause defaults.
+        // documented pause defaults.
         assert!(settings.pause.fullscreen);
         assert!(!settings.pause.maximized);
         assert!(settings.pause.session_lock);
@@ -875,7 +875,7 @@ mod tests {
         assert_eq!(settings.volume, 50, "absent key keeps its value");
 
         // Wire input beyond 100 clamps — the CLI rejects it first, but a
-        // hand-crafted pipe client is not the CLI (design-volume §3).
+        // hand-crafted pipe client is not the CLI.
         let patch: SettingsPatch = serde_json::from_str(r#"{"volume":200}"#).expect("patch");
         settings.apply_patch(patch);
         assert_eq!(settings.volume, 100, "wire input clamps to 100");
@@ -893,7 +893,7 @@ mod tests {
         assert!(settings.pause.fullscreen, "untouched keys keep their value");
         assert_eq!(settings.on_battery, BatteryAction::Off);
 
-        // Forward compatibility: unknown keys drop on the floor (ipc.md §2).
+        // Forward compatibility: unknown keys drop on the floor.
         let patch: SettingsPatch =
             serde_json::from_str(r#"{"future_knob":7,"restore_wallpaper_on_exit":false}"#)
                 .expect("patch");
@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn power_profile_preset_fills_unset_battery_action() {
-        // D9: the profile is a preset that only fills `on_battery` while it
+        // the profile is a preset that only fills `on_battery` while it
         // is still off.
         let mut settings = Settings::default();
         settings.apply_patch(SettingsPatch {
@@ -962,7 +962,7 @@ mod tests {
 
     #[test]
     fn command_data_shapes_decode_with_defaults() {
-        // `wallpaper.set` with a direct path (S2) — id/monitor optional.
+        // `wallpaper.set` with a direct path — id/monitor optional.
         let set: SetData =
             serde_json::from_str(r#"{"path":"C:\\videos\\clip.mp4"}"#).expect("set data");
         assert_eq!(set.path.as_deref(), Some(r"C:\videos\clip.mp4"));
@@ -1022,7 +1022,7 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("file not found"), "{line}");
-        // Empty additive fields stay off the wire (pre-S5 payloads are
+        // Empty additive fields stay off the wire (pre- payloads are
         // byte-identical).
         assert!(!line.contains("assessments"), "{line}");
 
@@ -1033,8 +1033,8 @@ mod tests {
         assert_eq!(pruned.removed, 3);
     }
 
-    /// S5 wire shapes (ipc.md §3): `assess` request/report round-trip,
-    /// and the additive `set`/`add` fields tolerate pre-S5 payloads.
+    /// wire shapes: `assess` request/report round-trip,
+    /// and the additive `set`/`add` fields tolerate pre- payloads.
     #[test]
     fn assess_shapes_round_trip_and_stay_additive() {
         use crate::assess::Recommendation;
@@ -1070,7 +1070,7 @@ mod tests {
         let back: AssessReport = serde_json::from_str(&line).expect("decode");
         assert_eq!(back, report);
 
-        // A pre-S5 `wallpaper.set` success payload decodes with defaults —
+        // A pre- `wallpaper.set` success payload decodes with defaults —
         // an old daemon's `{}` never breaks the new CLI.
         let legacy: SetReport = serde_json::from_str("{}").expect("legacy set payload");
         assert!(legacy.warnings.is_empty());
@@ -1080,7 +1080,7 @@ mod tests {
 
     #[test]
     fn conflict_warning_flags_contradictory_combinations() {
-        // §2.6 C1/C2: warn, but the precedence table keeps it deterministic.
+        // warn, but the precedence table keeps it deterministic.
         let mut settings = Settings::default();
         settings.apply_patch(SettingsPatch {
             power_profile: Some(PowerProfile::Battery),

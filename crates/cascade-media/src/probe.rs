@@ -1,8 +1,8 @@
-//! Metadata probe for the library (design-m4 §4, §5.1).
+//! Metadata probe for the library.
 //!
 //! Reads stream attributes from the container only — **no frame is
 //! decoded**, nothing is written, and the user's file is opened read-only
-//! (AGENTS §3.3). One call answers `library.add`'s "does this file exist
+//! One call answers `library.add`'s "does this file exist
 //! and what is in it?".
 
 use std::path::Path;
@@ -26,7 +26,7 @@ use crate::source_reader::{
 /// Probe one file: existence is checked by the caller (it wants its own
 /// error text), everything else comes from the container's video type.
 ///
-/// Self-contained by design (D13): COM and MF are started on the calling
+/// Self-contained by design: COM and MF are started on the calling
 /// thread and shut down again before returning, so any caller (daemon
 /// main loop, CLI, future GUI) can probe without prior setup — and no MF
 /// or COM state is left behind by the call.
@@ -48,7 +48,7 @@ pub fn probe(path: &Path) -> Result<VideoMetadata, String> {
         return Err("media foundation is not available".to_string());
     }
     let result = probe_container(path);
-    // Shutdown order: MF first, then COM (design-m2 §3.3).
+    // Shutdown order: MF first, then COM.
     let _ = unsafe { MFShutdown() };
     if com_owned {
         // SAFETY: balances the successful CoInitializeEx above.
@@ -59,7 +59,7 @@ pub fn probe(path: &Path) -> Result<VideoMetadata, String> {
 
 /// The container read itself. Every MF object created here (the source
 /// reader, its media types) dies inside this call — plain data is what
-/// returns (D13 leak rules: never a retained MF object).
+/// returns (leak rules: never a retained MF object).
 fn probe_container(path: &Path) -> Result<VideoMetadata, String> {
     let url = file_url(path);
     let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
@@ -102,7 +102,7 @@ fn probe_container(path: &Path) -> Result<VideoMetadata, String> {
         .unwrap_or_else(|_| "unknown".to_string());
 
     // MPEG-2/H.264/HEVC profile and level are UINT32s when present; the
-    // assessment engine (S5) interprets the numbers, the library stores
+    // assessment engine interprets the numbers, the library stores
     // them verbatim.
     let profile = unsafe { mt.GetUINT32(&MF_MT_MPEG2_PROFILE) }
         .ok()
@@ -111,7 +111,7 @@ fn probe_container(path: &Path) -> Result<VideoMetadata, String> {
         .ok()
         .map(|value| value.to_string());
 
-    // HDR detection (M7): PQ (2084) and HLG are the HDR transfer
+    // HDR detection: PQ (2084) and HLG are the HDR transfer
     // functions; a present-but-other value is a declared SDR transfer;
     // an absent attribute stays None — unknown, never guessed.
     let hdr = unsafe { mt.GetUINT32(&MF_MT_TRANSFER_FUNCTION) }
@@ -159,7 +159,7 @@ fn duration_ms_from(var: PROPVARIANT) -> Option<u64> {
     Some(ticks / 10_000)
 }
 
-/// A readable codec name for the library row (`ipc.md` §3 items).
+/// A readable codec name for the library row (items).
 fn codec_name(guid: &windows::core::GUID) -> String {
     if *guid == MFVideoFormat_H264 {
         "H264".to_string()
@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn hdr_transfer_values_map_to_sdr_or_hdr() {
         // PQ (2084) and HLG are HDR; every declared SDR transfer is not;
-        // the mapping decides M7's severity on the wire (core assess).
+        // the mapping decides 's severity on the wire (core assess).
         assert!(hdr_from_transfer(MFVideoTransFunc_2084.0 as u32));
         assert!(hdr_from_transfer(MFVideoTransFunc_HLG.0 as u32));
         assert!(!hdr_from_transfer(5)); // BT.709
@@ -247,7 +247,7 @@ mod tests {
     }
 
     /// Manual probe of a real file — run by hand, never in CI (no media
-    /// files are committed, AGENTS §11). See design-m4 S3 verification.
+    /// files are committed). See verification.
     #[test]
     #[ignore]
     fn probe_reads_a_real_file() {
@@ -260,25 +260,25 @@ mod tests {
         println!("{meta:?}");
     }
 
-    // ── R&D: colour-matrix localisation (quality §2 / §7) ────────────────
+    // ── R&D: colour-matrix localisation (quality / ) ────────────────
     //
-    // The P1/AB1 bars failure (42.9% on 2026-11-09, s7-pixel log) matches
+    // The /AB1 bars failure (42.9% on 2026-11-09, s7-pixel log) matches
     // "content encoded with BT.601, decoded as BT.709" within 1-2 units on
     // three independent primaries, and bars.mp4 declares bt470bg in its H.264
     // VUI (verified on the raw stream) but has NO mp4 colr box. This probe
     // reads the colour attributes Media Foundation reports at two points:
     //
-    //   native  = GetNativeMediaType: what the SOURCE made of the file
+    // native = GetNativeMediaType: what the SOURCE made of the file
     //             (colr box / VUI as the MF demuxer sees it)
-    //   nv12    = GetCurrentMediaType after negotiating NV12: what the
+    // nv12 = GetCurrentMediaType after negotiating NV12: what the
     //             DECODER hands to the presenter (EVR in the wallpaper path)
     //
     // Interpretation:
-    //   native absent/709 + nv12 709  -> source drops the VUI tag
-    //   native 601        + nv12 709  -> decoder drops it
-    //   native 601        + nv12 601  -> source+decoder correct; the loss is
+    // native absent/709 + nv12 709 -> source drops the VUI tag
+    // native 601 + nv12 709 -> decoder drops it
+    // native 601 + nv12 601 -> source+decoder correct; the loss is
     //                                    in the presenter (EVR/MediaEngine)
-    // That decides where a fix may live (quality.md §2: read
+    // That decides where a fix may live : read
     // MF_MT_YUV_MATRIX, set it explicitly).
     //
     // Run by hand, never in CI (no media files are committed). Override the
@@ -298,7 +298,7 @@ mod tests {
         let mf = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) };
         assert!(mf.is_ok(), "MFStartup failed");
         let result = color_probe_body(&path);
-        // Shutdown order: MF first, then COM (design-m2 §3.3).
+        // Shutdown order: MF first, then COM.
         let _ = unsafe { MFShutdown() };
         if com_owned {
             // SAFETY: balances the successful CoInitializeEx above.
@@ -308,7 +308,7 @@ mod tests {
     }
 
     /// The probe itself. Opens the file read-only through the source
-    /// reader (AGENTS §3.3) and prints colour attributes at both stages;
+    /// reader and prints colour attributes at both stages;
     /// creates no sample, decodes no frame.
     fn color_probe_body(path: &std::path::Path) -> Result<(), String> {
         use windows::Win32::Media::MediaFoundation::{
@@ -331,7 +331,7 @@ mod tests {
 
         // Does the reader expose the avcC sequence header (SPS/PPS)? If
         // yes, a pure SPS/VUI parser can derive the matrix for files whose
-        // only colour signal is the bitstream VUI (notes-p1-color-601 §8):
+        // only colour signal is the bitstream VUI:
         // no container box walk needed.
         // SAFETY: `native` is a live media type; the size is an out-param.
         match unsafe { native.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) } {
@@ -416,7 +416,7 @@ mod tests {
         )
     }
 
-    // ── E3: frame-server mode (notes-p1-color-601 §9) ─────────────────
+    // ──: frame-server mode ─────────────────
 
     /// Required event sink for the frame-server probe: the callback
     /// attribute must exist in every MediaEngine mode (MSDN
@@ -435,13 +435,13 @@ mod tests {
         }
     }
 
-    /// Frame-server feasibility probe (E3).
+    /// Frame-server feasibility probe.
     ///
     /// Creates a MediaEngine **without** `MF_MEDIA_ENGINE_PLAYBACK_HWND`
     /// (frame-server is the documented default mode), attaches our D3D11
     /// device via `MF_MEDIA_ENGINE_DXGI_MANAGER`, then follows the Microsoft
     /// contract: `OnVideoStreamTick` -> `S_OK` -> `TransferVideoFrame` into
-    /// our own texture. Reads back pixels at the SMPTE bar centres to see
+    /// our own texture. Reads back pixels at the SMPTE bar centres to
     /// which chroma matrix the engine's own YUV->RGB conversion uses
     /// (Experiment B proved the EVR *rendering* path decodes `bars.mp4` as
     /// BT.709; this asks whether the frame-server blit path differs), tries
@@ -457,7 +457,7 @@ mod tests {
                 r"C:\Users\Zahraan Dzakii\AppData\Local\Temp\s7\bars.mp4".to_string()
             }));
         // STA matches the daemon's engine thread (engine.rs `ComInit`,
-        // design-m2 §3.1); same COM/MF startup order as the colour probe.
+        // same COM/MF startup order as the colour probe.
         use windows::Win32::System::Com::COINIT_APARTMENTTHREADED;
         let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         let com_owned = com.is_ok();
@@ -465,7 +465,7 @@ mod tests {
         let mf = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) };
         assert!(mf.is_ok(), "MFStartup failed");
         let result = frame_server_body(&path);
-        // Shutdown order: MF first, then COM (design-m2 §3.3).
+        // Shutdown order: MF first, then COM.
         let _ = unsafe { MFShutdown() };
         if com_owned {
             // SAFETY: balances the successful CoInitializeEx above.
@@ -474,7 +474,7 @@ mod tests {
         result.expect("frame-server probe");
     }
 
-    /// The E3 probe body. The engine is released (never `Shutdown()`) when
+    /// The probe body. The engine is released (never `Shutdown()`) when
     /// this fn returns — the same release path `engine.rs` uses when its
     /// playback window is gone; the caller then runs MFShutdown.
     fn frame_server_body(path: &std::path::Path) -> Result<(), String> {
@@ -763,7 +763,7 @@ mod tests {
         );
 
         // Does the engine surface the matrix as a read-only stream
-        // attribute? (F4: no setter exists; this is the query channel.)
+        // attribute? : no setter exists; this is the query channel.)
         let ex = engine
             .cast::<IMFMediaEngineEx>()
             .map_err(|err| format!("cast IMFMediaEngineEx: {}", err.message()))?;

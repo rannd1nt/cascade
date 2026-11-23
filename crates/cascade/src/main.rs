@@ -1,10 +1,10 @@
 //! `cascade` — role dispatch only.
 //!
 //! All Win32 behaviour lives in `cascade-win`; this binary parses argv and
-//! reports results. See `docs/architecture.md` §2.
+//! reports results.
 
 // GUI subsystem: starting the daemon must never create a console window
-// (M1-F, measured flash of ~100 ms with focus steal on a console build).
+// (measured flash of ~100 ms with focus steal on a console build).
 // The CLI re-attaches to a console in `console::prepare_stdio`.
 #![windows_subsystem = "windows"]
 
@@ -36,7 +36,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     dpi::set_per_monitor_v2();
     // The bare form decides its own stdio strategy *after* the install
-    // prompt decision (design-m4 §6.2); every other role prepares stdio
+    // prompt decision; every other role prepares stdio
     // first — every path below may print.
     let result = if args.is_empty() {
         bare_main()
@@ -55,7 +55,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// What a bare `cascade` (no arguments) should do (design-m4 §6.2, D5).
+/// What a bare `cascade` (no arguments) should do.
 /// Pure so the decision is unit-testable without a window station.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BareAction {
@@ -83,7 +83,7 @@ fn bare_action(installed: bool, have_console: bool, respawn: bool) -> BareAction
 
 /// The bare-invocation flow. Unlike every other role this one may show a
 /// dialog *before* stdio exists — allocating a console first would flash a
-/// window next to the prompt (design-m4 §6.2).
+/// window next to the prompt.
 fn bare_main() -> Result<ExitCode, String> {
     let respawn = std::env::var_os("CASCADE_RESPAWN").is_some();
     let action = bare_action(
@@ -92,7 +92,7 @@ fn bare_main() -> Result<ExitCode, String> {
         respawn,
     );
     match action {
-        // The internal respawn keeps the silent daemon strategy (M1-F:
+        // The internal respawn keeps the silent daemon strategy :
         // never allocate a console for the long-lived role).
         BareAction::RespawnRun => {
             console::prepare_stdio(true);
@@ -130,7 +130,7 @@ fn is_daemon_role(args: &[String]) -> bool {
     )
 }
 
-/// `ui` / `--ui` open a GUI window (design-m5 D11c). Like the daemon it
+/// `ui` / `--ui` open a GUI window. Like the daemon it
 /// must never *create* a console — a windowed app double-clicked from a
 /// shortcut would flash one — while a terminal launch still attaches and
 /// prints errors there (same `prepare_stdio` strategy as the daemon).
@@ -139,7 +139,7 @@ fn is_gui_role(args: &[String]) -> bool {
 }
 
 /// `uninstall --quiet` is launched by Windows Settings with no console
-/// (design-m5-p4 §14 I4). The GUI-subsystem exe would otherwise
+/// The GUI-subsystem exe would otherwise
 /// `AllocConsole` and flash a terminal during a GUI uninstall, so this
 /// role uses the silent stdio strategy like the daemon. The flag is only
 /// recognized on `uninstall`; every other command keeps its normal output.
@@ -152,8 +152,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         None => cmd_run(StartRole::Manual, &[]),
         Some("run") => cmd_run(StartRole::Manual, &args[1..]),
         Some("--autostart") => cmd_run(StartRole::Autostart, &args[1..]),
-        // Pw2-S1 (`design-m5b.md` §6): the listener as a manual entry —
-        // the automatic entry rules arrive with Pw2-S2 (§4.3).
+        // the listener is also available as a manual entry point
         Some("--listen") => cmd_listen(&args[1..]),
         Some("doctor") => cmd_doctor(),
         Some("stop") => cmd_signal(control::WM_CASCADE_STOP, "stop"),
@@ -179,10 +178,9 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Some("ui") | Some("--ui") => {
-            // The library window (design-m5 P2): a separate process that
-            // talks to the daemon only over the pipe. D7 (a second
-            // instance focuses the first) is deferred to P4 — today a
-            // second launch simply opens a second window.
+            // The library window is a separate process that talks to the
+            // daemon only over the pipe. Focusing an existing window on a
+            // second launch is deferred; today it opens a second window.
             cascade_ui::run()?;
             Ok(ExitCode::SUCCESS)
         }
@@ -194,26 +192,26 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
 }
 
 /// How this process was started, as far as the entry rules care
-/// (`design-m5b.md` §4.3). Only `--autostart` counts as an automatic
+/// Only `--autostart` counts as an automatic
 /// start: a typed `run` is a deliberate action and therefore gets the
-/// session override (D1) instead of the listener.
+/// session override instead of the listener.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartRole {
     /// `cascade run`, `cascade` bare, or a `--detached` child — manual.
     Manual,
-    /// `--autostart` (the Run key at logon, `design-m5.md` §4).
+    /// `--autostart` (the Run key at logon).
     Autostart,
 }
 
-/// The entry rule (`design-m5b.md` §4.3): start as the battery listener
+/// The entry rule: start as the battery listener
 /// instead of the full daemon. Evaluated in [`cmd_run`] **before**
 /// `build_backend`, so the listener branch is a structural skip-load
-/// (R4): no backend, no factory call, no Media Foundation session exists
+/// no backend, no factory call, no Media Foundation session exists
 /// on that path.
 ///
 /// Pure — the power source is read by the caller (`power::read_source()`)
 /// and `None` means "no honest answer", which counts as AC (fail-open,
-/// §4.8): an unknown source must never start a listener that could then
+/// an unknown source must never start a listener that could then
 /// never transition back.
 fn should_listenable(
     role: StartRole,
@@ -226,10 +224,10 @@ fn should_listenable(
         && (role == StartRole::Autostart || respawn_env)
 }
 
-/// The D1 session override (`design-m5b.md` §4.3): start as the full
+/// The session override: start as the full
 /// daemon even though the stop rule says battery. True for a fresh manual
-/// start on battery — `run` fresh, T5 after the pre-quit — and for the T6
-/// `Start now` child (`CASCADE_SESSION_OVERRIDE`, MD6 §7). Never for an
+/// start on battery — `run` fresh, after the pre-quit — and for the
+/// `Start now` child (`CASCADE_SESSION_OVERRIDE`). Never for an
 /// automatic start (that becomes the listener instead), and never for a
 /// transition child landing on AC. Pure; unit-tested next to
 /// [`should_listenable`].
@@ -246,7 +244,7 @@ fn session_override_rule(
 }
 
 fn cmd_run(role: StartRole, args: &[String]) -> Result<ExitCode, String> {
-    // `--detached` (design-m5 §4) never reaches the daemon: it changes how
+    // `--detached` never reaches the daemon: it changes how
     // *this* process spawns the child, not what the child does.
     let (detached, args) = split_detached_flag(args)?;
     if detached {
@@ -256,37 +254,37 @@ fn cmd_run(role: StartRole, args: &[String]) -> Result<ExitCode, String> {
 
     // Everything the entry rules need, read once here — from disk /
     // hardware, never from a backend, so the listener branch stays a
-    // structural skip-load (R4).
+    // structural skip-load.
     let respawn_env = std::env::var_os("CASCADE_RESPAWN").is_some();
     let override_env = std::env::var_os(respawn::SESSION_OVERRIDE_ENV).is_some();
     let on_battery_setting = offline::settings_get().on_battery;
     let source_now = cascade_win::power::read_source();
 
-    // T5 (`design-m5b.md` §4.6): a fresh manual `run` takes the session
+    // a fresh manual `run` takes the session
     // from a running listener — `status` says `listening` → `quit` → poll
     // for the pipe release — before this process starts the full daemon.
-    // A respawn child skips it: T2/T3/T6 land after the listener released
+    // A respawn child skips it: land after the listener released
     // the pipe itself. A full daemon's `mode` is never `listening`, so its
     // existing `AlreadyRunning` behaviour is unchanged.
     if role == StartRole::Manual && !respawn_env {
         pre_quit_listener()?;
     }
 
-    // Entry rules (`design-m5b.md` §4.3), evaluated here — before
-    // `build_backend`. MD6 (§7): the T6 `Start now` child carries
+    // Entry rules, evaluated here — before
+    // `build_backend`: the `Start now` child carries
     // `CASCADE_SESSION_OVERRIDE`, so it must land FULL instead of closing
     // the loop back into a listener.
     if !override_env && should_listenable(role, respawn_env, on_battery_setting, source_now) {
         match listener::run(Box::new(cascade_media::probe)) {
             // The listener ran and stopped on its own (quit, `cascade
-            // stop`, or a T3/T6 hand-off that already spawned its child).
+            // stop`, or a hand-off that already spawned its child).
             Ok(Some(daemon::RunExit::Exit)) => return Ok(ExitCode::SUCCESS),
-            // The listener never asks the CLI to re-exec it: T3/T6 spawn
+            // The listener never asks the CLI to re-exec it: spawn
             // the full child themselves while they still own the pipe.
             Ok(Some(daemon::RunExit::Respawn)) => {
                 return respawn::respawn_child().map(|_| ExitCode::SUCCESS)
             }
-            // T8 fail-open (`design-m5b.md` §4.8): listener mode never
+            // fail-open: listener mode never
             // began — fall through to the full daemon below with the same
             // entry data; its collector logs the failure and stays off.
             Ok(None) => {}
@@ -297,14 +295,14 @@ fn cmd_run(role: StartRole, args: &[String]) -> Result<ExitCode, String> {
         }
     }
 
-    // D1 (`design-m5b.md` §4.3): a manual start on battery with the stop
-    // rule stays full for this session — T9 holds the stop arm, T10
+    // a manual start on battery with the stop
+    // rule stays full for this session — holds the stop arm,
     // clears the override once AC is confirmed.
     options.session_override =
         session_override_rule(role, override_env, on_battery_setting, source_now);
 
     // A backend is only worth constructing when a source exists
-    // (design-m2 §2.2): `--video` wins, otherwise the last successful path
+    // `--video` wins, otherwise the last successful path
     // replays. The daemon resolves the same pair again and loads it.
     let source = options.video.clone().or_else(|| {
         state::Store::open()
@@ -313,18 +311,18 @@ fn cmd_run(role: StartRole, args: &[String]) -> Result<ExitCode, String> {
             .map(PathBuf::from)
     });
     let backend = build_backend(source.as_deref());
-    // `cascade-win` may not depend on `cascade-media` (AGENTS §4): the
+    // `cascade-win` may not depend on `cascade-media`: the
     // daemon builds later backends (a first `wallpaper.set` on a videoless
     // start) through this factory instead.
     let factory: daemon::BackendFactory = Box::new(|path: &Path| build_backend(Some(path)));
-    // The library probe travels the same way (design-m4 §4): win may not
+    // The library probe travels the same way: win may not
     // depend on media, so the binary injects it.
     let probe: daemon::ProbeFn = Box::new(cascade_media::probe);
     match daemon::run(options, backend, factory, probe) {
         Ok(daemon::RunExit::Exit) => Ok(ExitCode::SUCCESS),
         // A different-file `wallpaper.set` was answered: the exit ladder
         // has repainted and `state.json` holds the new path; re-exec so
-        // the child loads it with flat memory (design-m2 §4).
+        // the child loads it with flat memory.
         Ok(daemon::RunExit::Respawn) => respawn::respawn_child().map(|_| ExitCode::SUCCESS),
         Err(err) => {
             // Best effort: a console close may already have invalidated the
@@ -335,7 +333,7 @@ fn cmd_run(role: StartRole, args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
-/// `cascade --listen` (`design-m5b.md` §4.2, Pw2-S1): run the battery
+/// `cascade --listen`: run the battery
 /// listener — control pipe and window only. Structural skip-load: this
 /// branch returns before `build_backend` is ever called, so no backend, no
 /// factory, and no Media Foundation session can exist in this process.
@@ -345,10 +343,10 @@ fn cmd_listen(args: &[String]) -> Result<ExitCode, String> {
     }
     match listener::run(Box::new(cascade_media::probe)) {
         Ok(Some(daemon::RunExit::Exit)) => Ok(ExitCode::SUCCESS),
-        // The listener only ever ends with `Exit` (T3/T6 spawn their own
+        // The listener only ever ends with `Exit` (spawn their own
         // child); the arm exists so the shape matches `cmd_run`.
         Ok(Some(daemon::RunExit::Respawn)) => respawn::respawn_child().map(|_| ExitCode::SUCCESS),
-        // T8 fail-open (`design-m5b.md` §4.8): listener mode never began —
+        // fail-open: listener mode never began —
         // an explicit `--listen` must not brick the session either, so it
         // falls through to the same full-daemon start `cmd_run` would make.
         Ok(None) => cmd_run(StartRole::Manual, &[]),
@@ -359,19 +357,19 @@ fn cmd_listen(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
-/// How long T5 waits for the listener to release the session pipe after
-/// `quit` (`design-m5b.md` §4.6): 3 s, polled every 100 ms. A healthy
+/// How long waits for the listener to release the session pipe after
+/// `quit`: 3 s, polled every 100 ms. A healthy
 /// listener exits well inside this (flush ack → exit ladder → drops).
 const PRE_QUIT_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
 const PRE_QUIT_POLL: Duration = Duration::from_millis(100);
 
-/// T5 (`design-m5b.md` §4.6): hand a fresh manual `cascade run` (or
+/// hand a fresh manual `cascade run` (or
 /// `run --detached`) the session from a running battery listener —
 /// `status` says `listening` → `quit` → poll for the pipe release →
 /// proceed. A full daemon's `mode` is never `listening`, so this is a
 /// no-op against one and its `AlreadyRunning` behaviour is unchanged.
 /// A listener that refuses to die surfaces as an error instead of ever
-/// starting a second instance (AGENTS §3 — single instance, `ipc.md` §1).
+/// starting a second instance (single instance).
 fn pre_quit_listener() -> Result<(), String> {
     let listening = client::request("status", no_data())
         .ok()
@@ -409,18 +407,18 @@ fn pre_quit_listener() -> Result<(), String> {
 
 /// `DETACHED_PROCESS` (Win32): the child gets no console of its own, so it
 /// survives this process *and* the terminal that launched it — the whole
-/// point of `run --detached` (design-m5 §4). Value from the process
+/// point of `run --detached`. Value from the process
 /// creation flags:
 /// <https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags>
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 /// How long `run --detached` waits for the child's pipe to answer
-/// (design-m5 §4). A healthy daemon is up well inside this; the loop polls
+/// A healthy daemon is up well inside this; the loop polls
 /// `status` every [`DETACHED_POLL`].
 const DETACHED_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const DETACHED_POLL: Duration = Duration::from_millis(100);
 
-/// Strip `--detached` from a `run` argv (design-m5 §4). Pure so the flag
+/// Strip `--detached` from a `run` argv. Pure so the flag
 /// handling is unit-testable; the child never sees it and validates the
 /// remaining flags itself.
 fn split_detached_flag(args: &[String]) -> Result<(bool, Vec<String>), String> {
@@ -439,7 +437,7 @@ fn split_detached_flag(args: &[String]) -> Result<(bool, Vec<String>), String> {
 /// The detached child's argv: `run` plus this command's flags. Pure so the
 /// re-entry contract is unit-testable — the child must take the daemon
 /// path (`is_daemon_role`), never the bare double-click flow
-/// (design-m4 §6.2, which may prompt to install) and never the
+/// (which may prompt to install) and never the
 /// unknown-command arm of `dispatch` (a flag-only argv would land there).
 fn detached_child_args(args: &[String]) -> Vec<String> {
     let mut child = Vec::with_capacity(args.len() + 1);
@@ -448,18 +446,18 @@ fn detached_child_args(args: &[String]) -> Vec<String> {
     child
 }
 
-/// `cascade run --detached` (design-m5 §4): start the daemon without a
+/// `cascade run --detached`: start the daemon without a
 /// console, wait until its pipe answers, print the pid, return — the
 /// caller may close the terminal immediately and the wallpaper keeps
 /// playing. Plain `run` stays foreground for debugging.
 fn run_detached(role: StartRole, args: &[String]) -> Result<ExitCode, String> {
-    // T5 (`design-m5b.md` §4.6): the same hand-over as a foreground manual
+    // the same hand-over as a foreground manual
     // `run` — quit a listening session first, so `--detached` starts the
     // full daemon instead of hitting the listener's `AlreadyRunning`.
     if role == StartRole::Manual && std::env::var_os("CASCADE_RESPAWN").is_none() {
         pre_quit_listener()?;
     }
-    // Single instance (`ipc.md` §1): refuse *before* spawning a child that
+    // Single instance: refuse *before* spawning a child that
     // would only print an error and die.
     if control::find_existing().is_some() {
         return Err(
@@ -486,7 +484,7 @@ fn run_detached(role: StartRole, args: &[String]) -> Result<ExitCode, String> {
         .creation_flags(DETACHED_PROCESS)
         // The child must not inherit this terminal's handles: once the
         // terminal closes they die, and the daemon's `eprintln!` would
-        // panic on the dead handle (AGENTS §3 — a daemon must not panic).
+        // panic on the dead handle (a daemon must not panic).
         // `NUL` handles are permanent — exactly what an autostart start
         // gets (`console.rs`).
         .stdin(Stdio::null())
@@ -581,21 +579,21 @@ fn parse_run_options(args: &[String]) -> Result<daemon::DaemonOptions, String> {
 /// Build the media backend.
 ///
 /// Default (no env): slice 2's Media Engine backend first. It is the
-/// lightest measured video configuration (120.9 MB private bytes, R1 in
-/// docs/rnd-tier2-step5-measurement.md Appendix G) and runs at ~1.2% CPU
+/// lightest measured video configuration (120.9 MB private bytes, in
+/// Appendix G) and runs at ~1.2% CPU
 /// with hardware decode on the target machine. The plain SourceReader CPU
 /// path must not ship as the default: live-measured 2026-11-07 at
 /// 11.5-12.0% CPU (≈140% of one core), 0% GPU decode and 247 MB private
-/// bytes — the E3a gate decision, re-confirmed (Appendix D and G).
+/// bytes — the gate decision, re-confirmed (Appendix D and G).
 ///
 /// Opt-in: any `CASCADE_TIER2*` env var selects the Tier 2 SourceReader
 /// first (RND experiments run through `deploy-tier2.ps1`, which sets
-/// them). `CASCADE_TIER2_E3B=1` additionally enables the E3b GPU path
+/// them). `CASCADE_TIER2_E3B=1` additionally enables the GPU path
 /// (measured 0.90-1.56% CPU, 172.8 MB private bytes) — frozen as an
-/// opt-in experiment (design-m4.md §1, decision D1): re-measured only if
+/// opt-in experiment (decision ): re-measured only if
 /// MediaEngine fails in the field. A construction
 /// failure falls through to the next backend; a failure of both degrades
-/// to the colour background instead of refusing to start (AGENTS §3.1).
+/// to the colour background instead of refusing to start.
 fn build_backend(source: Option<&Path>) -> Option<Box<dyn MediaBackend>> {
     let _ = source?;
     let tier2_opted_in =
@@ -603,7 +601,7 @@ fn build_backend(source: Option<&Path>) -> Option<Box<dyn MediaBackend>> {
 
     let source_reader = || match SourceReaderBackend::new() {
         Ok(backend) => {
-            // Log the path that will actually run: without E3b the reader
+            // Log the path that will actually run: without the reader
             // decodes and converts on the CPU (measured 11.5-12% CPU).
             if std::env::var_os("CASCADE_TIER2_E3B").is_some() {
                 cascade_win::dlog!("cascade: media backend: SourceReader (Tier 2 E3b)");
@@ -657,7 +655,7 @@ fn cmd_doctor() -> Result<ExitCode, String> {
 
 /// `cascade install` — copy this exe to `%LOCALAPPDATA%\Cascade`, generate
 /// the `cascade.cmd` shim, update the user PATH, enable autostart, and
-/// start the engine (design-m4 §6.1). Runs from wherever the exe is.
+/// start the engine. Runs from wherever the exe is.
 fn cmd_install(args: &[String]) -> Result<ExitCode, String> {
     if !args.is_empty() {
         return Err(format!(
@@ -671,7 +669,7 @@ fn cmd_install(args: &[String]) -> Result<ExitCode, String> {
 }
 
 /// `cascade uninstall [--purge] [--quiet]` — reverse the install
-/// (design-m4 §6.1, design-m5-p4 §14 I4). Without `--purge`,
+/// Without `--purge`,
 /// `library.json` and `state.json` are kept. `--quiet` only changes stdio
 /// (used by the Settings Uninstall button); the uninstall steps are
 /// identical.
@@ -715,7 +713,7 @@ fn cmd_signal(message: u32, label: &str) -> Result<ExitCode, String> {
 }
 
 /// `cascade status [--json]` — one request over the control pipe
-/// (`ipc.md` §7). Exit code 1 when the engine is not reachable, so scripts
+/// Exit code 1 when the engine is not reachable, so scripts
 /// can branch on it.
 fn cmd_status(args: &[String]) -> Result<ExitCode, String> {
     let json = status_options(args)?;
@@ -779,7 +777,7 @@ fn print_status_summary(status: &cascade_core::ipc::Status) {
             y = rect.y,
         );
         // Playback counters exist only on the monitor the engine is
-        // attached to (M4 S3b); unknown values are omitted on the wire and
+        // attached to; unknown values are omitted on the wire and
         // therefore here too — never printed as a fake zero.
         let stats = [
             monitor
@@ -860,7 +858,7 @@ fn cmd_autostart(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-// --- Control commands (M4 S2, ipc.md §3) ------------------------------------
+// Control commands ------------------------------------
 
 /// `cascade restore` — repaint through the pipe, with the window message as
 /// the fallback for a daemon that predates `wallpaper.restore`.
@@ -878,8 +876,8 @@ fn cmd_restore() -> Result<ExitCode, String> {
     }
 }
 
-/// `cascade pause` / `cascade resume` — the user pause toggle (design-m4
-/// §2.6): runtime-only, never written to `config.toml`.
+/// `cascade pause` / `cascade resume` — the user pause toggle (
+/// runtime-only, never written to `config.toml`.
 fn cmd_playback(paused: bool, args: &[String]) -> Result<ExitCode, String> {
     let label = if paused { "pause" } else { "resume" };
     if !args.is_empty() {
@@ -901,8 +899,8 @@ fn cmd_playback(paused: bool, args: &[String]) -> Result<ExitCode, String> {
 #[derive(Debug)]
 struct SetOptions {
     /// Exactly one of `path` / `id` / `ordinal` reaches the wire
-    /// (`ipc.md` §3): ordinals are resolved to the stable id first
-    /// (`design-m5.md` D1).
+    /// ordinals are resolved to the stable id first
+    ///
     path: Option<PathBuf>,
     id: Option<String>,
     /// A CLI-only library number (`set 3`), resolved against a fresh
@@ -952,7 +950,7 @@ fn parse_set_options(args: &[String]) -> Result<SetOptions, String> {
                     ));
                 }
                 // A bare decimal number is a library ordinal (`set 3`,
-                // design-m5 D1), never a path: resolve it against a fresh
+                // never a path: resolve it against a fresh
                 // list at execution time. A file actually named `3` needs
                 // a `.\` prefix or a full path.
                 match parse_ordinal(other) {
@@ -984,12 +982,12 @@ fn parse_set_options(args: &[String]) -> Result<SetOptions, String> {
 }
 
 /// `cascade set <path> | <n> | --id <a3f2> [--monitor <id>]` — play a file
-/// directly or a library item (design-m4 S2 path, S3 id; design-m5 D1 for
+/// directly or a library item (path, id; for
 /// the ordinal). The path is made absolute here: the daemon's working
 /// directory is not the CLI's.
 fn cmd_set(args: &[String]) -> Result<ExitCode, String> {
     let options = parse_set_options(args)?;
-    // Exactly one of path / id / ordinal goes out (`ipc.md` §3).
+    // Exactly one of path / id / ordinal goes out.
     let (data, label) = if let Some(item_id) = options.id {
         (
             SetData {
@@ -1001,7 +999,7 @@ fn cmd_set(args: &[String]) -> Result<ExitCode, String> {
         )
     } else if let Some(n) = options.ordinal {
         // Ordinals are CLI-only: resolve against a *fresh* list at
-        // execution time, then send the stable wire id (design-m5 D1).
+        // execution time, then send the stable wire id.
         // The success line names the resolved title and path, so a stale
         // number is visible immediately.
         let items = fetch_library()?;
@@ -1032,7 +1030,7 @@ fn cmd_set(args: &[String]) -> Result<ExitCode, String> {
         serde_json::to_value(data).map_err(|err| format!("could not build request: {err}"))?;
     let data = client::request("wallpaper.set", payload).map_err(|err| err.to_string())?;
     println!("{label}");
-    // S5 (design-m4 §5.3): the daemon assessed before answering — a
+    // the daemon assessed before answering — a
     // rejection (`error`) already surfaced through the Err above; what
     // comes back here is the honest print-then-apply part.
     if let Ok(report) = serde_json::from_value::<SetReport>(data) {
@@ -1069,7 +1067,7 @@ fn parse_monitor_option(args: &[String]) -> Result<Option<String>, String> {
 }
 
 /// `cascade clear [--monitor <id>]` — back to the colour background. User
-/// files are never touched (AGENTS §3.3).
+/// files are never touched.
 fn cmd_clear(args: &[String]) -> Result<ExitCode, String> {
     let monitor = parse_monitor_option(args)?;
     let payload = serde_json::to_value(MonitorData { monitor })
@@ -1079,7 +1077,7 @@ fn cmd_clear(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `cascade quit` — graceful exit over the pipe only (design-m4 §2.3): the
+/// `cascade quit` — graceful exit over the pipe only: the
 /// response is flushed before the exit ladder starts. `cascade stop` stays
 /// the window-based escape hatch.
 fn cmd_quit(args: &[String]) -> Result<ExitCode, String> {
@@ -1099,9 +1097,9 @@ fn cmd_quit(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
-// --- Routing guard (design-m5b §3.1) ----------------------------------------
+// Routing guard ----------------------------------------
 /// What the window probe says about our processes, relative to the retry
-/// budget (`design-m5b.md` §3.1).
+/// budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Guard {
     /// `control::find_existing()` found no Cascade control window.
@@ -1114,7 +1112,7 @@ enum Guard {
     Unanswered,
 }
 
-/// The decision for one attempt (`design-m5b.md` §3.1).
+/// The decision for one attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {
     /// The pipe route decides: either a daemon payload or an honest error.
@@ -1129,19 +1127,19 @@ enum Route {
 }
 
 /// The answer to one routed request: the daemon's payload, or the positive
-/// verdict that nothing of ours is running (`design-m5b.md` §3.1).
+/// verdict that nothing of ours is running.
 enum Routed {
     Daemon(serde_json::Value),
     Offline,
 }
 
 /// Retry cadence while a control window exists without a pipe: every 150 ms
-/// up to 1.5 s in total (`design-m5b.md` §3.1).
+/// up to 1.5 s in total.
 const GUARD_RETRY: Duration = Duration::from_millis(150);
 const GUARD_BUDGET: Duration = Duration::from_millis(1_500);
 /// The confirm delay after a first negative verdict: the daemon's boot window
 /// between pipe creation and control window is ~100 ms, so a second probe
-/// 200 ms later settles it (AGENTS §3.17 — no watcher, no auto-spawn).
+/// 200 ms later settles it (no watcher, no auto-spawn).
 const GUARD_CONFIRM: Duration = Duration::from_millis(200);
 const GUARD_HUNG: &str = "a Cascade process is present but not answering — wait a moment and retry";
 
@@ -1163,7 +1161,7 @@ fn route(result: &Result<serde_json::Value, client::ClientError>, guard: Guard) 
     }
 }
 
-/// One request, routed (`design-m5b.md` §3.1): the pipe first, and the
+/// One request, routed: the pipe first, and the
 /// direct file route only after a positive double verdict — two probes,
 /// 200 ms apart, with no control window either time.
 fn request_routed(cmd: &str, data: &serde_json::Value) -> Result<Routed, String> {
@@ -1201,7 +1199,7 @@ fn request_routed(cmd: &str, data: &serde_json::Value) -> Result<Routed, String>
     }
 }
 
-/// `cascade settings get|set` (`ipc.md` §5).
+/// `cascade settings get|set`.
 fn cmd_settings(args: &[String]) -> Result<ExitCode, String> {
     match args.first().map(String::as_str) {
         Some("get") => settings_get(&args[1..]),
@@ -1222,7 +1220,7 @@ fn settings_get(args: &[String]) -> Result<ExitCode, String> {
     let data = match request_routed("settings.get", &no_data())? {
         Routed::Daemon(data) => data,
         // The same file and the same Run-key fill the daemon applies at its
-        // wire edge (design-m5b §3.3): same shape, so scripts cannot tell.
+        // wire edge: same shape, so scripts cannot tell.
         Routed::Offline => serde_json::to_value(offline::settings_get())
             .map_err(|err| format!("could not format settings: {err}"))?,
     };
@@ -1263,7 +1261,7 @@ fn print_settings(settings: &Settings) {
 }
 
 /// `cascade settings set <key> <value>` — exactly two arguments, a strictly
-/// validated key (`design-m4` §3: unknown key → error, never ignored).
+/// validated key : unknown key → error, never ignored).
 fn settings_set(args: &[String]) -> Result<ExitCode, String> {
     if args.len() != 2 {
         return Err(
@@ -1273,7 +1271,7 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
     let key = args[0].as_str();
     let value = args[1].as_str();
 
-    // `autostart` is not file backed (design-m4 D10): the Run key is the
+    // `autostart` is not file backed: the Run key is the
     // oracle, so it travels as its own command instead of a settings patch.
     if key == "autostart" {
         let enabled = parse_bool(value)?;
@@ -1282,9 +1280,9 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
         let status: AutostartStatus = match request_routed("autostart.set", &payload)? {
             Routed::Daemon(data) => serde_json::from_value(data)
                 .map_err(|err| format!("engine sent an unreadable autostart status: {err}"))?,
-            // The Run key is the oracle (design-m4 D10) and this write is
+            // The Run key is the oracle and this write is
             // already direct: the same registry calls `cascade autostart
-            // on|off` makes, so the status view is identical (design-m5b §3.2).
+            // on|off` makes, so the status view is identical.
             Routed::Offline => {
                 let exe = std::env::current_exe()
                     .map_err(|err| format!("cannot resolve the current executable: {err}"))?;
@@ -1316,7 +1314,7 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
         Routed::Daemon(data) => (
             serde_json::from_value::<Settings>(data)
                 .map_err(|err| format!("engine sent unreadable settings: {err}"))?,
-            // MD2 (`design-m5b.md` §7): the battery listener persists the
+            // the battery listener persists the
             // value too but has no engine to restart — one `status`
             // roundtrip tells the two pipe roles apart, so the echo is
             // honest on both.
@@ -1328,14 +1326,14 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
         ),
         // Apply and persist in this process; with no live engine nothing
         // applies in-process, and a failed save is an error here so the CLI
-        // never echoes a change that did not stick (design-m5b §3.3).
+        // never echoes a change that did not stick.
         Routed::Offline => (offline::settings_apply(patch)?, SetRoute::Offline),
     };
     println!("{key} = {canonical}");
     for note in set_notes(key, route) {
         println!("  {note}");
     }
-    // A contradictory-but-allowed combination applies and warns (D9).
+    // A contradictory-but-allowed combination applies and warns.
     if let Some(warning) = settings.conflict_warning() {
         println!("  warning: {warning}");
     }
@@ -1343,20 +1341,20 @@ fn settings_set(args: &[String]) -> Result<ExitCode, String> {
 }
 
 /// Which path answered `settings set` — the echo note must describe *that*
-/// path's apply semantics (`design-m5b.md` §3.3 offline parity, §4.5
-/// listener command set, MD2 in §7).
+/// path's apply semantics (offline parity,
+/// listener command set, in ).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SetRoute {
     /// A full daemon applied it to the running engine.
     Daemon,
-    /// The battery listener persisted it; no engine exists (MD2).
+    /// The battery listener persisted it; no engine exists.
     Listening,
     /// No Cascade process was running; the file was written directly.
     Offline,
 }
 
 /// True when the session pipe is currently served by the battery listener
-/// (MD2, `design-m5b.md` §7): one `status` roundtrip, `mode:"listening"`.
+/// one `status` roundtrip, `mode:"listening"`.
 /// Any failure answers `false` — the daemon-route note stays the default,
 /// so a transient error never invents a route.
 fn listener_serving() -> bool {
@@ -1368,7 +1366,7 @@ fn listener_serving() -> bool {
 
 /// The apply-semantics note after `settings set`: each route says how *it*
 /// applies the value — a live engine, a listener with no engine to
-/// restart, or no process at all (`design-m5b.md` §3.3 / §4.5, MD2 §7 —
+/// restart, or no process at all (/, —
 /// honest echoes, same shape).
 fn set_notes(key: &str, route: SetRoute) -> Vec<&'static str> {
     match (key, route) {
@@ -1412,7 +1410,7 @@ fn build_patch(key: &str, value: &str) -> Result<(SettingsPatch, String), String
             action.as_str().to_string()
         }
         "engine_mode" => {
-            // Requested route, not the running one (design-engine-mode §4):
+            // Requested route, not the running one:
             // the CLI never claims which mode the engine ended up in.
             let mode = PresentationMode::parse(value)
                 .ok_or_else(|| format!("engine_mode expects accurate|efficient, got {value}"))?;
@@ -1420,7 +1418,7 @@ fn build_patch(key: &str, value: &str) -> Result<(SettingsPatch, String), String
             mode.as_str().to_string()
         }
         "volume" => {
-            // Strict at the CLI (design-volume §3): out-of-range is an
+            // Strict at the CLI: out-of-range is an
             // error here, never a silent clamp — the daemon clamps only
             // what a hand-crafted pipe client sends.
             let level = parse_volume(value)?;
@@ -1459,7 +1457,7 @@ fn build_patch(key: &str, value: &str) -> Result<(SettingsPatch, String), String
 }
 
 /// The error every unknown `settings set` key produces — it lists what *is`
-/// valid so the user never has to open the docs (`design-m4` §3).
+/// valid so the user never has to open the docs.
 fn unknown_setting_key(key: &str) -> String {
     format!(
         "unknown setting key '{key}' (valid: power_profile, on_battery, engine_mode, \
@@ -1480,7 +1478,7 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     }
 }
 
-/// `0..=100`, the audio level (`design-volume.md` §2). Parsed as `u32`
+/// `0..=100`, the audio level. Parsed as `u32`
 /// first so `-1` and `abc` get the same readable error as `101`.
 fn parse_volume(value: &str) -> Result<u8, String> {
     let level: u32 = value
@@ -1493,11 +1491,11 @@ fn parse_volume(value: &str) -> Result<u8, String> {
     Ok(level as u8)
 }
 
-// --- Library commands (M4 S3, ipc.md §3 / design-m4 §4) ---------------------
+// Library commands ---------------------
 
 /// `cascade library ls|add|rm|prune` — every subcommand needs a daemon
-/// (single writer: the main loop, `ipc.md` §3). `list`/`remove` stay as
-/// readable aliases (design-m5 §4).
+/// (single writer: the main loop). `list`/`remove` stay as
+/// readable aliases.
 fn cmd_library(args: &[String]) -> Result<ExitCode, String> {
     match args.first().map(String::as_str) {
         Some("ls") | Some("list") => library_list(&args[1..]),
@@ -1510,8 +1508,8 @@ fn cmd_library(args: &[String]) -> Result<ExitCode, String> {
 }
 
 /// Fresh `library.list` — ordinals resolve against the live list at
-/// execution time, never a cached one (design-m5 D1). Routed: with no
-/// daemon the stored file answers (design-m5b §3.3).
+/// execution time, never a cached one. Routed: with no
+/// daemon the stored file answers.
 fn fetch_library() -> Result<LibraryItemsData, String> {
     let data = match request_routed("library.list", &no_data())? {
         Routed::Daemon(data) => data,
@@ -1520,7 +1518,7 @@ fn fetch_library() -> Result<LibraryItemsData, String> {
     serde_json::from_value(data).map_err(|err| format!("engine sent an unreadable library: {err}"))
 }
 
-/// A CLI ordinal: a pure decimal number (`design-m5.md` D1). Numbers live
+/// A CLI ordinal: a pure decimal number. Numbers live
 /// only in the CLI; the wire keeps the stable 4-hex id. `0` parses here
 /// and is rejected by [`resolve_ordinal`] with a readable message.
 fn parse_ordinal(token: &str) -> Option<usize> {
@@ -1561,7 +1559,7 @@ fn library_list(args: &[String]) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     // The `ID` column is the ordinal the other commands accept
-    // (design-m5 §4): `set 3`, `library rm 3` — the wire id stays behind
+    // `set 3`, `library rm 3` — the wire id stays behind
     // `--id` for scripts.
     println!("ID  TITLE  RESOLUTION  FPS  LENGTH  CODEC  PATH");
     for (index, item) in items.items.iter().enumerate() {
@@ -1585,7 +1583,7 @@ fn library_list(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `cascade library add <path>...` — reference, never copy (AGENTS §3.3).
+/// `cascade library add <path>...` — reference, never copy.
 /// Paths are absolutised here: the daemon's cwd is not the CLI's.
 fn library_add(args: &[String]) -> Result<ExitCode, String> {
     if args.is_empty() {
@@ -1606,7 +1604,7 @@ fn library_add(args: &[String]) -> Result<ExitCode, String> {
     let result: LibraryAddResult = match request_routed("library.add", &payload)? {
         Routed::Daemon(data) => serde_json::from_value(data)
             .map_err(|err| format!("engine sent an unreadable add result: {err}"))?,
-        // The same shared core with the same probe (design-m5b §3.3): the
+        // The same shared core with the same probe: the
         // added/rejected/assessments output cannot drift from the daemon's.
         Routed::Offline => {
             let probe: daemon::ProbeFn = Box::new(cascade_media::probe);
@@ -1616,7 +1614,7 @@ fn library_add(args: &[String]) -> Result<ExitCode, String> {
     for item in &result.added {
         println!("added: {} ({})", item.title, item.path);
         // Badge data computed at the moment the item entered the library
-        // (design-m4 §5.3 step 5) — printed here so the CLI is honest too;
+        // (step 5) — printed here so the CLI is honest too;
         // an `error` row never blocks an add (the library is paths only).
         if let Some(assessment) = result.assessments.iter().find(|a| a.id == item.id) {
             print_warnings(&assessment.warnings);
@@ -1640,7 +1638,7 @@ fn library_add(args: &[String]) -> Result<ExitCode, String> {
 
 /// `cascade library rm <n|id|path>` (alias `remove`) — edits the list
 /// only; the file on
-/// disk is never touched (AGENTS §3.3).
+/// disk is never touched.
 fn library_remove(args: &[String]) -> Result<ExitCode, String> {
     if args.len() != 1 {
         return Err(
@@ -1649,7 +1647,7 @@ fn library_remove(args: &[String]) -> Result<ExitCode, String> {
     }
     let token = args[0].as_str();
     // The list doubles as the ordinal/id/path index and the confirmation
-    // source (design-m5 D1: resolve fresh, send the stable id).
+    // source : resolve fresh, send the stable id).
     let items = fetch_library()?;
     // Only a path-shaped token needs absolutising (the daemon's cwd is
     // not the CLI's); ordinals and ids match as-is.
@@ -1694,7 +1692,7 @@ fn library_remove(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Resolve `library rm <token>` against a fetched list (design-m5 D1):
+/// Resolve `library rm <token>` against a fetched list:
 /// an **in-range ordinal** wins, then a 4-hex id, then a path. Pure so the
 /// precedence is unit-testable; `absolute_path` is only read by the path
 /// branch (the caller computes it for path-shaped tokens only).
@@ -1733,7 +1731,7 @@ fn library_prune(args: &[String]) -> Result<ExitCode, String> {
         Routed::Daemon(data) => serde_json::from_value(data)
             .map_err(|err| format!("engine sent an unreadable prune result: {err}"))?,
         // The daemon's exact drop rule against a freshly loaded store
-        // (design-m5b §3.3).
+        //
         Routed::Offline => LibraryPruneResult {
             removed: offline::library_prune()?,
         },
@@ -1750,13 +1748,13 @@ fn library_prune(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// A library id: exactly 4 hex characters (design-m4 §4).
+/// A library id: exactly 4 hex characters.
 fn is_item_id(token: &str) -> bool {
     token.len() == 4 && token.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Resolve a path argument against a fetched list with the same
-/// case/separator rule the daemon dedupes with.
+/// Resolve a path argument against a fetched list with the daemon's
+/// case/separator deduplication rule.
 fn find_item_by_path<'a>(items: &'a [LibraryItem], path: &str) -> Option<&'a LibraryItem> {
     let key = dedupe_key(path);
     items.iter().find(|item| dedupe_key(&item.path) == key)
@@ -1773,7 +1771,7 @@ fn format_duration(ms: u64) -> String {
     }
 }
 
-/// `cascade assess [<file>] [--monitor <id>] [--json]` (design-m4 §3):
+/// `cascade assess [<file>] [--monitor <id>] [--json]`:
 /// no file → device profile + recommendation for the selected monitor;
 /// with a file → + that file's descriptor and structured warnings.
 /// Read-only, never blocks — an `error` row is a diagnosis (only
@@ -1833,7 +1831,7 @@ fn cmd_assess(args: &[String]) -> Result<ExitCode, String> {
 }
 
 /// One structured warning, three lines: measured values, consequence,
-/// fix (design-m4 §5.2 — this text is what the M5 badge shows).
+/// fix (this text is what the badge shows).
 fn print_warnings(warnings: &[Warning]) {
     for warning in warnings {
         println!(
@@ -1927,9 +1925,7 @@ fn print_assess_report(report: &AssessReport) {
         .filter(|warning| warning.severity == Severity::Error)
         .count();
     if errors > 0 {
-        println!(
-            "{errors} error(s) — `cascade set` refuses this file (codec policy, architecture.md §6)"
-        );
+        println!("{errors} error(s) — `cascade set` refuses this file (unsupported codec policy)");
     } else if report.warnings.is_empty() {
         println!("no warnings — this video fits the display and the hardware");
     } else {
@@ -1987,7 +1983,7 @@ fn print_help() {
 mod tests {
     use super::*;
 
-    // --- routing guard (design-m5b §3.1) --------------------------------
+    // routing guard --------------------------------
 
     #[test]
     fn route_truth_table_covers_every_attempt() {
@@ -2016,8 +2012,8 @@ mod tests {
 
     #[test]
     fn offline_set_notes_are_honest_about_the_missing_engine() {
-        // Daemon route: unchanged wording (design-engine-mode §3,
-        // design-volume §3).
+        // Daemon route: unchanged wording (
+        //
         assert_eq!(
             set_notes("engine_mode", SetRoute::Daemon),
             vec!["daemon restarts to apply it if a video is playing"]
@@ -2026,7 +2022,7 @@ mod tests {
             set_notes("volume", SetRoute::Daemon),
             vec!["applied to the playing video immediately (no restart)"]
         );
-        // Listening route (MD2, §7): the listener persists but there is no
+        // Listening route: the listener persists but there is no
         // engine to restart or load into.
         assert_eq!(
             set_notes("engine_mode", SetRoute::Listening),
@@ -2036,7 +2032,7 @@ mod tests {
             set_notes("volume", SetRoute::Listening),
             vec!["applied at the next load (no engine to restart)"]
         );
-        // Offline route: same shape, honest apply semantics (design-m5b §3.3).
+        // Offline route: same shape, honest apply semantics.
         assert_eq!(
             set_notes("engine_mode", SetRoute::Offline),
             vec!["applied at the next start (no daemon running)"]
@@ -2074,7 +2070,7 @@ mod tests {
         assert!(is_gui_role(&args(&["ui"])));
         assert!(is_gui_role(&args(&["--ui"])));
         // `ui` with arguments stays the GUI role; the window itself takes
-        // none (design-m5 §5) — anything else must keep its own stdio.
+        // none — anything else must keep its own stdio.
         assert!(is_gui_role(&args(&["ui", "extra"])));
         assert!(!is_gui_role(&args(&["status"])));
         assert!(!is_gui_role(&args(&["run"])));
@@ -2087,7 +2083,7 @@ mod tests {
         // Respawn wins: the internal child must never hit the prompt.
         assert_eq!(bare_action(true, true, true), BareAction::RespawnRun);
         assert_eq!(bare_action(false, false, true), BareAction::RespawnRun);
-        // Not installed: always the Yes/No prompt (D5), console or not.
+        // Not installed: always the Yes/No prompt, console or not.
         assert_eq!(bare_action(false, true, false), BareAction::PromptInstall);
         assert_eq!(bare_action(false, false, false), BareAction::PromptInstall);
         // Installed: typed command runs, double-click shows usage only.
@@ -2145,19 +2141,19 @@ mod tests {
         let battery = Some(true);
         let ac = Some(false);
 
-        // autostart + battery + stop → LISTENER (T1, B1).
+        // autostart + battery + stop → LISTENER (B1).
         assert!(should_listenable(Autostart, false, stop, battery));
         // autostart + AC → FULL.
         assert!(!should_listenable(Autostart, false, stop, ac));
-        // `run` fresh + battery + stop → FULL with the D1 session
+        // `run` fresh + battery + stop → FULL with the session
         // override (`session_override_rule` below).
         assert!(!should_listenable(Manual, false, stop, battery));
         // `run` fresh + AC → FULL, no override.
         assert!(!should_listenable(Manual, false, stop, ac));
         // transition child (CASCADE_RESPAWN) + battery + stop → LISTENER
-        // (T2's landing).
+        // ('s landing).
         assert!(should_listenable(Manual, true, stop, battery));
-        // transition child + AC → FULL (T3's landing).
+        // transition child + AC → FULL ('s landing).
         assert!(!should_listenable(Manual, true, stop, ac));
         // Unknown source (255 / failed read) counts as AC (fail-open).
         assert!(!should_listenable(Autostart, false, stop, None));
@@ -2180,7 +2176,7 @@ mod tests {
         let battery = Some(true);
         let ac = Some(false);
 
-        // fresh manual + battery + stop → override (D1; also T5's landing
+        // fresh manual + battery + stop → override (; also 's landing
         // after the pre-quit, since the listener is gone by then).
         assert!(session_override_rule(Manual, false, stop, battery));
         // fresh manual + AC → no override.
@@ -2188,7 +2184,7 @@ mod tests {
         // unknown source counts as AC (fail-open): no override.
         assert!(!session_override_rule(Manual, false, stop, None));
         // automatic starts never take the override — they become the
-        // listener instead (§4.3), so there is no full session to hold.
+        // listener instead, so there is no full session to hold.
         assert!(!session_override_rule(Autostart, false, stop, battery));
         // other actions on a manual start need no override: the stop rule
         // is not what would end them.
@@ -2204,7 +2200,7 @@ mod tests {
             BatteryAction::Pause,
             battery
         ));
-        // T6 `Start now` child (MD6 §7): the env marker forces the
+        // `Start now` child: the env marker forces the
         // override regardless of role or source — it must land FULL, never
         // loop back into a listener.
         assert!(session_override_rule(Manual, true, stop, battery));
@@ -2273,7 +2269,7 @@ mod tests {
         assert_eq!(options.path.as_deref(), Some(Path::new("clip.mp4")));
         assert!(options.monitor.is_none());
 
-        // A library id replaces the file (S3).
+        // A library id replaces the file.
         let options = parse_set_options(&args(&["--id", "a3f2"])).expect("id only");
         assert!(options.path.is_none());
         assert_eq!(options.id.as_deref(), Some("a3f2"));
@@ -2345,7 +2341,7 @@ mod tests {
         assert_eq!(patch.engine_mode, Some(PresentationMode::Accurate));
         assert_eq!(canonical, "accurate");
 
-        // Volume: the boundaries and the middle are valid (design-volume §2).
+        // Volume: the boundaries and the middle are valid.
         for value in ["0", "50", "100"] {
             let (patch, canonical) = build_patch("volume", value).expect("valid");
             assert_eq!(patch.volume, Some(value.parse::<u8>().expect("number")));
@@ -2393,7 +2389,7 @@ mod tests {
         assert_eq!(parse_volume("0").expect("zero"), 0, "the default is valid");
         assert_eq!(parse_volume("100").expect("full"), 100);
         assert_eq!(parse_volume(" 50 ").expect("trimmed"), 50);
-        // Every rejection says what is valid (design-volume §3).
+        // Every rejection says what is valid.
         for bad in ["101", "255", "-1", "abc"] {
             let err = parse_volume(bad).expect_err("must reject");
             assert!(err.contains("0-100"), "error must state the range: {err}");
@@ -2436,7 +2432,7 @@ mod tests {
     #[test]
     fn detached_child_reenters_through_run() {
         // The child always re-enters as `run`: never the bare double-click
-        // flow (design-m4 §6.2 may prompt to install) and never the
+        // flow (may prompt to install) and never the
         // unknown-command arm of `dispatch`.
         assert_eq!(detached_child_args(&[]), args(&["run"]));
         assert_eq!(
@@ -2488,7 +2484,7 @@ mod tests {
 
     #[test]
     fn set_options_accept_library_numbers() {
-        // A bare number is an ordinal, not a path (design-m5 D1).
+        // A bare number is an ordinal, not a path.
         let options = parse_set_options(&args(&["3"])).expect("number");
         assert_eq!(options.ordinal, Some(3));
         assert!(options.path.is_none());

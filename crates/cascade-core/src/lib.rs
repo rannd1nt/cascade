@@ -2,9 +2,9 @@
 //!
 //! Nothing in this crate may depend on Media Foundation or a GUI toolkit.
 //! The single Win32 exception is [`client`] — the named-pipe **client**
-//! transport (design-m5 D10): a narrow set of `windows-sys` calls so the
+//! transport: a narrow set of `windows-sys` calls so the
 //! CLI and the GUI can both reach the daemon without depending on
-//! `cascade-win` (AGENTS §4). The pipe server stays in `cascade-win`.
+//! `cascade-win`. The pipe server stays in `cascade-win`.
 
 use std::path::Path;
 
@@ -55,7 +55,7 @@ pub enum PauseReason {
     SessionLocked,
     Screensaver,
     RemoteSession,
-    /// Running on battery with `on_battery` set to `pause`/`stop` (D9):
+    /// Running on battery with `on_battery` set to `pause`/`stop`:
     /// reported honestly instead of masquerading as `display_off` or
     /// `user_paused`.
     OnBattery,
@@ -103,8 +103,8 @@ impl EngineMode {
     }
 }
 
-/// How a video frame is fitted into the host window (`architecture.md` §6).
-/// M2 serves `Contain` only; `Cover`/`Stretch` are Tier 2 (`quality.md` §4).
+/// How a video frame is fitted into the host window.
+/// serves `Contain` only; `Cover`/`Stretch` are Tier 2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fit {
     Cover,
@@ -113,12 +113,12 @@ pub enum Fit {
 }
 
 /// Which presentation route the backend builds at load time
-/// (`settings set engine_mode`, `design-engine-mode.md` §2).
+/// (`settings set engine_mode`).
 ///
 /// Named `PresentationMode` to stay distinct from the lifecycle
 /// [`EngineMode`] (Boot/Attached/…). This is the **requested** mode: read
 /// once, when the engine is created, and never re-read on a running engine
-/// (AGENTS §3.15 — no code path reconfigures a live engine). The **actual**
+/// (no code path reconfigures a live engine). The **actual**
 /// route is reported separately by `status.monitors[].engine`
 /// (`frame-server` | `rendering`), because the accurate route keeps its
 /// one-way fallback to rendering and the dev knob `CASCADE_ENGINE_RENDER=1`
@@ -128,12 +128,12 @@ pub enum Fit {
 pub enum PresentationMode {
     /// Frame-server + CPU staging bridge: correct colour on BT.601 content,
     /// at the measured cost of ~33.50% CPU / ~225 MB on the target machine
-    /// (2026-11-10, `rnd-media-engine-bottleneck.md` §6).
+    ///
     #[default]
     Accurate,
     /// Rendering/EVR route: much cheaper (~9.00–10.32% CPU / ~121 MB) with
     /// the documented wrong colour on BT.601 content — the trade the user
-    /// opts into, never a silent downgrade (AGENTS §8).
+    /// opts into, never a silent downgrade.
     Efficient,
 }
 
@@ -147,7 +147,7 @@ impl PresentationMode {
         }
     }
 
-    /// Must match the serde spelling (`ipc.md` §5).
+    /// Must match the serde spelling.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Accurate => "accurate",
@@ -157,18 +157,18 @@ impl PresentationMode {
 }
 
 /// What the caller wants from a backend for one loaded source
-/// (`architecture.md` §6).
+///
 #[derive(Clone, Debug)]
 pub struct PlaybackOptions {
     pub fit: Fit,
     pub looping: bool,
     pub max_fps: Option<u32>,
     pub power_saver: bool,
-    /// Engine route to build at load (`design-engine-mode.md` §4). Carried
+    /// Engine route to build at load. Carried
     /// over the existing win → media boundary so no trait method and no
-    /// dependency edge had to be added (AGENTS §4).
+    /// dependency edge had to be added.
     pub engine_mode: PresentationMode,
-    /// Audio level 0–100 for this load (`design-volume.md` §4): `0` = muted
+    /// Audio level 0–100 for this load: `0` = muted
     /// (default), `1–100` = audible at `level / 100`. Same boundary trick
     /// as `engine_mode`; runtime changes travel as `MediaBackend::set_volume`.
     pub volume: u8,
@@ -176,7 +176,7 @@ pub struct PlaybackOptions {
 
 impl Default for PlaybackOptions {
     fn default() -> Self {
-        // M2 defaults (design-m2 §5): contain-only, loop on, uncapped fps,
+        // defaults: contain-only, loop on, uncapped fps,
         // no power profiles; the engine route defaults to honest colour.
         Self {
             fit: Fit::Contain,
@@ -189,13 +189,13 @@ impl Default for PlaybackOptions {
     }
 }
 
-/// Backend counters. Surfaced to `status` in M4; M2 measures externally
-/// with GPU/CPU counters instead (`design-m2.md` §5).
+/// Backend counters. Surfaced to `status` in; measures externally
+/// with GPU/CPU counters instead.
 ///
 /// `hardware_decode` is optional because "cannot observe" and "observed
 /// software decode" are different claims: the Media Engine reports neither,
-/// so it answers `None` until the M4 S4 MFT probe exists and `status` omits
-/// `hwdec` rather than asserting a `false` that would be wrong (M2 measured
+/// so it answers `None` until the MFT probe exists and `status` omits
+/// `hwdec` rather than asserting a `false` that would be wrong (measured
 /// the GPU VideoDecode engine busy on this very build).
 #[derive(Clone, Debug, Default)]
 pub struct BackendStats {
@@ -208,13 +208,13 @@ pub struct BackendStats {
     /// Active presentation mode of the engine backend — `Some("frame-server")`
     /// (NV12 + our video processor) or `Some("rendering")` (the
     /// `MF_MEDIA_ENGINE_PLAYBACK_HWND` fallback, wrong colour on BT.601
-    /// content by design, `design-p1-color.md` §4.4). `None` while no
+    /// content by design). `None` while no
     /// playback thread runs, so `status` omits the field instead of
-    /// guessing (`ipc.md` §4).
+    /// guessing.
     pub engine_mode: Option<String>,
 }
 
-/// The only win → media boundary (AGENTS §4). Core stays Win32-free: the
+/// The only win → media boundary. Core stays Win32-free: the
 /// HWND travels as a plain integer.
 #[derive(Clone, Debug)]
 pub struct HostSurface {
@@ -225,7 +225,7 @@ pub struct HostSurface {
     pub dpi: u32,
 }
 
-/// Errors a media backend can report (design-m2 §2.1).
+/// Errors a media backend can report.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     #[error("cannot open {path}: {reason}")]
@@ -242,13 +242,13 @@ pub type BackendResult<T> = Result<T, BackendError>;
 
 /// The win → media boundary as a trait: `cascade-win` calls it and knows
 /// nothing about Media Foundation; `cascade-media` implements it and never
-/// depends on `cascade-win` (`architecture.md` §6, design-m2 §2).
+/// depends on `cascade-win`.
 pub trait MediaBackend {
     fn load(&mut self, source: &Path, opts: &PlaybackOptions) -> BackendResult<()>;
     fn play(&mut self) -> BackendResult<()>;
     fn pause(&mut self) -> BackendResult<()>;
     fn set_looping(&mut self, on: bool) -> BackendResult<()>;
-    /// Apply an audio level 0–100 to the engine (`design-volume.md` §3) —
+    /// Apply an audio level 0–100 to the engine —
     /// a live property change like `play`/`pause`, never a reload. Backends
     /// with no audio session implement it as a no-op.
     fn set_volume(&mut self, level: u8) -> BackendResult<()>;
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn pause_reason_strings_are_stable() {
         // These strings appear in `status` output and the IPC payload;
-        // changing one is a breaking protocol change (docs/ipc.md).
+        // changing one is a breaking protocol change.
         assert_eq!(PauseReason::Fullscreen.as_str(), "fullscreen");
         assert_eq!(PauseReason::Maximized.as_str(), "maximized");
         assert_eq!(PauseReason::DisplayOff.as_str(), "display_off");
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_one() {
-        // Bumping this without a docs/ipc.md update breaks old clients.
+        // Bumping this without a update breaks old clients.
         assert_eq!(PROTOCOL_VERSION, 1);
     }
 
@@ -322,15 +322,15 @@ mod tests {
         assert!(opts.looping);
         assert_eq!(opts.max_fps, None);
         assert!(!opts.power_saver);
-        // Honest colour is the default route (design-engine-mode §2).
+        // Honest colour is the default route.
         assert_eq!(opts.engine_mode, PresentationMode::Accurate);
-        // Silent by default (design-volume §1).
+        // Silent by default.
         assert_eq!(opts.volume, 0);
     }
 
     #[test]
     fn engine_mode_parses_and_serialises_as_documented() {
-        // CLI/wire spelling (`ipc.md` §5): case-insensitive in, exact out.
+        // CLI/wire spelling: case-insensitive in, exact out.
         assert_eq!(
             PresentationMode::parse("accurate"),
             Some(PresentationMode::Accurate)

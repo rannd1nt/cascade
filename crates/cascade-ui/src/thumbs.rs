@@ -1,15 +1,15 @@
-//! Thumbnail worker for the library grid (design-m5-p4 §11 T5–T11).
+//! Thumbnail worker for the library grid.
 //!
 //! One dedicated thread in the **UI process** owns the disk cache and
 //! the decode pipeline; the UI thread owns an LRU of GPU textures and is
-//! the only place `load_texture` runs (T7). The daemon never links this
-//! path (isolation DoD, design-m5 §11) — decode happens here, in the
+//! the only place `load_texture` runs. The daemon never links this
+//! path (isolation) — decode happens here, in the
 //! window's process, and a failure is a placeholder tile, never a
-//! banner (§11.1).
+//! banner.
 //!
 //! The thread never calls into egui's API: it holds a clone of
 //! `egui::Context` only to `request_repaint()` when a result is ready —
-//! the S1-proven cross-thread wake.
+//! the -proven cross-thread wake.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -21,12 +21,12 @@ use eframe::egui;
 
 use crate::theme;
 
-/// In-memory texture capacity (T10): ≈60 tiles ≈ two screens at the
+/// In-memory texture capacity: ≈60 tiles ≈ two screens at the
 /// default window size; past it the least-recently-rendered texture is
 /// dropped (its `TextureHandle` frees the egui texture).
 pub const LRU_LIMIT: usize = 60;
 
-/// One decode request from the render thread (T6).
+/// One decode request from the render thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThumbReq {
     /// Stable 4-hex library id — the cache key (`{id}.jpg`).
@@ -35,7 +35,7 @@ pub struct ThumbReq {
     pub path: String,
 }
 
-/// One result back to the UI thread (T6/T7): RGBA bytes ready for
+/// One result back to the UI thread: RGBA bytes ready for
 /// `ColorImage`, or the reason to show on hover over the placeholder.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ThumbDone {
@@ -51,8 +51,8 @@ pub enum ThumbDone {
     },
 }
 
-/// The dedicated thumb thread (T6): serial, so one id is never decoded
-/// twice at once; wakes the UI after every result (T6/T7).
+/// The dedicated thumb thread: serial, so one id is never decoded
+/// twice at once; wakes the UI after every result.
 pub fn thumb_worker(reqs: Receiver<ThumbReq>, done: Sender<ThumbDone>, ctx: egui::Context) {
     while let Ok(req) = reqs.recv() {
         let msg = match load_thumb(&req) {
@@ -66,25 +66,25 @@ pub fn thumb_worker(reqs: Receiver<ThumbReq>, done: Sender<ThumbDone>, ctx: egui
         };
         let _ = done.send(msg);
         // A finished thumbnail must appear now, not at the next 1 s
-        // poll repaint (`design-m5-p4` §5 wake semantics).
+        // poll repaint (wake semantics).
         ctx.request_repaint();
     }
     // Request channel closed → the app flips `thumbs_live` and every
-    // tile stays on its placeholder (§11.1: no retry loops).
+    // tile stays on its placeholder : no retry loops).
 }
 
-/// One thumb: fresh stat first (T5), cache hit if the proof matches,
-/// otherwise decode → fit → JPEG → cache write (§11.4 pipeline).
+/// One thumb: fresh stat first, cache hit if the proof matches,
+/// otherwise decode → fit → JPEG → cache write (pipeline).
 /// Returns the fitted RGBA frame either way — the texture comes from the
-/// same bytes on both paths (T7).
+/// same bytes on both paths.
 fn load_thumb(req: &ThumbReq) -> Result<(u32, u32, Vec<u8>), String> {
     if !safe_id(&req.id) {
-        // Never build cache paths from a malformed id (AGENTS §3.12).
+        // Never build cache paths from a malformed id.
         return Err("unusable library id".to_string());
     }
     let source = PathBuf::from(&req.path);
     // The proof must be the file state *now*, not the wire item's
-    // possibly stale probe (T5).
+    // possibly stale probe.
     let stat = std::fs::metadata(&source).map_err(|err| format!("cannot read file: {err}"))?;
     let mtime = stat
         .modified()
@@ -122,9 +122,9 @@ fn load_thumb(req: &ThumbReq) -> Result<(u32, u32, Vec<u8>), String> {
     Ok((fitted.width, fitted.height, fitted.rgba))
 }
 
-/// Cache hit (T5): `{id}.jpg` + `{id}.meta` present and the fresh stat
+/// Cache hit: `{id}.jpg` + `{id}.meta` present and the fresh stat
 /// matches the proof. Every failure mode is a miss — regenerate, never a
-/// wrong hit (T4).
+/// wrong hit.
 fn cache_hit(dir: &Path, id: &str, mtime: u64, size: u64) -> Option<Frame> {
     let proof = std::fs::read_to_string(meta_path(dir, id)).ok()?;
     if parse_meta(&proof)? != (mtime, size) {
@@ -134,7 +134,7 @@ fn cache_hit(dir: &Path, id: &str, mtime: u64, size: u64) -> Option<Frame> {
     thumbnail::decode_jpeg(&jpeg).ok()
 }
 
-/// The one-line sidecar proof `"<src_mtime> <src_size>"` (T4). Anything
+/// The one-line sidecar proof `"<src_mtime> <src_size>"`. Anything
 /// else — missing fields, non-numbers, trailing junk — is a miss.
 fn parse_meta(text: &str) -> Option<(u64, u64)> {
     let mut parts = text.split_whitespace();
@@ -148,7 +148,7 @@ fn parse_meta(text: &str) -> Option<(u64, u64)> {
 
 /// Write `{id}.jpg` then `{id}.meta`, each tmp+rename. Order matters: a
 /// crash between them leaves no/old meta → regenerate, never a wrong hit
-/// (T4).
+///
 fn write_cache(dir: &Path, id: &str, jpeg: &[u8], mtime: u64, size: u64) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     write_atomic(&jpg_path(dir, id), jpeg)?;
@@ -166,8 +166,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Delete cache files whose id left the library (T11): our own files in
-/// our own directory only (AGENTS §3.12). Returns the number removed.
+/// Delete cache files whose id left the library: our own files in
+/// our own directory only. Returns the number removed.
 ///
 /// Called once, after the first *successful* `library.list` reply —
 /// never before, and never from an error path (an empty guess would
@@ -175,8 +175,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 ///
 /// Compiled only outside tests (`cfg(not(test))`, mirrored at the call
 /// site in `app.rs`): a unit test must never touch the real cache
-/// directory (AGENTS §7). The filter logic below is unit-tested; the
-/// full prune is V4 on the target machine.
+/// directory. The filter logic below is unit-tested; the
+/// full prune is on the target machine.
 #[cfg(not(test))]
 pub fn prune_orphans(current_ids: &[String]) -> usize {
     let Some(dir) = thumbs_dir() else {
@@ -215,7 +215,7 @@ fn cache_file_id(name: &str) -> Option<&str> {
 }
 
 /// A well-formed cache id is orphaned exactly when the library no
-/// longer lists it (T11).
+/// longer lists it.
 fn is_orphan(id: &str, current: &HashSet<&str>) -> bool {
     !current.contains(id)
 }
@@ -248,13 +248,13 @@ fn meta_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.meta"))
 }
 
-/// In-memory texture LRU (T10): `HashMap` for lookup, `VecDeque` for
+/// In-memory texture LRU: `HashMap` for lookup, `VecDeque` for
 /// recency — `get_touch` on every render, evict from the front past
 /// `limit` (visible tiles were just touched, so the front can never be
 /// one). Dropping the handle frees the egui texture.
 ///
 /// Generic over the handle so the ordering logic unit-tests without a
-/// renderer (§11.5 V7); the app instantiates it with
+/// renderer; the app instantiates it with
 /// `egui::TextureHandle`.
 pub struct TextureLru<H> {
     textures: HashMap<String, H>,
@@ -271,7 +271,7 @@ impl<H> TextureLru<H> {
         }
     }
 
-    /// The handle for `id`, marked most-recently-used (T10).
+    /// The handle for `id`, marked most-recently-used.
     pub fn get_touch(&mut self, id: &str) -> Option<&H> {
         self.touch(id);
         self.textures.get(id)
@@ -294,7 +294,7 @@ impl<H> TextureLru<H> {
         }
     }
 
-    /// Drop everything whose id left the library (T9): no texture lingers
+    /// Drop everything whose id left the library: no texture lingers
     /// for an item that is gone.
     pub fn retain_ids(&mut self, current: &HashSet<String>) {
         self.order.retain(|id| current.contains(id));
@@ -326,7 +326,7 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
-    // --- meta proof (T4) ------------------------------------------------
+    // meta proof ------------------------------------------------
 
     #[test]
     fn meta_parses_the_documented_one_line_proof() {
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(parse_meta("1 2 3"), None);
     }
 
-    // --- prune filter (T11) --------------------------------------------
+    // prune filter --------------------------------------------
 
     #[test]
     fn cache_names_only_claim_our_files() {
@@ -373,7 +373,7 @@ mod tests {
         assert!(!safe_id("abcdefghi"));
     }
 
-    // --- LRU order (T10) ------------------------------------------------
+    // LRU order ------------------------------------------------
 
     #[test]
     fn lru_evicts_the_front_past_the_limit() {

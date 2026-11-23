@@ -1,14 +1,14 @@
 //! Library persistence (`%LOCALAPPDATA%\Cascade\library.json`,
-//! design-m4 §4).
+//!
 //!
 //! Follows the `state.rs` pattern exactly: best-effort, atomic (tmp +
 //! rename), a corrupt or unknown-version file decodes to an **empty
 //! library** and never blocks the daemon. The file holds the list only —
-//! no user media is ever touched (AGENTS §3.3).
+//! no user media is ever touched.
 //!
-//! Writers: the daemon main loop (`ipc.md` §3) **or** the offline CLI /
+//! Writers: the daemon main loop **or** the offline CLI /
 //! battery listener when no full daemon exists — the routing guard in
-//! `design-m5b.md` §3 makes those mutually exclusive (pipe wins).
+//! makes those mutually exclusive (pipe wins).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ impl LibraryStore {
     }
 
     /// The stored list, or an empty library for a missing, corrupt, or
-    /// unknown-version file (design-m4 §4: corrupt file = empty library).
+    /// unknown-version file : corrupt file = empty library).
     pub fn load(&self) -> Library {
         let Some(path) = self.path.as_ref() else {
             return Library::default();
@@ -101,7 +101,7 @@ impl LibraryStore {
     }
 
     /// Test seam: a store rooted at an explicit directory, so offline
-    /// tests never touch the real profile (`design-m5b.md` §3.6).
+    /// tests never touch the real profile.
     #[cfg(test)]
     pub(crate) fn open_in(dir: &Path) -> Self {
         Self {
@@ -110,13 +110,13 @@ impl LibraryStore {
     }
 }
 
-/// The D13 staleness proof for one file: modification time in Unix
+/// The staleness proof for one file: modification time in Unix
 /// seconds and byte size. Either side can fail to read (unreadable
 /// metadata, pre-epoch mtime) — `None` on that side means "cannot prove
 /// freshness", and [`LibraryItem::proof_matches`] then treats the entry
 /// as stale instead of guessing. Shared by the daemon's descriptor
 /// refresh and the offline `library.add` (moved from `daemon.rs`,
-/// `design-m5b.md` §3.4).
+///
 pub fn file_proof(path: &Path) -> (Option<u64>, Option<u64>) {
     let Ok(meta) = std::fs::metadata(path) else {
         return (None, None);

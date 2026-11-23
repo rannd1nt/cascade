@@ -1,7 +1,7 @@
-//! The assessment engine (design-m4 §5.2): pure data in, structured
-//! warnings out — one unit test per metric row M1–M9.
+//! The assessment engine: pure data in, structured
+//! warnings out — one unit test per metric row.
 //!
-//! D13 leak rules apply to every caller: this module allocates plain data
+//! leak rules apply to every caller: this module allocates plain data
 //! only. It never creates an engine, swapchain, D3D device, or Media
 //! Foundation object, and it never runs the load pipeline — the caller
 //! probes the file first (container attributes, SourceReader dropped in
@@ -10,9 +10,9 @@
 //! cannot stale them.
 //!
 //! Severities: `info` and `warn` never block anything (they are printed
-//! and the user's request applies — design-m4 §5.3); `error` is the only
+//! and the user's request applies — ); `error` is the only
 //! severity that blocks `wallpaper.set`, and only the codec policy
-//! (`architecture.md` §6) and HDR produce it.
+//! and HDR produce it.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,48 +20,48 @@ use crate::device::{codec_support, level_name, profile_name, DeviceProfile, Moni
 use crate::library::VideoMetadata;
 use crate::Fit;
 
-// --- Policy thresholds (constants in one place, design-m4 §5.2) -------------
+// Policy thresholds (constants in one place) -------------
 // These are policy, not measurements: tuned only with measured evidence
-// (AGENTS §8). Every one is exercised by a unit test below.
+// Every one is exercised by a unit test below.
 
-/// M3: below this fraction of the display on both axes the upscale is
+/// below this fraction of the display on both axes the upscale is
 /// visible (soft image).
 const MIN_UPSCALE_RATIO: f64 = 0.70;
-/// M3: above this fraction of the display on both axes the extra pixels
+/// above this fraction of the display on both axes the extra pixels
 /// are decoded but never shown.
 const MAX_WASTE_RATIO: f64 = 1.50;
-/// M4: aspect-ratio mismatch tolerance (1 %).
+/// aspect-ratio mismatch tolerance (1 %).
 const AR_TOLERANCE: f64 = 0.01;
-/// M5: at or below this frame rate on a faster display, motion judders.
+/// at or below this frame rate on a faster display, motion judders.
 const MAX_JUDDER_FPS: f64 = 24.0;
-/// M8: warn below this much free VRAM after surface allocations.
+/// warn below this much free VRAM after surface allocations.
 const VRAM_HEADROOM_WARN_MB: u64 = 256;
-/// M8: adapters at or below this dedicated size are aperture iGPUs (the
+/// adapters at or below this dedicated size are aperture iGPUs (the
 /// measured target reports 128 MB dedicated) — VRAM headroom on such a
-/// machine is system RAM, which M9 already covers. Skipping avoids a
-/// permanent false positive (amended design-m4 §5.2, S5).
+/// machine is system RAM, which already covers. Skipping avoids a
+/// permanent false positive (amended).
 const VRAM_APERTURE_MAX_MB: u64 = 256;
-/// M9: total RAM floors.
+/// total RAM floors.
 const RAM_MIN_MB: u64 = 4096;
 const RAM_4K_MIN_MB: u64 = 8192;
-/// 4K video detection for M9.
+/// 4K video detection for.
 const UHD_WIDTH: u32 = 3840;
 const UHD_HEIGHT: u32 = 2160;
-/// M8 surface estimate: double-buffered RGBA8 swapchain per monitor…
+/// surface estimate: double-buffered RGBA8 swapchain per monitor…
 const SWAPCHAIN_BUFFERS: u64 = 2;
 /// …and H.264's maximum reference-frame set for the decode surfaces (NV12,
 /// macroblock-aligned). An estimate by design — labelled as such on the
 /// wire, never presented as a measurement.
 const DECODE_SURFACES: u64 = 16;
-/// M6: bits-per-pixel-per-frame budget keyed by codec class.
+/// bits-per-pixel-per-frame budget keyed by codec class.
 const BPP_H264: f64 = 0.10;
 const BPP_MODERN_HIGH_EFFICIENCY: f64 = 0.06; // HEVC, VP9
 const BPP_AV1: f64 = 0.05;
 const BPP_LEGACY: f64 = 0.20; // MPEG-2, WMV9
 const BPP_DEFAULT: f64 = 0.10;
 
-/// Which metric produced a warning (`ipc.md` §9; stable wire strings —
-/// the M5 GUI badge keys off them).
+/// Which metric produced a warning (; stable wire strings —
+/// the GUI badge keys off them).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
@@ -70,7 +70,7 @@ pub enum Metric {
     Resolution,
     Aspect,
     // "fps", not serde's automatic "frame_rate": the wire string predates
-    // this module (status/monitor rows) and the M5 badge keys off it.
+    // this module (status/monitor rows) and the badge keys off it.
     #[serde(rename = "fps")]
     FrameRate,
     Bitrate,
@@ -96,7 +96,7 @@ impl Metric {
 }
 
 /// How much a warning matters. Only [`Severity::Error`] blocks a set
-/// (design-m4 §5.3).
+///
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
@@ -115,8 +115,8 @@ impl Severity {
     }
 }
 
-/// One structured warning (design-m4 §5.2): the record the CLI prints and
-/// the M5 GUI `(i)` badge renders. `detail` carries the measured values;
+/// One structured warning: the record the CLI prints and
+/// the GUI `(i)` badge renders. `detail` carries the measured values;
 /// `consequence` and `fix` are plain English, derived from them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Warning {
@@ -127,7 +127,7 @@ pub struct Warning {
     pub fix: String,
 }
 
-/// The "format video so it is not cropped" answer (design-m4 §5.2):
+/// The "format video so it is not cropped" answer:
 /// `width` × `height` is the exact display resolution (never asks the
 /// user to change their screen), `note` names the standard 16:9 ladder
 /// alternative when this display's AR matches one.
@@ -146,7 +146,7 @@ pub struct Assessment {
 }
 
 impl Assessment {
-    /// Any blocking warning (design-m4 §5.3 step 2)? The first error is
+    /// Any blocking warning (step 2)? The first error is
     /// the rejection message `wallpaper.set` sends.
     pub fn first_error(&self) -> Option<&Warning> {
         self.warnings
@@ -156,7 +156,7 @@ impl Assessment {
 }
 
 /// Normalise a probe codec label to the device-side fourcc key so the two
-/// sides of D12 compare equal (`H264` → `h264`, `AV1` → `av01`, …).
+/// sides of compare equal (`H264` → `h264`, `AV1` → `av01`, …).
 /// Unknown labels lowercase verbatim — never renamed to something we
 /// did not measure.
 pub fn codec_key(raw: &str) -> String {
@@ -170,7 +170,7 @@ pub fn codec_key(raw: &str) -> String {
     }
 }
 
-/// Is this codec inside the v1 supported set (`architecture.md` §6)?
+/// Is this codec inside the v1 supported set ?
 /// H.264 8-bit 4:2:0 only — everything else is an `error` severity and the
 /// single class of warning that blocks `wallpaper.set`.
 pub fn policy_supported(codec_key: &str) -> bool {
@@ -186,7 +186,7 @@ fn is_high_bit_depth_profile(profile: u32) -> bool {
 /// Evaluate every metric row for one video on one target monitor.
 ///
 /// `device` is the live [`DeviceProfile`] (collected fresh per event —
-/// D13: warnings are derived at read time), `monitor` is the assigned
+/// warnings are derived at read time), `monitor` is the assigned
 /// output, `fit` is the playback fit the engine would use.
 pub fn assess(
     video: &VideoMetadata,
@@ -214,7 +214,7 @@ pub fn assess(
     }
 }
 
-/// M1: codec in the device decode set (D12: D3D11 GPU profiles ∪ hardware
+/// codec in the device decode set: D3D11 GPU profiles ∪ hardware
 /// MFT input types) — `warn` when it is not ("plays, expect high CPU");
 /// the explicit policy rejects are `error`.
 fn m1_codec(
@@ -229,8 +229,8 @@ fn m1_codec(
             metric: Metric::Codec,
             severity: Severity::Error,
             detail: format!("codec policy: {raw} ({codec}) is outside the v1 supported set"),
-            consequence: "Cascade v1 will not play this file — there is no software fallback \
-                          (architecture.md §6 codec policy)"
+            consequence: "Cascade will not play this file — there is no software fallback \
+                          for codecs outside the supported set"
                 .to_string(),
             fix: "re-encode to H.264 (8-bit 4:2:0) to play it here".to_string(),
         });
@@ -277,7 +277,7 @@ fn m1_codec(
         });
         return;
     };
-    // GPU-only codecs carry empty sets: "supported, detail unknown" (D12).
+    // GPU-only codecs carry empty sets: "supported, detail unknown".
     // Only a machine that advertises detail gets the profile comparison.
     if entry.profiles.is_empty() {
         return;
@@ -308,7 +308,7 @@ fn m1_codec(
     }
 }
 
-/// M2: file level vs the device's advertised maximum level (H.264/HEVC
+/// file level vs the device's advertised maximum level (H.264/HEVC
 /// level numbers are monotonic in both encodings, so a numeric max works).
 fn m2_level(
     video: &VideoMetadata,
@@ -328,7 +328,7 @@ fn m2_level(
         .filter(|levels| !levels.is_empty())
         .and_then(|levels| levels.into_iter().max())
     else {
-        // No advertised level detail (GPU-only codec, D12): unknown, skip.
+        // No advertised level detail (GPU-only codec): unknown, skip.
         return;
     };
     if file_level > max_device {
@@ -351,7 +351,7 @@ fn m2_level(
     }
 }
 
-/// M3: resolution vs display pixels — too small on both axes (visible
+/// resolution vs display pixels — too small on both axes (visible
 /// upscale) or too large on both axes (decode cost for pixels never seen).
 fn m3_resolution(video: &VideoMetadata, monitor: &MonitorProfile, warnings: &mut Vec<Warning>) {
     let (mw, mh) = (f64::from(monitor.rect.w), f64::from(monitor.rect.h));
@@ -395,7 +395,7 @@ fn m3_resolution(video: &VideoMetadata, monitor: &MonitorProfile, warnings: &mut
     }
 }
 
-/// M4: aspect ratio vs the display, phrased for the actual `Fit` — bars
+/// aspect ratio vs the display, phrased for the actual `Fit` — bars
 /// with `Contain`, cropped area with `Cover`, nothing with `Stretch`.
 fn m4_aspect(
     video: &VideoMetadata,
@@ -477,7 +477,7 @@ fn m4_aspect(
     });
 }
 
-/// M5: frame rate vs display refresh — faster than the display wastes
+/// frame rate vs display refresh — faster than the display wastes
 /// decode (`info`), slow content on a fast display judders (`warn`).
 fn m5_frame_rate(video: &VideoMetadata, monitor: &MonitorProfile, warnings: &mut Vec<Warning>) {
     let (Some(fps), Some(hz)) = (video.fps, monitor.refresh_hz) else {
@@ -515,9 +515,9 @@ fn m5_frame_rate(video: &VideoMetadata, monitor: &MonitorProfile, warnings: &mut
     }
 }
 
-/// M6: bitrate vs the decode budget for (resolution × frame rate × codec
+/// bitrate vs the decode budget for (resolution × frame rate × codec
 /// class). Budgets are policy constants — measured evidence can move them
-/// (AGENTS §8), a single loud file cannot.
+/// a single loud file cannot.
 fn m6_bitrate(video: &VideoMetadata, codec: &str, warnings: &mut Vec<Warning>) {
     let (Some(bitrate), Some(fps)) = (video.bitrate_bps, video.fps) else {
         return;
@@ -558,16 +558,15 @@ fn bpp_budget(codec: &str) -> f64 {
     }
 }
 
-/// M7: HDR — HDR content is a v1 policy `error` (no tone mapping,
-/// `architecture.md` §6); SDR content on an HDR display is a `warn`.
+/// HDR — HDR content is a v1 policy `error` (no tone mapping,
+/// SDR content on an HDR display is a `warn`.
 fn m7_hdr(video: &VideoMetadata, monitor: &MonitorProfile, warnings: &mut Vec<Warning>) {
     if video.hdr == Some(true) {
         warnings.push(Warning {
             metric: Metric::Hdr,
             severity: Severity::Error,
             detail: "codec policy: HDR transfer function (PQ/HLG) in the file".to_string(),
-            consequence: "Cascade v1 has no tone mapping — HDR content renders washed out or \
-                          clipped (architecture.md §6)"
+            consequence: "Cascade has no tone mapping — HDR content renders washed out or clipped"
                 .to_string(),
             fix: "re-encode in SDR (BT.709) to play it here".to_string(),
         });
@@ -588,10 +587,10 @@ fn m7_hdr(video: &VideoMetadata, monitor: &MonitorProfile, warnings: &mut Vec<Wa
     }
 }
 
-/// M8: VRAM headroom after the surfaces this session needs (estimate —
+/// VRAM headroom after the surfaces this session needs (estimate —
 /// swapchains for every monitor plus the decode surfaces). Skipped on
 /// aperture iGPUs (dedicated ≤ 256 MB, the measured target): their "VRAM"
-/// is system RAM and M9 already reports memory pressure there.
+/// is system RAM and already reports memory pressure there.
 fn m8_vram(device: &DeviceProfile, video: &VideoMetadata, warnings: &mut Vec<Warning>) {
     let dedicated = device
         .gpus
@@ -624,7 +623,7 @@ fn m8_vram(device: &DeviceProfile, video: &VideoMetadata, warnings: &mut Vec<War
     });
 }
 
-/// The M8 surface estimate (labelled "est." everywhere it is shown).
+/// The surface estimate (labelled "est." everywhere it is shown).
 fn estimated_surface_mb(device: &DeviceProfile, video: &VideoMetadata) -> u64 {
     let mut bytes: u64 = 0;
     for monitor in &device.monitors {
@@ -638,7 +637,7 @@ fn estimated_surface_mb(device: &DeviceProfile, video: &VideoMetadata) -> u64 {
     bytes.div_ceil(1024 * 1024)
 }
 
-/// M9: system RAM headroom — total below 4 GB warns; below 8 GB with 4K
+/// system RAM headroom — total below 4 GB warns; below 8 GB with 4K
 /// content warns (decode buffers plus a low-RAM machine).
 fn m9_ram(device: &DeviceProfile, video: &VideoMetadata, warnings: &mut Vec<Warning>) {
     let Some(ram) = device.ram.as_ref() else {
@@ -672,7 +671,7 @@ fn m9_ram(device: &DeviceProfile, video: &VideoMetadata, warnings: &mut Vec<Warn
 }
 
 /// The "format video so it is not cropped" answer for one display
-/// (design-m4 §5.2): the exact display resolution preserves the display's
+/// the exact display resolution preserves the display's
 /// AR perfectly and never asks the user to change their screen; the note
 /// names the smallest standard 16:9 ladder size that still covers the
 /// display, with its AR delta, or says honestly that no ladder matches.
@@ -777,7 +776,7 @@ mod tests {
             gpus: vec![GpuAdapter {
                 name: "Test GPU".to_string(),
                 vendor_id: 0x8086,
-                dedicated_mb: 128, // aperture iGPU: M8 skips (S5 amendment)
+                dedicated_mb: 128, // aperture iGPU: skips
                 shared_mb: 8060,
                 driver_version: Some("30.0.101.1960".to_string()),
             }],
@@ -801,14 +800,14 @@ mod tests {
         assess(video, device, monitor, Fit::Contain).warnings
     }
 
-    /// Design-m4 §5.2 contract: the measured baseline is clean.
+    /// Design-m4 contract: the measured baseline is clean.
     #[test]
     fn baseline_produces_no_warnings() {
         let warnings = warnings_for(&baseline_video(), &baseline_device(), &baseline_monitor());
         assert!(warnings.is_empty(), "{warnings:#?}");
     }
 
-    /// Metric ids are wire strings the M5 badge keys off — assert serde
+    /// Metric ids are wire strings the badge keys off — assert serde
     /// and `as_str` agree so the two can never drift.
     #[test]
     fn metric_and_severity_wire_strings_are_stable() {
@@ -836,7 +835,7 @@ mod tests {
         );
     }
 
-    /// Probe labels are uppercase (`H264`) while D12 device labels are
+    /// Probe labels are uppercase (`H264`) while device labels are
     /// lowercase fourcc (`h264`); aliases line the two vocabularies up.
     #[test]
     fn codec_key_normalises_probe_labels_to_device_labels() {
@@ -854,12 +853,12 @@ mod tests {
         assert!(!policy_supported(&codec_key("HEVC")));
     }
 
-    /// M1: policy-reject codec → `error`, the only blocking class.
+    /// policy-reject codec → `error`, the only blocking class.
     #[test]
     fn m1_policy_rejected_codec_is_an_error() {
         let mut video = baseline_video();
         video.codec = "HEVC".to_string();
-        video.bitrate_bps = Some(1_000_000); // under the M6 budget for HEVC
+        video.bitrate_bps = Some(1_000_000); // under the budget for HEVC
         let warnings = warnings_for(&video, &baseline_device(), &baseline_monitor());
         assert_eq!(warnings.len(), 1, "{warnings:#?}");
         assert_eq!(warnings[0].metric, Metric::Codec);
@@ -874,8 +873,8 @@ mod tests {
         .is_some());
     }
 
-    /// M1: a high-bit-depth H.264 profile is a policy error too
-    /// (architecture §6: 8-bit 4:2:0 only).
+    /// a high-bit-depth H.264 profile is a policy error too
+    /// (architecture: 8-bit 4:2:0 only).
     #[test]
     fn m1_high_bit_depth_profile_is_an_error() {
         let mut video = baseline_video();
@@ -886,7 +885,7 @@ mod tests {
         assert!(warnings[0].detail.contains("High10"), "{warnings:#?}");
     }
 
-    /// M1: codec absent from the D12 device set → `warn` ("plays, expect
+    /// codec absent from the device set → `warn` ("plays, expect
     /// high CPU"), never an error.
     #[test]
     fn m1_missing_hardware_decode_warns_but_does_not_block() {
@@ -901,7 +900,7 @@ mod tests {
         assert_eq!(warnings[0].severity, Severity::Warn);
     }
 
-    /// M1 (D12): a GPU-only codec advertises no profile detail — that is
+    /// a GPU-only codec advertises no profile detail — that is
     /// "supported, detail unknown", never a false "no hardware decode".
     #[test]
     fn m1_gpu_only_codec_with_unknown_detail_does_not_warn() {
@@ -910,7 +909,7 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:#?}");
     }
 
-    /// M1: when the device *does* advertise profile detail and the file
+    /// when the device *does* advertise profile detail and the file
     /// sits outside it → `warn`.
     #[test]
     fn m1_profile_outside_the_device_set_warns() {
@@ -935,7 +934,7 @@ mod tests {
         assert!(warnings[0].detail.contains("Baseline"), "{warnings:#?}");
     }
 
-    /// M2: file level above the device's advertised maximum → `warn`.
+    /// file level above the device's advertised maximum → `warn`.
     #[test]
     fn m2_level_above_the_device_maximum_warns() {
         let mut device = baseline_device();
@@ -963,14 +962,14 @@ mod tests {
         assert!(warnings_for(&video, &device, &baseline_monitor()).is_empty());
     }
 
-    /// M3: both axes well below 70 % → upscale warning; both above 150 %
-    /// → waste warning; a single off axis is M4's problem, not M3's.
+    /// both axes well below 70 % → upscale warning; both above 150 %
+    /// → waste warning; a single off axis is 's problem, not 's.
     #[test]
     fn m3_resolution_warns_both_ways_but_never_on_one_axis_alone() {
         let device = baseline_device();
         let monitor = baseline_monitor();
         // 640x360 on 1366x768: 47% x 47% → soft upscale. Bitrate set under
-        // the M6 budget for this size so the row stays isolated.
+        // the budget for this size so the row stays isolated.
         let mut small = baseline_video();
         small.width = 640;
         small.height = 360;
@@ -986,7 +985,7 @@ mod tests {
         let warnings = warnings_for(&huge, &device, &monitor);
         assert_eq!(warnings.len(), 1, "{warnings:#?}");
         assert_eq!(warnings[0].metric, Metric::Resolution);
-        // Narrow-but-short (one axis each side): no M3 claim.
+        // Narrow-but-short (one axis each side): no claim.
         let mut odd = baseline_video();
         odd.width = 1366;
         odd.height = 500;
@@ -995,7 +994,7 @@ mod tests {
             .all(|warning| warning.metric != Metric::Resolution));
     }
 
-    /// M4: AR mismatch > 1 % names the actual cost of the actual `Fit`.
+    /// AR mismatch > 1 % names the actual cost of the actual `Fit`.
     #[test]
     fn m4_aspect_names_bars_for_contain_and_crop_for_cover() {
         let device = baseline_device();
@@ -1021,7 +1020,7 @@ mod tests {
         assert_eq!((rec.width, rec.height), (1366, 768));
     }
 
-    /// M4 edge: a video wider than the display flips bars to the sides
+    /// edge: a video wider than the display flips bars to the sides
     /// with Contain and to the sides' crop with Cover.
     #[test]
     fn m4_aspect_flips_the_axis_with_the_shape_of_the_mismatch() {
@@ -1037,7 +1036,7 @@ mod tests {
         assert!(cover[0].consequence.contains("sides"), "{cover:#?}");
     }
 
-    /// M5: above the display's Hz → `info` (wasted decode); ≤ 24 fps on a
+    /// above the display's Hz → `info` (wasted decode); ≤ 24 fps on a
     /// 60 Hz display → `warn` (judder); in-between rates stay silent.
     #[test]
     fn m5_frame_rate_info_above_hz_and_warn_at_judder_rates() {
@@ -1051,13 +1050,13 @@ mod tests {
         assert_eq!(warnings[0].severity, Severity::Info);
         let mut slow = baseline_video();
         slow.fps = Some(24.0);
-        slow.bitrate_bps = Some(1_000_000); // under the M6 budget at 24 fps
+        slow.bitrate_bps = Some(1_000_000); // under the budget at 24 fps
         let warnings = warnings_for(&slow, &device, &monitor);
         assert_eq!(warnings.len(), 1, "{warnings:#?}");
         assert_eq!(warnings[0].severity, Severity::Warn);
         assert!(warnings[0].consequence.contains("judder"), "{warnings:#?}");
         // 25–60 fps on 60 Hz: no claim either way (bitrate kept under the
-        // M6 budget at every frame rate so this row stays isolated).
+        // budget at every frame rate so this row stays isolated).
         for fps in [25.0, 30.0, 60.0] {
             let mut video = baseline_video();
             video.fps = Some(fps);
@@ -1066,7 +1065,7 @@ mod tests {
         }
     }
 
-    /// M6: above the bits-per-pixel budget for (size × fps × codec class)
+    /// above the bits-per-pixel budget for (size × fps × codec class)
     /// → `warn`; at or below it stays silent. Budget for the baseline is
     /// 1920·1080·60·0.10 = 12 441 600 bps.
     #[test]
@@ -1086,7 +1085,7 @@ mod tests {
         assert!(warnings_for(&video, &device, &monitor).is_empty());
     }
 
-    /// M7: HDR content is the policy `error`; SDR content on an HDR
+    /// HDR content is the policy `error`; SDR content on an HDR
     /// display is a `warn`; SDR on SDR is silent.
     #[test]
     fn m7_hdr_policy_error_and_sdr_on_hdr_warn() {
@@ -1111,12 +1110,12 @@ mod tests {
         assert_eq!(warnings[0].severity, Severity::Error);
     }
 
-    /// M8: aperture iGPUs (dedicated ≤ 256 MB — the measured target has
+    /// aperture iGPUs (dedicated ≤ 256 MB — the measured target has
     /// 128 MB) skip the metric entirely; a real dGPU under 256 MB
     /// headroom after the surface estimate warns.
     #[test]
     fn m8_vram_skips_aperture_igpus_and_warns_a_tight_dedicated_gpu() {
-        // Aperture iGPU: no M3-style false positive, no warning ever.
+        // Aperture iGPU: no -style false positive, no warning ever.
         let warnings = warnings_for(&baseline_video(), &baseline_device(), &baseline_monitor());
         assert!(warnings
             .iter()
@@ -1134,13 +1133,13 @@ mod tests {
         );
         // 384 MB dedicated: est. surfaces = 1 monitor swapchain (8 MB) +
         // 4K decode (190 MB) = 198 MB → 186 MB headroom < 256 → warn.
-        // (4K on this display also trips M3 — filter to this row.)
+        // (4K on this display also trips — filter to this row.)
         let mut tight = baseline_device();
         tight.gpus[0].dedicated_mb = 384;
         let mut video = baseline_video();
         video.width = 3840;
         video.height = 2160;
-        video.bitrate_bps = Some(1_000_000); // under the M6 budget at 4K60
+        video.bitrate_bps = Some(1_000_000); // under the budget at 4K60
         let vram: Vec<Warning> = warnings_for(&video, &tight, &baseline_monitor())
             .into_iter()
             .filter(|warning| warning.metric == Metric::Vram)
@@ -1150,7 +1149,7 @@ mod tests {
         assert!(vram[0].detail.contains("headroom"), "{vram:#?}");
     }
 
-    /// M9: total RAM below 4 GB warns; below 8 GB with 4K content warns;
+    /// total RAM below 4 GB warns; below 8 GB with 4K content warns;
     /// the measured 16 GB machine is silent.
     #[test]
     fn m9_ram_warns_on_low_total_and_on_4k_with_8gb() {
@@ -1168,11 +1167,11 @@ mod tests {
             total_mb: 6144,
             available_mb: 3000,
         });
-        // 4K on this display also trips M3 (waste) — filter to this row.
+        // 4K on this display also trips (waste) — filter to this row.
         let mut video = baseline_video();
         video.width = 3840;
         video.height = 2160;
-        video.bitrate_bps = Some(1_000_000); // under the M6 budget at 4K60
+        video.bitrate_bps = Some(1_000_000); // under the budget at 4K60
         let ram: Vec<Warning> = warnings_for(&video, &medium, &monitor)
             .into_iter()
             .filter(|warning| warning.metric == Metric::Ram)
@@ -1217,7 +1216,7 @@ mod tests {
         assert_eq!(recommend(&broken).width, 0);
     }
 
-    /// The wire shape of an assessment (ipc.md §9): snake_case fields, the
+    /// The wire shape of an assessment: snake_case fields, the
     /// stable metric/severity strings, and a recommendation alongside.
     #[test]
     fn assessment_serialises_to_the_documented_shape() {

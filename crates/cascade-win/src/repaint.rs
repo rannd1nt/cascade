@@ -4,7 +4,7 @@
 //! Explorer paint the desktop again". Levels run in order; the first successful
 //! level stops the ladder, except that L1 always runs.
 //!
-//! See `docs/reliability.md` §3 for the rationale and for the open question of
+//! See for the rationale and for the open question of
 //! which level is actually sufficient on a given build.
 
 use windows_sys::Win32::Foundation::HWND;

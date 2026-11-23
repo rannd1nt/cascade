@@ -1,15 +1,15 @@
-//! H.264 SPS/VUI colour tags parsed from the bitstream (P1 colour fix,
-//! `design-p1-color.md` §4.1).
+//! H.264 SPS/VUI colour tags parsed from the bitstream (colour fix,
+//!
 //!
 //! Media Foundation ignores H.264 VUI colour flags on build 26200.9711
-//! (`notes-p1-color-601.md` D1), and the canonical gate asset carries no
-//! `colr` box at all (E1-1) — so the only trustworthy source for the
+//! and the canonical gate asset carries no
+//! `colr` box at all — so the only trustworthy source for the
 //! YCbCr matrix is the SPS itself. The sequence header arrives as
 //! `MF_MT_MPEG_SEQUENCE_HEADER` (Annex-B for MP4, measured 42 bytes for
 //! `bars.mp4`), which may also be an avcC record; both are accepted.
 //!
 //! This module is pure bit-twiddling: no Win32, no MF, unit-testable per
-//! AGENTS §7. Any parse failure yields the documented defaults (BT.709 +
+//! Any parse failure yields the documented defaults (BT.709 +
 //! limited range — the behaviour every path had before this fix, so a
 //! malformed stream can never regress worse than the old hardcode).
 
@@ -383,7 +383,7 @@ mod tests {
     use super::*;
 
     /// `Temp\s7\bars.mp4` sequence header, exactly as
-    /// `MF_MT_MPEG_SEQUENCE_HEADER` reports it (probe 2026-11-10, notes §8):
+    /// `MF_MT_MPEG_SEQUENCE_HEADER` reports it (probe 2026-11-10, notes ):
     /// Annex-B SPS + PPS, 42 bytes. ffprobe: `color_space=bt470bg`
     /// (matrix_coefficients 5), `color_range=tv`.
     const BARS_SEQUENCE_HEADER: &[u8] = &[
@@ -403,8 +403,8 @@ mod tests {
 
     #[test]
     fn bars_gate_asset_is_bt601_limited() {
-        // The whole P1 fix in one assertion: the gate source must parse as
-        // BT.601, or the desktop decodes it as 709 and P1 fails again.
+        // The whole fix in one assertion: the gate source must parse as
+        // BT.601, or the desktop decodes it as 709 and fails again.
         assert_eq!(
             colour_tags(BARS_SEQUENCE_HEADER),
             ColourTags {

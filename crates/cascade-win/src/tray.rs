@@ -1,4 +1,4 @@
-//! The tray icon and its menu, inside the daemon (design-m5 §6, P3).
+//! The tray icon and its menu, inside the daemon.
 //!
 //! The icon hangs off the **existing hidden top-level control window**
 //! ([`crate::control`]) — not a message-only window: system broadcasts
@@ -43,11 +43,11 @@ use crate::{derr, dlog};
 /// looks up during verification.
 const TRAY_UID: u32 = 1;
 
-/// Tooltip: short, no version noise (design-m5 §6 — the tray is silent).
+/// Tooltip: short, no version noise (the tray is silent).
 const TRAY_TIP: &str = "Cascade";
 
 /// Resource ID of `img/cascade.ico`, embedded by `crates/cascade/build.rs`
-/// (`1 ICON ...`). MAKEINTRESOURCEW is an integer-encoded pointer — the
+/// (`1 ICON...`). MAKEINTRESOURCEW is an integer-encoded pointer — the
 /// same encoding windows-sys uses for `IDI_APPLICATION`.
 const ICON_RESOURCE_ID: u32 = 1;
 
@@ -65,7 +65,7 @@ static RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 /// Record a tray click from the window procedure; the main loop shows
-/// the menu on its next turn (design-m5 §6 — wndproc = flags only).
+/// the menu on its next turn (wndproc = flags only).
 pub fn request_menu() {
     MENU_PENDING.store(true, Ordering::Release);
 }
@@ -82,36 +82,36 @@ pub fn taskbar_created_id() -> u32 {
     TASKBAR_CREATED.load(Ordering::Acquire)
 }
 
-/// Which menu this icon shows (`design-m5b.md` §4.7, D2). A process is
+/// Which menu this icon shows. A process is
 /// one role for its whole life, so the mode is fixed at construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayMode {
-    /// The full daemon: Open / Pause / Quit (design-m5 §6).
+    /// The full daemon: Open / Pause / Quit.
     Full,
     /// The battery listener: only what it can honestly do
-    /// (`design-m5b.md` §4.7): the MD1 header, `Start now` (T6), and
+    /// the header, `Start now`, and
     /// `Quit`.
     Listening,
 }
 
-/// The listening menu's disabled header (MD1, decided Pw2-S3 and recorded
-/// in `design-m5b.md` §7): what the process is and why no engine runs.
+/// The listening menu's disabled header (decided and recorded
+/// in ): what the process is and why no engine runs.
 const LISTENING_HEADER: &str = "Cascade — on battery (engine off)";
 
 /// What one menu choice means for the main loop (pure; unit-tested).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
     /// Spawn `current_exe() ui` — the same `cascade ui` command the CLI
-    /// runs (AGENTS §1: the menu only opens existing CLI paths).
+    /// runs : the menu only opens existing CLI paths).
     OpenUi,
     /// Flip `flags.user_paused` and re-evaluate the pause oracle —
     /// identical to `cascade pause` / `cascade resume`.
     TogglePause,
-    /// The shared quit function (design-m5 §4): the normal exit ladder,
-    /// repaint first — never `process::exit` (AGENTS §13).
+    /// The shared quit function: the normal exit ladder,
+    /// repaint first — never `process::exit`.
     Quit,
-    /// Listening menu only: start the full daemon now (T6,
-    /// `design-m5b.md` §4.4) — the listener hands the session over even
+    /// Listening menu only: start the full daemon now (
+    /// — the listener hands the session over even
     /// though the source is still battery.
     StartNow,
 }
@@ -122,7 +122,7 @@ const MENU_TOGGLE: u32 = 2;
 const MENU_QUIT: u32 = 3;
 const MENU_START: u32 = 4;
 
-/// Map a `TrackPopupMenu` command id to an action. Pure so the D8 menu
+/// Map a `TrackPopupMenu` command id to an action. Pure so the menu
 /// contract is unit-testable without a shell.
 fn menu_action(cmd: u32) -> Option<TrayAction> {
     match cmd {
@@ -136,7 +136,7 @@ fn menu_action(cmd: u32) -> Option<TrayAction> {
     }
 }
 
-/// The pause entry shows the action it will perform (design-m5 D8).
+/// The pause entry shows the action it will perform.
 fn pause_label(paused: bool) -> &'static str {
     if paused {
         "Resume"
@@ -145,11 +145,11 @@ fn pause_label(paused: bool) -> &'static str {
     }
 }
 
-/// The daemon's tray state (design-m5 §6).
+/// The daemon's tray state.
 pub struct Tray {
     hwnd: HWND,
     icon: HICON,
-    /// Which menu to build (Full vs Listening, `design-m5b.md` §4.7).
+    /// Which menu to build (Full vs Listening).
     mode: TrayMode,
     /// Whether the shell currently holds our icon — our own belief,
     /// updated only from real `NIM_ADD` / `NIM_DELETE` results.
@@ -183,7 +183,7 @@ impl Tray {
     /// One tray turn: reconcile the shell icon with `want` (the live
     /// `settings.tray`), then show the menu if the window procedure
     /// recorded a click since the last turn. Called twice per loop pass
-    /// (design-m5 §6) — both call sites are cheap no-ops when nothing
+    /// both call sites are cheap no-ops when nothing
     /// changed.
     pub fn step(&mut self, want: bool, paused: bool) -> Option<TrayAction> {
         self.sync(want);
@@ -287,7 +287,7 @@ fn register_taskbar_created() {
     let id = unsafe { RegisterWindowMessageW(name.as_ptr()) };
     if id == 0 {
         // Without the id no broadcast matches: the icon would not come
-        // back after an explorer restart (the §12 scenario says it must).
+        // back after an explorer restart (the scenario says it must).
         derr!("tray: could not register TaskbarCreated (explorer-restart re-add disabled)");
     }
     TASKBAR_CREATED.store(id, Ordering::Release);
@@ -322,10 +322,10 @@ fn load_icon() -> HICON {
 /// map the chosen id. Returns `None` on dismissal or a create failure.
 ///
 /// Each mode offers only what that role can honestly do
-/// (`design-m5b.md` §4.7): the listener has no engine, so `Open`/`Pause`
-/// would be dead entries. The listening menu ships the MD1 header (§7,
-/// decided Pw2-S3: `Cascade — on battery (engine off)`), `Start now`
-/// (T6), and `Quit`.
+/// the listener has no engine, so `Open`/`Pause`
+/// would be dead entries. The listening menu ships the header (
+/// decided: `Cascade — on battery (engine off)`), `Start now`
+/// and `Quit`.
 fn show_menu(hwnd: HWND, mode: TrayMode, paused: bool) -> Option<TrayAction> {
     // SAFETY: a valid menu handle when non-null.
     let menu: HMENU = unsafe { CreatePopupMenu() };
@@ -346,7 +346,7 @@ fn show_menu(hwnd: HWND, mode: TrayMode, paused: bool) -> Option<TrayAction> {
             AppendMenuW(menu, MF_STRING, MENU_TOGGLE as usize, pause.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         } else {
-            // Disabled header (MD1): a label, not a command — its id is 0
+            // Disabled header: a label, not a command — its id is 0
             // and `MF_GRAYED` keeps `TrackPopupMenu` from ever returning it.
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, header.as_ptr());
             AppendMenuW(menu, MF_STRING, MENU_START as usize, start.as_ptr());
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(menu_action(MENU_OPEN), Some(TrayAction::OpenUi));
         assert_eq!(menu_action(MENU_TOGGLE), Some(TrayAction::TogglePause));
         assert_eq!(menu_action(MENU_QUIT), Some(TrayAction::Quit));
-        // Pw2-S3: the listening menu's T6 entry.
+        // the listening menu's entry.
         assert_eq!(menu_action(MENU_START), Some(TrayAction::StartNow));
         // 0 = dismissed; an id this build never created is ignored.
         assert_eq!(menu_action(0), None);
@@ -402,7 +402,7 @@ mod tests {
         assert_ne!(MENU_START, MENU_TOGGLE);
         assert_ne!(MENU_START, MENU_QUIT);
         assert_ne!(MENU_TOGGLE, MENU_QUIT);
-        // The disabled header (MD1) is a label, id 0 — never a command.
+        // The disabled header is a label, id 0 — never a command.
         assert_eq!(LISTENING_HEADER, "Cascade — on battery (engine off)");
     }
 

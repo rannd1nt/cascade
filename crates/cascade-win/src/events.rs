@@ -1,8 +1,8 @@
-//! Server→client event stream (`docs/ipc.md` §6, design-m5-p4 §4).
+//! Server→client event stream.
 //!
 //! A second named pipe, `\\.\pipe\cascade-evt-{session}`, separate from
 //! the control pipe so the control path keeps its single-instance,
-//! one-client-at-a-time design untouched (CLI-first, AGENTS §1). The
+//! one-client-at-a-time design untouched (CLI-first). The
 //! server runs on one process-scoped thread with two phases: block in
 //! `ConnectNamedPipe` while nobody subscribes, then park on a condvar
 //! and write coalesced event lines until the client goes away.
@@ -10,8 +10,8 @@
 //! Emission (`emit_*`) is called from the daemon's own threads: one
 //! relaxed atomic load says whether anyone is listening, so with no
 //! subscriber the call does no locking, no waking, and no I/O — idle
-//! event work is 0 (`design-m5.md` §11). Delivery is paced to at most
-//! 10 lines/second (`ipc.md` §6) on the serve thread, never on an
+//! event work is 0. Delivery is paced to at most
+//! 10 lines/second on the serve thread, never on an
 //! emitting thread.
 
 use std::collections::VecDeque;
@@ -44,15 +44,15 @@ use crate::wide;
 /// fragment, a full library list); the same size the control pipe uses.
 const BUFFER_BYTES: u32 = 4096;
 /// Minimum gap between delivered lines: the wire cap of 10 events per
-/// second (`ipc.md` §6), enforced here so emitting threads never sleep.
+/// second, enforced here so emitting threads never sleep.
 const LINE_PACING: Duration = Duration::from_millis(100);
 /// How long `shutdown()` waits for the last line to leave the process.
 /// Bounded on purpose: the exit ladder must never wait on a client
-/// (AGENTS §3.1), and the client treats a missing `shutdown` exactly
+/// and the client treats a missing `shutdown` exactly
 /// like a broken pipe.
 const SHUTDOWN_FLUSH_WAIT: Duration = Duration::from_millis(200);
 /// `log` events buffered before the oldest is dropped: "surface once"
-/// diagnostics, newest wins (`design-m5-p4` §4.1).
+/// diagnostics, newest wins.
 const LOG_CAP: usize = 8;
 /// Respawn contention budget for the event pipe: the same wait the
 /// control pipe uses (`daemon.rs` `RESPAWN_PIPE_WAIT`), because a dying
@@ -63,7 +63,7 @@ const CREATE_POLL: Duration = Duration::from_millis(100);
 /// a slow retry instead of a hot loop.
 const RETRY_PAUSE: Duration = Duration::from_millis(250);
 
-// --- payloads -------------------------------------------------------------
+// payloads -------------------------------------------------------------
 
 #[derive(Serialize)]
 struct StateData<'a> {
@@ -92,7 +92,7 @@ fn wire_event(name: &str, data: serde_json::Value) -> Event {
 
 /// Serialize a plain payload, or log and drop the event. Payloads here
 /// are simple data that cannot realistically fail; a failure must never
-/// panic a background daemon (AGENTS §13).
+/// panic a background daemon.
 fn payload<T: Serialize>(value: &T) -> Option<serde_json::Value> {
     match serde_json::to_value(value) {
         Ok(data) => Some(data),
@@ -103,12 +103,12 @@ fn payload<T: Serialize>(value: &T) -> Option<serde_json::Value> {
     }
 }
 
-// --- pending slots (coalescing) -------------------------------------------
+// pending slots (coalescing) -------------------------------------------
 
 /// What waits for the serve thread. Typed slots instead of a queue:
 /// `state` and `library.changed` carry *current* state, so the newest
 /// value always replaces the older one and coalescing is lossless
-/// (`design-m5-p4` §4.1).
+///
 #[derive(Default)]
 struct Pending {
     state: Option<Event>,
@@ -172,7 +172,7 @@ struct EventBus {
     shared: Arc<Shared>,
 }
 
-/// Process-scoped bus (design-m5-p4 §4.3): the handle and thread live
+/// Process-scoped bus: the handle and thread live
 /// past `daemon::run`'s locals so `ExitSignal::drop` can still flush the
 /// `shutdown` line. Empty in the listener and in tests → every emit and
 /// the flush are no-ops there.
@@ -180,7 +180,7 @@ static BUS: OnceLock<EventBus> = OnceLock::new();
 
 /// Recover a mutex even if some other thread panicked while holding it:
 /// every critical section here is a plain field assignment, so the data
-/// is structurally intact (AGENTS §4 — no `unwrap` in library code).
+/// is structurally intact (no `unwrap` in library code).
 fn lock(shared: &Shared) -> MutexGuard<'_, Pending> {
     shared
         .pending
@@ -193,7 +193,7 @@ fn push(edit: impl FnOnce(&mut Pending)) {
         return;
     };
     // No subscriber → no work at all: the isolation invariant's "idle
-    // event work is 0" (`design-m5.md` §11).
+    // event work is 0".
     if !bus.shared.subscribers.load(Ordering::Relaxed) {
         return;
     }
@@ -203,11 +203,11 @@ fn push(edit: impl FnOnce(&mut Pending)) {
     bus.shared.wake.notify_one();
 }
 
-// --- emission points (design-m5-p4 §4.5) ----------------------------------
+// emission points ----------------------------------
 
 /// `state`: mode / pause reasons / playback identity changed. Numeric
 /// counters are deliberately absent — they tick on the 1 s `status` poll
-/// (`design-m5.md` §8).
+///
 pub fn emit_state(mode: &str, paused_reasons: &[String]) {
     let Some(data) = payload(&StateData {
         mode,
@@ -227,9 +227,9 @@ pub fn emit_library_changed(items: &[LibraryItem]) {
     push(|pending| pending.library = Some(wire_event("library.changed", data)));
 }
 
-/// `log`: a warning the UI should surface once (`ipc.md` §6). Call sites
-/// are curated — internal diagnostics are not user-facing (`design-m5-p4`
-/// §7.4).
+/// `log`: a warning the UI should surface once. Call sites
+/// are curated — internal diagnostics are not user-facing (
+///
 pub fn emit_log(level: &str, message: &str) {
     let Some(data) = payload(&LogData { level, message }) else {
         return;
@@ -279,13 +279,13 @@ pub fn shutdown() {
     }
 }
 
-// --- server ---------------------------------------------------------------
+// server ---------------------------------------------------------------
 
 /// Start the event stream. Called once per daemon, **after** the control
 /// pipe is ours (the control pipe stays the single-instance guard).
 /// Every failure degrades to today's poll-only behaviour with a log
 /// line: no events is a lesser state, never a broken desktop
-/// (`design-m5-p4` §4.4).
+///
 pub fn init() {
     if BUS.get().is_some() {
         return;
@@ -346,7 +346,7 @@ fn create_event_pipe() -> Result<HANDLE, u32> {
 fn try_create_event_pipe() -> Result<HANDLE, u32> {
     let name = wide::to_wide(&event_server_name());
     // SAFETY: `name` is NUL-terminated; a null SECURITY_ATTRIBUTES
-    // gives the default DACL (same user only, `ipc.md` §1); the buffer
+    // gives the default DACL (same user only); the buffer
     // sizes are kernel-side counts, not pointers.
     let handle = unsafe {
         CreateNamedPipeW(
@@ -354,7 +354,7 @@ fn try_create_event_pipe() -> Result<HANDLE, u32> {
             PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             // One server instance = one subscriber at a time
-            // (design-m5-p4 §3): a second waits with normal backoff.
+            // a second waits with normal backoff.
             1,
             BUFFER_BYTES,
             BUFFER_BYTES,
@@ -400,8 +400,8 @@ fn serve(raw: isize, shared: Arc<Shared>) {
         }
 
         // New subscriber: discard anything queued for a previous one —
-        // events are not replayed (`ipc.md` §6); the client resyncs
-        // statelessly right after connecting (`ipc.md` §7).
+        // events are not replayed; the client resyncs
+        // statelessly right after connecting.
         {
             let mut pending = lock(&shared);
             *pending = Pending::default();
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn emits_without_a_bus_are_noops() {
         // The listener and unit tests never call `init`: emission must
-        // be a silent no-op, not a panic (design-m5-p4 §4.5).
+        // be a silent no-op, not a panic.
         emit_state("attached", &[]);
         emit_library_changed(&[]);
         emit_log("warn", "test");

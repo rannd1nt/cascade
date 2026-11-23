@@ -1,15 +1,15 @@
-//! First-frame thumbnails (design-m5 §7, design-m5-p4 §11 T1–T3).
+//! First-frame thumbnails.
 //!
 //! One video file in, one fitted RGBA frame out — plus JPEG encode and
 //! decode for the disk cache. Called **only by `cascade-ui`**: the daemon
-//! never decodes a thumbnail (isolation DoD, design-m5 §11).
+//! never decodes a thumbnail (isolation).
 //!
 //! Each call is self-contained: COM + Media Foundation start on the
-//! calling thread and shut down again before returning (D13, the
+//! calling thread and shut down again before returning (the
 //! `probe::probe` pattern), so the dedicated thumb thread needs no setup
 //! of its own.
 //!
-//! T3 amendment (measured, `rnd-tier2-step5-measurement.md` D.3/D.5): MF
+//! amendment (measured, D.3/D.5): MF
 //! refuses RGB32 output without XVP and XVP crashes this machine's Intel
 //! driver 4/4 — so the decoder output is NV12 (the daemon's proven
 //! default path, no video processor involved) and YUV→RGB is our own
@@ -30,11 +30,11 @@ use crate::source_reader::{
     MF_SOURCE_READER_FLAG_ERROR,
 };
 
-/// Fitted thumbnail size (design-m5-p4 §11.4): 2× the 160×90 pt tile, so
-/// one texture stays sharp at 100–200 % DPI (AGENTS §1).
+/// Fitted thumbnail size: 2× the 160×90 pt tile, so
+/// one texture stays sharp at 100–200 % DPI.
 pub const THUMB_WIDTH: u32 = 320;
 pub const THUMB_HEIGHT: u32 = 180;
-/// JPEG quality for the disk cache (§11.4).
+/// JPEG quality for the disk cache.
 pub const JPEG_QUALITY: u8 = 80;
 
 /// One frame: top-down RGBA8, tightly packed (4 bytes per pixel).
@@ -64,10 +64,10 @@ impl Frame {
 }
 
 /// Decode the first video frame of `path` at native size, converted to
-/// RGBA with the stream's own colour tags (T3).
+/// RGBA with the stream's own colour tags.
 ///
 /// Self-contained per call: COM + MF start here and shut down before
-/// returning (D13), exactly like `probe::probe`.
+/// returning, exactly like `probe::probe`.
 pub fn decode_first_frame(path: &Path) -> Result<Frame, String> {
     // Same order as `cascade-media::probe`: MF calls block or fail
     // without COM + MF started on this thread.
@@ -85,7 +85,7 @@ pub fn decode_first_frame(path: &Path) -> Result<Frame, String> {
         return Err("media foundation is not available".to_string());
     }
     let result = first_frame(path);
-    // Shutdown order: MF first, then COM (design-m2 §3.3).
+    // Shutdown order: MF first, then COM.
     let _ = unsafe { MFShutdown() };
     if com_owned {
         // SAFETY: balances the successful CoInitializeEx above.
@@ -211,7 +211,7 @@ fn convert_locked_nv12(
 }
 
 /// MF's converter writes B,G,R,A bytes; egui and the `image` crate want
-/// R,G,B,A. In-place channel swap, pure — unit-tested (§11.5 V7).
+/// R,G,B,A. In-place channel swap, pure — unit-tested.
 fn bgra_to_rgba(pixels: &mut [u8]) {
     // Index walk, not `chunks_exact(4)`: clippy suggests `as_chunks`
     // (Rust 1.88) but the workspace MSRV is 1.80 (Cargo.toml).
@@ -221,7 +221,7 @@ fn bgra_to_rgba(pixels: &mut [u8]) {
     }
 }
 
-/// Contain-fit into `out_w × out_h` (T3): Triangle downscale, then pad
+/// Contain-fit into `out_w × out_h`: Triangle downscale, then pad
 /// the letterbox with `pad` (RGBA) so the result is always exactly the
 /// cache size. A frame that already matches passes through untouched.
 pub fn fit_contain(frame: &Frame, out_w: u32, out_h: u32, pad: [u8; 4]) -> Result<Frame, String> {
@@ -248,13 +248,13 @@ pub fn fit_contain(frame: &Frame, out_w: u32, out_h: u32, pad: [u8; 4]) -> Resul
     Frame::new(out_w, out_h, out.into_raw())
 }
 
-/// Encode a frame as JPEG at `quality` for the disk cache (T2).
+/// Encode a frame as JPEG at `quality` for the disk cache.
 ///
 /// JPEG has no alpha channel; every pixel this module produces is
 /// opaque, so the A byte is dropped, not composited.
 pub fn encode_jpeg(frame: &Frame, quality: u8) -> Result<Vec<u8>, String> {
     let mut rgb = Vec::with_capacity(frame.rgba.len() / 4 * 3);
-    // Index walk, not `chunks_exact(4)` (workspace MSRV 1.80, see
+    // Index walk, not `chunks_exact(4)` (workspace MSRV 1.80,
     // `bgra_to_rgba`).
     let full = frame.rgba.len() / 4 * 4;
     for i in (0..full).step_by(4) {
@@ -270,7 +270,7 @@ pub fn encode_jpeg(frame: &Frame, quality: u8) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Decode a cached JPEG back into a frame (cache-hit path of §11.4).
+/// Decode a cached JPEG back into a frame (cache-hit path of ).
 pub fn decode_jpeg(bytes: &[u8]) -> Result<Frame, String> {
     let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
         .map_err(|err| format!("jpeg decode: {err}"))?

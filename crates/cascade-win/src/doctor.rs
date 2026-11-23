@@ -322,7 +322,7 @@ fn yes_no(v: bool) -> &'static str {
 }
 
 /// `60 Hz, 96 dpi, SDR (BT.709), 8 bpc` — only the parts the OS reported.
-/// Pure; unit-tested (design-m4 §8, slice S4).
+/// Pure; unit-tested (slice ).
 fn extras_label(m: &MonitorProfile) -> String {
     let mut parts = Vec::new();
     if let Some(hz) = m.refresh_hz {

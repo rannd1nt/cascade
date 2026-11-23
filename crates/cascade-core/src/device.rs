@@ -1,8 +1,8 @@
-//! `DeviceProfile`: the machine facts `assess()` consumes (design-m4 §5.1).
+//! `DeviceProfile`: the machine facts `assess()` consumes.
 //!
 //! Pure data and pure helpers only — no Win32, no I/O (crate doc rule).
 //! Collection lives in `cascade-win/src/device.rs`; `cascade doctor` prints
-//! the profile; the S5 `assess()` reads it.
+//! the profile; the `assess()` reads it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,7 +19,7 @@ pub struct DeviceProfile {
 }
 
 /// Per-monitor facts: identity/geometry from `monitor::enumerate` plus the
-/// refresh/DPI/HDR extras collected for S4. Every extra is `Option` — a mode
+/// refresh/DPI/HDR extras collected for. Every extra is `Option` — a mode
 /// the OS does not report stays `None` instead of a guessed zero.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MonitorProfile {
@@ -45,7 +45,7 @@ pub struct GpuAdapter {
     pub dedicated_mb: u64,
     pub shared_mb: u64,
     /// Display-driver version from the class key (read-only), matched by
-    /// `DriverDesc == name`; `None` when absent (design-m4 §5.1).
+    /// `DriverDesc == name`; `None` when absent.
     pub driver_version: Option<String>,
 }
 
@@ -120,7 +120,7 @@ pub struct CodecSupport {
 /// MFT detail joins the map with *empty* sets — "decodes this codec, detail
 /// unknown" — never a guessed profile or level. Duplicates collapse (sets),
 /// so a machine with two H.264 MFTs reports one `h264` row — what `assess`
-/// M1/M2 needs to answer "does this device decode profile P at level L?".
+/// needs to answer "does this device decode profile P at level L?".
 pub fn codec_support(capability: &DecodeCapability) -> BTreeMap<String, CodecSupport> {
     let mut out: BTreeMap<String, CodecSupport> = BTreeMap::new();
     for decoder in &capability.decoders {

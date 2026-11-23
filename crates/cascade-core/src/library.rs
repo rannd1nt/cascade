@@ -1,6 +1,6 @@
-//! Library model (design-m4 §4): a list of **paths only**.
+//! Library model: a list of **paths only**.
 //!
-//! Nothing here reads, copies, moves, or modifies user media (AGENTS §3.3) —
+//! Nothing here reads, copies, moves, or modifies user media —
 //! the model is pure data plus list algebra so every rule (dedupe, id
 //! stability, prune) is unit-testable without Win32 or a file system. The
 //! daemon owns persistence (`cascade-win/src/library.rs`) and probing
@@ -8,13 +8,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One library entry (`architecture.md` §8, extended with the assessment
-/// fields from design-m4 §5.3). The file at `path` is referenced, never
+/// One library entry (extended with the assessment
+/// fields from ). The file at `path` is referenced, never
 /// copied; metadata is a snapshot taken at `added_at` time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LibraryItem {
     /// 4 hex characters, unique in the file, stable for this entry
-    /// (design-m4 §4) — re-adding the path keeps the id.
+    /// re-adding the path keeps the id.
     pub id: String,
     /// Canonical path without the `\\?\` verbatim prefix.
     pub path: String,
@@ -36,22 +36,22 @@ pub struct LibraryItem {
     pub level: Option<String>,
     /// HDR transfer function found in the container: `Some(true)` = PQ/HLG,
     /// `Some(false)` = a known SDR transfer, `None` = attribute absent
-    /// (D13: assessment input, additive field — old files decode without it).
+    /// assessment input, additive field — old files decode without it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdr: Option<bool>,
-    /// Staleness proof (D13): file modification time in Unix seconds at
+    /// Staleness proof: file modification time in Unix seconds at
     /// probe time, paired with `size`. Same path + different proof = the
     /// file was replaced (4K → 1080p) and is re-probed on the next touch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtime: Option<u64>,
-    /// Staleness proof (D13): file size in bytes at probe time.
+    /// Staleness proof: file size in bytes at probe time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     /// Unix seconds when the entry was first added.
     pub added_at: u64,
 }
 
-/// Metadata a probe reads off one file (design-m4 §4 entry fields,
+/// Metadata a probe reads off one file (entry fields,
 /// without the identity the daemon assigns). Produced by
 /// `cascade_media::probe` and stored verbatim on [`LibraryItem`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -99,7 +99,7 @@ impl LibraryItem {
         }
     }
 
-    /// Attach the file's staleness proof (D13): the `mtime` + `size` the
+    /// Attach the file's staleness proof: the `mtime` + `size` the
     /// probe saw, so the next touch can tell a replaced file at the same
     /// path from an unchanged one without opening it.
     #[must_use]
@@ -110,7 +110,7 @@ impl LibraryItem {
     }
 
     /// Does the stored proof still describe the file on disk? An entry
-    /// probed before D13 (proof `None` on either side) is always stale —
+    /// probed before (proof `None` on either side) is always stale —
     /// re-probe once rather than trust metadata of unknown vintage.
     pub fn proof_matches(&self, mtime: Option<u64>, size: Option<u64>) -> bool {
         match (self.mtime, self.size, mtime, size) {
@@ -122,7 +122,7 @@ impl LibraryItem {
     }
 
     /// The stored metadata back in probe shape — what `assess()` consumes
-    /// when the staleness proof still matches (D13: no re-probe needed).
+    /// when the staleness proof still matches : no re-probe needed).
     pub fn metadata(&self) -> VideoMetadata {
         VideoMetadata {
             width: self.width,
@@ -164,7 +164,7 @@ impl Library {
     }
 
     /// Insert a new entry, or refresh the existing one with the same
-    /// canonical path (design-m4 §4 dedupe): the id and `added_at` of the
+    /// canonical path (dedupe): the id and `added_at` of the
     /// existing entry survive, the metadata is replaced.
     pub fn add(&mut self, item: LibraryItem) -> AddOutcome {
         let key = dedupe_key(&item.path);
@@ -183,13 +183,13 @@ impl Library {
         AddOutcome::Added(item)
     }
 
-    /// "Remove from library" — edits the list only (AGENTS §3.3).
+    /// "Remove from library" — edits the list only.
     pub fn remove(&mut self, id: &str) -> Option<LibraryItem> {
         let index = self.items.iter().position(|item| item.id == id)?;
         Some(self.items.remove(index))
     }
 
-    /// Drop every entry whose path no longer exists (design-m4 §4).
+    /// Drop every entry whose path no longer exists.
     /// Returns how many were removed. The `exists` closure keeps this
     /// pure — tests pass a set, the daemon passes `Path::is_file`.
     pub fn prune(&mut self, exists: impl Fn(&str) -> bool) -> usize {
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn item_json_shape_is_the_documented_one() {
-        // ipc.md §3: the `items` array carries exactly these keys; a
+        // the `items` array carries exactly these keys; a
         // change here is a wire change.
         let text = serde_json::to_string(&item(r"C:\videos\a.mp4", "a1b2")).expect("serialize");
         for key in [
@@ -394,7 +394,7 @@ mod tests {
             assert!(text.contains(key), "missing {key} in {text}");
         }
         // The staleness proof is additive: unset fields are omitted from
-        // the wire (a pre-D13 library document has neither key).
+        // the wire (a pre- library document has neither key).
         assert!(!text.contains("mtime"), "{text}");
         assert!(!text.contains(r#""size""#), "{text}");
         assert!(text.contains(r#""hdr""#), "{text}");
@@ -414,7 +414,7 @@ mod tests {
         assert_eq!(back, library);
     }
 
-    /// D13: `mtime` + `size` decide whether a stored descriptor still
+    /// `mtime` + `size` decide whether a stored descriptor still
     /// describes the file on disk — the whole re-probe trigger, pure.
     #[test]
     fn staleness_proof_matches_only_when_both_numbers_are_the_same() {
@@ -427,13 +427,13 @@ mod tests {
         // Unreadable proof on either side is "stale", never "fresh".
         assert!(!proofed.proof_matches(None, Some(42_424_242)));
         assert!(!proofed.proof_matches(Some(1_700_000_123), None));
-        // A pre-D13 entry (no stored proof) re-probes once, then is stable.
+        // A pre- entry (no stored proof) re-probes once, then is stable.
         let legacy = item(r"C:\videos\b.mp4", "c3d4");
         assert!(!legacy.proof_matches(Some(1), Some(1)));
     }
 
     /// The stored entry round-trips back into probe shape for `assess()`
-    /// without touching the file (D13: probe-once).
+    /// without touching the file : probe-once).
     #[test]
     fn metadata_rebuilds_the_probe_result_from_the_stored_entry() {
         let mut stored = item(r"C:\videos\a.mp4", "a1b2");

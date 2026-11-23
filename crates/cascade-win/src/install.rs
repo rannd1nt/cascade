@@ -1,24 +1,23 @@
-//! `cascade install` / `cascade uninstall` (design-m4 §6, D2/D5/D11).
+//! `cascade install` / `cascade uninstall`.
 //!
 //! Install runs from wherever the exe currently is (Downloads, a USB stick,
 //! the build output) and:
 //!
 //! 1. copies itself to `%LOCALAPPDATA%\Cascade\cascade.exe`,
-//! 2. generates the `cascade.cmd` shim so `cascade ...` typed from PATH is
-//!    synchronous in PowerShell 5.1 (§6.4),
+//! 2. generates the `cascade.cmd` shim so `cascade...` typed from PATH is
+//!    synchronous in PowerShell 5.1,
 //! 3. appends the directory to the **user** `Path` (kind preserved) and
 //!    broadcasts `WM_SETTINGCHANGE`,
-//! 4. points the `Run` key at the installed copy,
-//!    creates per-user Start Menu and Desktop `Cascade.lnk` shortcuts
-//!    (design-m5-p4 §13 — the declared exception to §3.12), and registers
-//!    one per-user Installed-apps key (design-m5-p4 §14),
+//! 4. points the `Run` key at the installed copy, creates per-user Start Menu
+//!    and Desktop `Cascade.lnk` shortcuts, and registers one per-user
+//!    Installed-apps key,
 //! 5. starts the engine from the installed copy if none is running.
 //!
 //! `uninstall` reverses the steps and deletes only files this module
 //! created. Anything else in the data directory (`measurements/`, logs,
 //! user JSON without `--purge`) and any other shell link or registry key
 //! is left in place — Cascade never deletes what it cannot recognize as
-//! its own (AGENTS §3.3, §3.12).
+//! its own.
 
 use std::ffi::c_void;
 use std::fs;
@@ -47,17 +46,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::{control, registry, state, wide};
 
-/// The shipped binary name. AGENTS §3.14: the stem must stay exactly
+/// The shipped binary name: the stem must stay exactly
 /// `cascade` (7 chars) — renaming it requires a re-measurement first, so
 /// this assertion is a guard, not documentation.
 pub const EXE_NAME: &str = "cascade.exe";
-/// The generated PowerShell 5.1 shim (design-m4 §6.1 step 2).
+/// The generated PowerShell 5.1 shim (step 2).
 ///
 /// It lives in its own `bin\` subdirectory because a same-directory
 /// `cascade.exe` shadows it: PATHEXT tries `.EXE` before `.CMD`, so *that*
 /// directory — not the exe directory — is what goes on PATH (measured
 /// 2026-11-09, `probe-s6.ps1`: `Get-Command cascade` resolved to
-/// `cascade.exe`; see design-m4 §6.4 correction).
+/// `cascade.exe`; see correction).
 pub const SHIM_NAME: &str = "cascade.cmd";
 /// Subdirectory of the data dir holding only the shim; the PATH entry.
 pub const SHIM_DIR_NAME: &str = "bin";
@@ -66,23 +65,23 @@ const STALE_NAME: &str = "cascade.stale.exe";
 /// The PATH entry in its literal form; we detect both this and the
 /// expanded `%LOCALAPPDATA%`-resolved directory, case-insensitively.
 const PATH_LITERAL: &str = "%LOCALAPPDATA%\\Cascade\\bin";
-/// Per-user shell link created by install (design-m5-p4 §13 I3/I4). Only
+/// Per-user shell link created by install. Only
 /// this exact name in the two shell folders may be touched by uninstall.
 pub const SHORTCUT_NAME: &str = "Cascade.lnk";
 /// The shortcut is a thin launcher over the existing GUI CLI role
-/// (AGENTS §1: CLI first, tray and GUI are layers over the same paths).
+/// CLI first, tray and GUI are layers over the same paths).
 const SHORTCUT_ARGS: &str = "ui";
 const SHORTCUT_DESCRIPTION: &str = "Cascade library";
-/// The one per-user Apps-entry key this module owns (design-m5-p4 §14 I1).
+/// The one per-user Apps-entry key this module owns.
 /// Only this exact subkey may be deleted by uninstall.
 pub const APPS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Cascade";
 /// Display values written to the Apps entry. No invented company name:
-/// the project is published under its own name (design-m5-p4 §14 I2).
+/// the project is published under its own name.
 pub const APPS_DISPLAY_NAME: &str = "Cascade";
 pub const APPS_PUBLISHER: &str = "Cascade";
 
 /// The `%LOCALAPPDATA%\Cascade` directory, or `None` when the environment
-/// is unusable (AGENTS: no `unwrap()` in library code).
+/// is unusable : no `unwrap()` in library code).
 fn data_dir() -> Result<PathBuf, String> {
     state::data_dir()
         .ok_or_else(|| "cannot resolve %LOCALAPPDATA% (environment unusable)".to_string())
@@ -103,7 +102,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
         .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
-/// `true` when this process **is** the installed copy (design-m4 §6.2:
+/// `true` when this process **is** the installed copy :
 /// which bare-invocation behaviour applies, and whether the installed exe
 /// can be deleted outright or only deferred).
 pub fn is_installed_here() -> bool {
@@ -113,11 +112,11 @@ pub fn is_installed_here() -> bool {
     same_path(&current, &dest)
 }
 
-// ---------------------------------------------------------------------
+//
 // Pure helpers (unit-tested): PATH editing, shim content.
-// ---------------------------------------------------------------------
+//
 
-/// The `cascade.cmd` body (design-m4 §6.1 step 2). Pure ASCII on purpose:
+/// The `cascade.cmd` body (step 2). Pure ASCII on purpose:
 /// cmd.exe parses batch files in the OEM code page, so a non-ASCII username
 /// must never enter this file — `%LOCALAPPDATA%` expands when cmd *runs* it
 /// (cmd's own environment, always present on Windows 11).
@@ -141,7 +140,7 @@ pub fn shortcut_path(folder: &Path) -> PathBuf {
 }
 
 /// `true` only for the exact name we own — an unrelated `Cascade Notes.lnk`
-/// must never be removed by uninstall (design-m5-p4 §13 I5).
+/// must never be removed by uninstall.
 pub fn is_our_shortcut(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -151,13 +150,13 @@ pub fn is_our_shortcut(path: &Path) -> bool {
 /// The `UninstallString` (and `QuietUninstallString`) written to the Apps
 /// entry. `--quiet` selects the silent stdio strategy so Windows Settings,
 /// which launches us with no console, never flashes a terminal window
-/// (design-m5-p4 §14 I3/I4). Pure so the exact command is unit-tested.
+/// Pure so the exact command is unit-tested.
 pub fn uninstall_command(exe: &Path) -> String {
     format!("\"{}\" uninstall --quiet", exe.display())
 }
 
 /// The `DisplayIcon` value: the exe holds the Cascade icon at index 0
-/// (build.rs, AGENTS §3.14); Windows expects `<path>,0` for a PE resource.
+/// (build.rs); Windows expects `<path>,0` for a PE resource.
 pub fn display_icon(exe: &Path) -> String {
     format!("{},0", exe.display())
 }
@@ -236,11 +235,11 @@ fn shim_path(dir: &Path) -> PathBuf {
     shim_dir(dir).join(SHIM_NAME)
 }
 
-// ---------------------------------------------------------------------
+//
 // Win32 side effects.
-// ---------------------------------------------------------------------
+//
 
-/// Ask every top-level window to re-read the environment (design-m4 §6.1
+/// Ask every top-level window to re-read the environment (
 /// step 3) so newly launched processes see the PATH change. Non-fatal: a
 /// timeout only means some window ignored the message; the registry value
 /// is already correct and the next logon picks it up regardless.
@@ -266,9 +265,9 @@ fn broadcast_environment() {
     }
 }
 
-// ---------------------------------------------------------------------
-// Per-user shell links (design-m5-p4 §13).
-// ---------------------------------------------------------------------
+//
+// Per-user shell links.
+//
 
 /// A COM apartment for the short-lived shell operations in install and
 /// uninstall. `IShellLinkW` is an STA object; no COM call happens on this
@@ -344,7 +343,7 @@ fn make_shortcut(exe: &Path, folder: &Path) -> Result<PathBuf, String> {
         .map_err(|err| format!("create shell link: {}", err.message()))?;
     // SAFETY: every PCWSTR points at a NUL-terminated buffer that outlives
     // the call; IShellLinkW copies the strings into the link. Index 0 is
-    // the exe's embedded Cascade resource (build.rs, AGENTS §3.14).
+    // the exe's embedded Cascade resource (build.rs).
     unsafe {
         link.SetPath(PCWSTR::from_raw(target.as_ptr()))
             .map_err(|err| format!("shortcut SetPath: {}", err.message()))?;
@@ -411,17 +410,17 @@ fn remove_shortcuts() -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------
-// Per-user "Installed apps" entry (design-m5-p4 §14).
-// ---------------------------------------------------------------------
+//
+// Per-user "Installed apps" entry.
+//
 
 /// Create/refresh Cascade's one Apps entry from the installed exe.
 ///
 /// Only `APPS_KEY` is touched; another application's `Uninstall` subkey is
-/// never enumerated or modified (AGENTS §3.12). Values mirror the real
+/// never enumerated or modified. Values mirror the real
 /// install: version comes from this crate's manifest, size from the exe on
 /// disk (so a reinstall corrects a stale number), and the removal command
-/// points at the same CLI path that S2b V5 already verified.
+/// points at the same CLI path that already verified.
 pub fn write_apps_entry(exe: &Path, dir: &Path) -> Result<(), String> {
     registry::create_key(APPS_KEY).map_err(|rc| format!("Apps entry: create key failed ({rc})"))?;
 
@@ -469,7 +468,7 @@ fn read_path() -> (u32, String) {
 }
 
 /// Poll `condition` every 200 ms until it holds or `timeout` passes.
-/// AGENTS §7: never sleep-and-hope — bounded polling with a deadline.
+/// never sleep-and-hope — bounded polling with a deadline.
 fn wait_for(condition: impl Fn() -> bool, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -483,8 +482,8 @@ fn wait_for(condition: impl Fn() -> bool, timeout: Duration) -> bool {
     }
 }
 
-/// Ask a running daemon to exit through its ladder (repaint first, AGENTS
-/// §3.1) and wait for its control window to disappear — the window
+/// Ask a running daemon to exit through its ladder (repaint first,
+/// and wait for its control window to disappear — the window
 /// existing is exactly "the daemon is alive".
 pub fn stop_engine() -> Result<(), String> {
     if let Some(hwnd) = control::find_existing() {
@@ -525,7 +524,7 @@ fn start_engine(exe: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The D5 double-click prompt (design-m4 §6.2). Anything but an explicit
+/// The double-click prompt. Anything but an explicit
 /// Yes (including a MessageBox failure) returns `false` — never installs
 /// without consent.
 pub fn confirm_install() -> bool {
@@ -548,11 +547,11 @@ pub fn confirm_install() -> bool {
     answer == IDYES
 }
 
-// ---------------------------------------------------------------------
+//
 // Install / uninstall.
-// ---------------------------------------------------------------------
+//
 
-/// Run the design-m4 §6.1 install steps, printing each one.
+/// Run the install steps, printing each one.
 ///
 /// Failure at any step leaves a truthful partial state: files land before
 /// PATH/autostart, and `uninstall` reverses any subset.
@@ -560,7 +559,7 @@ pub fn install_from(source: &Path) -> Result<(), String> {
     let dir = data_dir()?;
     let dest_exe = dir.join(EXE_NAME);
 
-    // Leftovers an earlier deferred delete could not finish (§6.1
+    // Leftovers an earlier deferred delete could not finish (
     // fallback): the renamed image and helper scripts in `%TEMP%`.
     sweep_leftovers(&dir);
 
@@ -579,7 +578,7 @@ pub fn install_from(source: &Path) -> Result<(), String> {
         println!("Installed to {}", dest_exe.display());
     }
 
-    // Step 2: the PowerShell 5.1 shim (D11), always rewritten. It sits in
+    // Step 2: the PowerShell 5.1 shim, always rewritten. It sits in
     // `bin\` so no same-directory exe can shadow it (PATHEXT order).
     let bin = shim_dir(&dir);
     fs::create_dir_all(&bin).map_err(|err| format!("create {}: {err}", bin.display()))?;
@@ -625,11 +624,11 @@ pub fn install_from(source: &Path) -> Result<(), String> {
         .map_err(|rc| format!("autostart: registry write failed ({rc})"))?;
     println!("Autostart: on.");
 
-    // Step 4b (design-m5-p4 §13 I4): discoverable from Start search and
+    // Step 4b: discoverable from Start search and
     // the Desktop, both per-user and both pointing at `cascade.exe ui`.
     install_shortcuts(&dest_exe)?;
 
-    // Step 4c (design-m5-p4 §14 I5): visible in Settings → Installed apps
+    // Step 4c: visible in Settings → Installed apps
     // with a GUI uninstall path. Written after the exe exists so the size
     // and command point at a real file.
     write_apps_entry(&dest_exe, &dir)?;
@@ -646,7 +645,7 @@ pub fn install_from(source: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Reverse the install (design-m4 §6.1), printing each step. Deletes only
+/// Reverse the install, printing each step. Deletes only
 /// files Cascade itself created; every other file in the data directory is
 /// reported as left in place.
 pub fn uninstall(purge: bool) -> Result<(), String> {
@@ -668,10 +667,10 @@ pub fn uninstall(purge: bool) -> Result<(), String> {
         .map_err(|rc| format!("autostart: registry delete failed ({rc})"))?;
     println!("Autostart: off.");
 
-    // 2b (design-m5-p4 §13 I5): remove exactly our two shell links.
+    // 2b: remove exactly our two shell links.
     remove_shortcuts()?;
 
-    // 2c (design-m5-p4 §14 I5): drop the Apps entry while the installed
+    // 2c: drop the Apps entry while the installed
     // exe still exists, so Windows never advertises a removal command
     // pointing at a file we have already renamed/deleted.
     remove_apps_entry()?;
@@ -780,7 +779,7 @@ fn remove_now_or_defer(path: &Path, deferred: &mut Vec<PathBuf>) {
 /// A hidden `cmd` runs this helper in `%TEMP%`: wait for this process to
 /// exit, remove the queued paths, remove the helper itself, then drop the
 /// data directory if it ended up empty. Only ever names Cascade's own
-/// files (AGENTS §3.12).
+/// files.
 fn schedule_delete(paths: &[PathBuf], dirs: &[PathBuf]) -> Result<(), String> {
     let bat = std::env::temp_dir().join(format!("cascade-cleanup-{}.bat", std::process::id()));
     let mut script = String::from("@echo off\r\nping -n 3 127.0.0.1 >nul\r\n");
@@ -836,7 +835,7 @@ mod tests {
 
     #[test]
     fn shim_is_exact_ascii_and_uses_runtime_expansion() {
-        // D11: cmd waits for this GUI child; AGENTS §3.14: stem stays 7.
+        // cmd waits for this GUI child;: stem stays 7.
         assert_eq!(
             shim_content(),
             "@echo off\r\n\"%LOCALAPPDATA%\\Cascade\\cascade.exe\" %*\r\n"

@@ -5,7 +5,7 @@
 //! `Progman`, z-ordered between `SHELLDLL_DefView` and the wallpaper `WorkerW`.
 //!
 //! Slice 1 paints a solid colour; the media backend replaces the painted
-//! content in M2 without changing this contract.
+//! content in without changing this contract.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -192,7 +192,7 @@ pub struct Host {
     windows: Vec<HostWindow>,
     surface: ShellSurface,
     /// The solid background, kept so a failed video attach can bring the
-    /// colour back (ownership table, design-m2 §4).
+    /// colour back (ownership table).
     color: COLORREF,
 }
 
@@ -283,7 +283,7 @@ unsafe extern "system" fn host_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // `[wd]` probes (M4 S7 diagnosis): does the shell's kill of our parent
+    // `[wd]` probes (diagnosis): does the shell's kill of our parent
     // reach this wndproc as WM_DESTROY/WM_NCDESTROY? The render loop pumps
     // every wake (daemon.rs message drain), so "no line here" means the
     // message was never sent, not that it was never dispatched. Unbuffered.
@@ -458,7 +458,7 @@ fn monitor_rect_in_parent(surface: &ShellSurface, rect: Rect) -> (i32, i32, i32,
 ///
 /// On the raised desktop the system wallpaper is a sibling `WorkerW` *above*
 /// any child window, so creating the window is not enough: the z-order has to
-/// be fixed explicitly. `SetWindowPos(a, b, ..)` places `a` directly behind
+/// be fixed explicitly. `SetWindowPos(a, b,..)` places `a` directly behind
 /// `b`, which is why the wallpaper is moved behind the lowest host window.
 fn restack(surface: &ShellSurface, windows: &[HostWindow]) {
     if surface.mode != DesktopMode::LayeredProgmanChild || windows.is_empty() {
@@ -607,10 +607,10 @@ impl Host {
     }
 
     /// Give up DXGI ownership of every host client area so the media engine
-    /// can draw into it (gate variant A, design-m2 §4). `HostState.presented`
+    /// can draw into it (gate variant A). `HostState.presented`
     /// stays `true`, so `WM_PAINT` keeps its hands off and the last
     /// presented pixels (the solid colour) remain visible until the engine
-    /// draws — the desktop is never blank (AGENTS §3.1).
+    /// draws — the desktop is never blank.
     pub fn release_presenter(&mut self) {
         for window in &mut self.windows {
             // Dropped while the HWND is still alive (HostWindow::presenter).
@@ -619,7 +619,7 @@ impl Host {
     }
 
     /// Recreate the swap chain after a video attach failed (ownership table,
-    /// design-m2 §4): the client area goes back to the solid colour.
+    /// the client area goes back to the solid colour.
     pub fn restore_presenter(&mut self) {
         for window in &mut self.windows {
             if window.presenter.is_some() {
@@ -640,7 +640,7 @@ impl Host {
                         window.monitor.id
                     );
                     // No swap chain means GDI must paint the colour, or the
-                    // window would show whatever DWM last had (AGENTS §3.1).
+                    // window would show whatever DWM last had.
                     set_presented(window.hwnd, false);
                 }
             }

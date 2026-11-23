@@ -1,10 +1,10 @@
 //! Pure fit math: where a video frame lands inside the host surface
-//! (`design-p1-color.md` §4.5.1, `quality.md` §4.7 — never distort).
+//! (never distort).
 //!
 //! One function, no Win32 state: the D3D11 video processor consumes the
 //! returned rects as stream source/destination rectangles. `Contain` is the
 //! only mode the daemon requests today (`PlaybackOptions::default()`); the
-//! other two are implemented and unit-tested for completeness (design §4.3).
+//! other two are implemented and unit-tested for completeness.
 
 use cascade_core::Fit;
 use windows::Win32::Foundation::RECT;
@@ -27,7 +27,7 @@ pub(crate) fn fit_rects(fit: Fit, video: (u32, u32), surface: (u32, u32)) -> (RE
         Fit::Stretch => (full(vw, vh), full(sw, sh)),
         Fit::Contain => {
             // Integer cross-multiplication avoids float rounding drift:
-            // vw/vh <= sw/sh  <=>  vw*sh <= vh*sw  → height-limited.
+            // vw/vh <= sw/sh <=> vw*sh <= vh*sw → height-limited.
             let (dw, dh) = if i64::from(vw) * i64::from(sh) <= i64::from(vh) * i64::from(sw) {
                 // Height-limited: full height, width = ceil(vw*sh/vh).
                 (ceil_div(vw, sh, vh).min(sw).max(1), sh)

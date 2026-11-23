@@ -78,7 +78,7 @@ impl std::error::Error for PresenterError {}
 
 /// One D3D11 device and one swap chain bound to one host window.
 ///
-/// The device is private to the window for now. M2 will hoist it into a shared
+/// The device is private to the window for now. will hoist it into a shared
 /// context once several windows and the decoder have to agree on one device.
 pub struct Presenter {
     #[allow(dead_code)]

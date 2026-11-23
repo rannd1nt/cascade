@@ -1,5 +1,5 @@
-//! `DeviceProfile` collection for `cascade doctor` and the S5 `assess()`
-//! (design-m4 §5.1).
+//! `DeviceProfile` collection for `cascade doctor` and the `assess()`
+//!
 //!
 //! Every collector is best-effort: an unreadable value becomes `None` (or an
 //! absent list entry), never an error — `doctor` must print something on
@@ -50,7 +50,7 @@ use crate::registry;
 use crate::wide;
 
 /// Display adapter class key (`HKLM\SYSTEM\...\Control\Class\{4d36e968-...}`),
-/// opened read-only (design-m4 §5.1). `DriverVersion` exists there on this
+/// opened read-only. `DriverVersion` exists there on this
 /// machine (measured: `30.0.101.1960`, 2026-11-08); when it does not, the
 /// version stays `None` instead of being guessed.
 const DISPLAY_CLASS_KEY: &str =
@@ -70,9 +70,10 @@ pub fn collect() -> DeviceProfile {
 
 /// The monitor an assessment targets: the requested id, else the primary,
 /// else the first row. A named monitor that does not exist gets the same
-/// `not_found` wording `set` uses (design-m4 §5.4: assess per monitor).
-/// Shared by the daemon and the offline `library.add` (design-m5b §3.4 —
-/// moved here from `daemon.rs` so both paths pick the same monitor).
+/// `not_found` wording `set` uses.
+///
+/// Shared by the daemon and the offline `library.add` so both paths pick
+/// the same monitor.
 pub fn pick_monitor<'a>(
     device: &'a DeviceProfile,
     requested: Option<&str>,
@@ -92,7 +93,7 @@ pub fn pick_monitor<'a>(
         .ok_or_else(|| "no display is attached to this session".to_string())
 }
 
-// --- monitors -----------------------------------------------------------------
+// monitors -----------------------------------------------------------------
 
 /// DXGI per-output extras, keyed by device name (`\\.\DISPLAY1`).
 struct OutputExtras {
@@ -203,7 +204,7 @@ fn color_space_label(color_space: DXGI_COLOR_SPACE_TYPE) -> &'static str {
     }
 }
 
-// --- GPU ----------------------------------------------------------------------
+// GPU ----------------------------------------------------------------------
 
 /// Hardware DXGI adapters (software/GPU-preference mirrors are skipped) with
 /// their driver version matched from the display class key by `DriverDesc`.
@@ -262,7 +263,7 @@ fn display_drivers() -> Vec<(String, String)> {
         .collect()
 }
 
-// --- CPU / RAM ----------------------------------------------------------------
+// CPU / RAM ----------------------------------------------------------------
 
 /// CPU name from the registry; physical cores from
 /// `GetLogicalProcessorInformationEx(RelationProcessorCore)` (one record per
@@ -335,7 +336,7 @@ fn ram() -> Option<RamInfo> {
     })
 }
 
-// --- decode capability --------------------------------------------------------
+// decode capability --------------------------------------------------------
 
 /// Enumerate hardware video-decoder MFTs and their advertised input types,
 /// unioned with the GPU's D3D11 decoder profiles.
@@ -344,7 +345,7 @@ fn ram() -> Option<RamInfo> {
 /// "unavailable"); `Some` with an empty `decoders` vector means MF ran fine
 /// and the machine has no hardware decoder MFT. The D3D11 query runs first
 /// and independently — it is the source that stays representative on
-/// machines where vendors register no decoder MFT at all (see
+/// machines where vendors register no decoder MFT at all (
 /// `DecodeCapability`'s doc for the measured case).
 fn decode() -> Option<DecodeCapability> {
     let gpu_codecs = gpu_decode_codecs();
@@ -367,7 +368,7 @@ fn decode() -> Option<DecodeCapability> {
     if let Some(capability) = capability.as_mut() {
         capability.gpu_codecs = gpu_codecs;
     }
-    // Shutdown order: MF first, then COM (design-m2 §3.3).
+    // Shutdown order: MF first, then COM.
     let _ = unsafe { MFShutdown() };
     if com_owned {
         // SAFETY: balances the successful CoInitializeEx above.
@@ -379,7 +380,7 @@ fn decode() -> Option<DecodeCapability> {
 /// Codec families every hardware DXGI adapter reports through the documented
 /// `ID3D11VideoDevice::GetVideoDecoderProfile` API — vendor-generic (Intel,
 /// NVIDIA, AMD, APU alike), unlike the Media Foundation hardware-MFT flag,
-/// which vendors may not populate for decoders they still accelerate (see
+/// which vendors may not populate for decoders they still accelerate (
 /// `DecodeCapability`'s doc). Deduplicated and sorted across adapters.
 fn gpu_decode_codecs() -> Vec<String> {
     let mut codecs = std::collections::BTreeSet::new();

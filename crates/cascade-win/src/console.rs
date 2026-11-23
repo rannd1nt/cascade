@@ -3,16 +3,16 @@
 //! `cascade.exe` is linked as a GUI-subsystem executable: launching it must
 //! never create a console window. A console-subsystem build was measured to
 //! flash a Terminal window and steal focus for ~100 ms on every Run-key start
-//! (see `docs/spike-m0.md`, "M1-F corrections"), which fails M1-F.
+//! (see, " corrections"), which fails.
 //!
 //! The CLI still has to print, so `main` prepares stdio per role:
 //!
-//! | role                                | stdio                                  |
+//! | role | stdio |
 //! |-------------------------------------|----------------------------------------|
-//! | std handles already valid           | untouched (pipes, files, redirection)  |
+//! | std handles already valid | untouched (pipes, files, redirection) |
 //! | an existing console (parent or own) | joined; NULL handles reopened on `CONOUT$` |
-//! | CLI without any console (double-click) | `AllocConsole`, then `CONOUT$`       |
-//! | daemon without a console            | `NUL` sink — never a window            |
+//! | CLI without any console (double-click) | `AllocConsole`, then `CONOUT$` |
+//! | daemon without a console | `NUL` sink — never a window |
 //!
 //! Joining a console never creates a window: that console already exists.
 //! Only the explicit `AllocConsole` for a double-clicked CLI does, which is
@@ -150,7 +150,7 @@ fn stdio_valid() -> bool {
 ///
 /// May attach to the parent console as a side effect — joining never creates
 /// a window (see the module docs). Used by the bare-invocation flow
-/// (design-m4 §6.2) *before* [`prepare_stdio`] decides whether to allocate
+/// *before* [`prepare_stdio`] decides whether to allocate
 /// one, so a double-click is distinguishable from a typed command.
 pub fn have_console() -> bool {
     if stdio_valid() {
