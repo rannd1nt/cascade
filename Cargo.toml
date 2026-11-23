@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.0-alpha.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-only"
 rust-version = "1.80"
 
 [workspace.dependencies]
@@ -20,7 +20,8 @@ cascade-win = { path = "crates/cascade-win" }
 cascade-media = { path = "crates/cascade-media" }
 cascade-ui = { path = "crates/cascade-ui" }
 # design-m5 D11 (AGENTS §11 license check): first GUI framework. MIT OR
-# Apache-2.0, no GPL/LGPL. glow renderer (D5) + bundled fonts only; the
+# Apache-2.0, no third-party GPL/LGPL (Cascade itself is GPL-3.0-only).
+# glow renderer (D5) + bundled fonts only; the
 # default wgpu/wayland/x11/accesskit/clipboard features are not wanted.
 # "persistence" restores the window size across launches (design-m5 D4)
 # into %APPDATA%\Cascade\data\app.ron — inside our own data directory.
