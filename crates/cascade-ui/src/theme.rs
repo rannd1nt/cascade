@@ -15,12 +15,64 @@ pub const TEXT: egui::Color32 = egui::Color32::from_rgb(0xFA, 0xFA, 0xFA);
 pub const MUTED: egui::Color32 = egui::Color32::from_rgb(0x9A, 0x9A, 0xA3);
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x5D, 0x5F, 0xEF);
 pub const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(0x4F, 0x51, 0xD6);
+/// Tinted row behind the active sidebar tab — not a button fill.
+pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0x22, 0x24, 0x4A);
 
-// Status colours for the strip dot (UI-only; the daemon never sends
-// colours — `status.mode` is a plain string, ipc.md §4).
-pub const OK: egui::Color32 = egui::Color32::from_rgb(0x4C, 0xC7, 0x72);
+// Status colours for notices (UI-only; the daemon never sends colours —
+// `status.mode` is a plain string, ipc.md §4).
 pub const WARN: egui::Color32 = egui::Color32::from_rgb(0xE0, 0xA0, 0x3C);
 pub const ERR: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x5C, 0x5C);
+
+/// Install OS font fallbacks so titles outside ASCII (Japanese, Chinese,
+/// Korean, and other non-Latin scripts) render instead of showing tofu
+/// boxes. egui's bundled font only covers Latin + Cyrillic; the fallback
+/// list is appended *after* it, so Latin text keeps its current look and
+/// the system face is used only when a glyph is missing (§16 refinement).
+///
+/// Files come from `%WINDIR%\Fonts` via `std` path probing only — no font
+/// is bundled with the binary, no new dependency, and no `cascade-win`
+/// code in the UI process. A missing file is simply skipped; the app
+/// still runs with egui's default font if no CJK face is installed.
+pub fn install_system_fonts(ctx: &egui::Context) {
+    use egui::epaint::text::{FontData, FontFamily, FontInsert, FontPriority, InsertFontFamily};
+
+    let fonts_dir = std::env::var_os("WINDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("Fonts");
+
+    // Broad CJK (YaHei) first, then Japanese (Yu Gothic) and Korean
+    // (Malgun Gothic). `Lowest` makes each a fallback rather than
+    // replacing the primary Latin face.
+    let candidates: &[(&str, &str)] = &[
+        ("cascade-cjk-yahei", "msyh.ttc"),
+        ("cascade-cjk-yugoth", "YuGothM.ttc"),
+        ("cascade-cjk-malgun", "malgun.ttf"),
+    ];
+    let families = || {
+        vec![
+            InsertFontFamily {
+                family: FontFamily::Proportional,
+                priority: FontPriority::Lowest,
+            },
+            InsertFontFamily {
+                family: FontFamily::Monospace,
+                priority: FontPriority::Lowest,
+            },
+        ]
+    };
+
+    for &(name, file) in candidates {
+        let Ok(bytes) = std::fs::read(fonts_dir.join(file)) else {
+            continue;
+        };
+        ctx.add_font(FontInsert::new(
+            name,
+            FontData::from_owned(bytes),
+            families(),
+        ));
+    }
+}
 
 /// Install the palette on the egui context — called once before the
 /// first frame (design-m5 §5.1).

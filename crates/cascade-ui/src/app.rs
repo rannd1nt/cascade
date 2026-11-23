@@ -1,5 +1,5 @@
-//! The library window: connection state, numbered library list, the
-//! Settings surface and the status strip (design-m5 §5). Request traffic
+//! The library window: connection state, numbered library grid, the
+//! Settings surface (design-m5 §5). Request traffic
 //! runs on one worker thread (D11c) — the UI thread only sends commands
 //! and drains replies, so a wedged or absent daemon can never freeze a
 //! frame. The persistent event subscription runs on a second thread beside
@@ -18,14 +18,14 @@ use cascade_core::ipc::{
 };
 use cascade_core::library::LibraryItem;
 use cascade_core::rule_engine::{BatteryAction, PauseSettings, PowerProfile};
-use cascade_core::PresentationMode;
+use cascade_core::{PresentationMode, Rect};
 use eframe::egui::{self, vec2};
 
 use crate::theme;
 use crate::thumbs::{self, TextureLru, ThumbDone, ThumbReq};
 
-/// Refresh cadence while the window draws (design-m5 §8: the strip polls
-/// `status` every 1 s, never faster — AGENTS §13).
+/// Refresh cadence while the window draws (design-m5 §8: status/settings
+/// are polled every 1 s, never faster — AGENTS §13).
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// While the engine is down every poll pays the connect budget
 /// (3 × 250 ms, `ipc.md` §7) inside the worker, so poll at half rate.
@@ -35,19 +35,25 @@ const POLL_INTERVAL_DISCONNECTED: Duration = Duration::from_secs(2);
 const EVENT_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const EVENT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-/// Library grid geometry (design-m5-p4 §11.4): the on-screen tile is
-/// 160×90 pt under a 320×180 texture (2× the tile, sharp at 100–200 %
-/// DPI — AGENTS §1). The row adds the ordinal/title line (15 pt) and
-/// the meta line (13 pt): 90 + 4 + 15 + 2 + 13 = 124.
-const TILE_W: f32 = 160.0;
-const THUMB_H: f32 = 90.0;
-const ROW_H: f32 = 124.0;
-/// Height reserved under the grid for the separator + action row: the
-/// buttons sit **below** the grid (`design-m5.md` §5 sketch), so the
-/// grid must never grow into their space.
-const BOTTOM_H: f32 = 56.0;
+/// Library grid geometry (§16 UI refinement): a 256×144 pt thumbnail
+/// (16:9), then a wrapping title and a wrapping metadata line laid out
+/// naturally so the gap between them is only `TEXT_GAP`. The cached
+/// texture stays 320×180; the media/cache path is untouched here.
+const TILE_W: f32 = 256.0;
+const THUMB_H: f32 = 144.0;
+/// Room for two wrapped lines of title + two of meta plus the small gap.
+const TEXT_H: f32 = 72.0;
+const TEXT_GAP: f32 = 4.0;
+const ROW_H: f32 = THUMB_H + 6.0 + TEXT_H; // 222
 /// Smallest grid the window still shows at its 640×400 floor.
 const MIN_GRID_H: f32 = 90.0;
+/// Action row: a compact left-aligned Add + icon-only search toggle, and
+/// a revealed search field immediately beside the toggle at the same box height.
+const SEARCH_W: f32 = 240.0;
+const ADD_W: f32 = 104.0;
+const ACTION_H: f32 = 30.0;
+const INFO_SIZE: f32 = 22.0;
+const SIDEBAR_ITEM_H: f32 = 44.0;
 
 /// Commands UI → worker. The worker runs them strictly in order, so at
 /// most one `Poll` is ever in flight (`poll_outstanding`) and replies
@@ -60,8 +66,9 @@ enum Cmd {
     },
     Add(Vec<String>),
     Remove(String),
-    Set(String),
-    Resume,
+    /// Library id plus the UI-local target monitor (`None` = daemon default).
+    /// The monitor travels in the existing `SetData.monitor` field (S4 S6).
+    Set(String, Option<String>),
     StartEngine,
     /// One settings write. The daemon answers with the full `Settings`
     /// payload; an engine-mode change additionally respawns *after* the
@@ -110,12 +117,25 @@ enum Conn {
     Unreachable(String),
 }
 
-/// The two surfaces implemented so far (design-m5 §5). Monitors belongs to
-/// S4 — it is only shown when >1 monitor exists.
+/// The surfaces implemented so far (design-m5 §5). Monitors is only shown
+/// when >1 monitor exists (S4 S1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Library,
     Settings,
+    Monitors,
+}
+
+impl Tab {
+    /// A display change can take the second monitor away while the surface
+    /// is open. Fall back to Library rather than leaving a dead tab (S4 S2).
+    fn normalize(self, monitor_count: usize) -> Self {
+        if self == Self::Monitors && monitor_count <= 1 {
+            Self::Library
+        } else {
+            self
+        }
+    }
 }
 
 /// Editable copy of the wire settings. `volume` is the live slider value —
@@ -247,6 +267,10 @@ pub struct CascadeApp {
     library_resync: bool,
     /// Search box text: client-side filter over title + path (D6).
     search: String,
+    /// Whether the search field is currently revealed. The icon-only
+    /// button toggles it; a click anywhere else (empty space, a tile)
+    /// hides it and clears the query (§16 refinement).
+    search_open: bool,
     /// Thumb requests (UI → worker); `None` when no thread runs — the
     /// spawn failed, or the worker exited (T6).
     thumb_tx: Option<Sender<ThumbReq>>,
@@ -263,8 +287,12 @@ pub struct CascadeApp {
     /// The orphan prune already ran after the first successful list
     /// reply (T11) — never from an error path.
     pruned: bool,
-    /// Which surface the sidebar shows (design-m5-p4 §15 S1).
+    /// Which surface the sidebar shows (design-m5-p4 §15 S1, §18 S1).
     tab: Tab,
+    /// UI-local target monitor for the next `Set as wallpaper` (§18 S5).
+    /// `None` keeps the daemon's primary→first fallback; this is not a
+    /// persisted setting and never starts the engine by itself.
+    target_monitor: Option<String>,
     /// Draft settings, synced from the wire only while no write is in
     /// flight (S6).
     form: SettingsForm,
@@ -344,6 +372,7 @@ impl CascadeApp {
             events_live: false,
             library_resync: false,
             search: String::new(),
+            search_open: false,
             thumb_tx,
             thumb_rx,
             thumb_pending: HashSet::new(),
@@ -351,6 +380,7 @@ impl CascadeApp {
             textures: TextureLru::new(thumbs::LRU_LIMIT),
             pruned: false,
             tab: Tab::Library,
+            target_monitor: None,
             form: SettingsForm::from_wire(&Settings::default(), false),
             settings_pending: false,
             dirty: false,
@@ -552,11 +582,21 @@ impl CascadeApp {
                 match status {
                     Ok(status) => {
                         self.conn = Conn::Connected;
+                        // A display change can remove the second monitor or
+                        // the chosen target (§18 S2/S5). Both are resolved
+                        // from the wire snapshot, never guessed locally.
+                        self.tab = self.tab.normalize(status.monitors.len());
+                        if retain_target(&mut self.target_monitor, &status) {
+                            self.notice = Some(
+                                "target monitor is no longer attached \u{2014} using the daemon default"
+                                    .to_string(),
+                            );
+                        }
                         self.status = Some(status);
                     }
                     Err(ClientError::NotRunning) => {
                         // The engine is down: forget everything it owned
-                        // so no stale list, strip values, or thumbnail
+                        // so no stale list, status values, or thumbnail
                         // textures linger.
                         self.conn = Conn::NotRunning;
                         self.status = None;
@@ -664,7 +704,7 @@ impl CascadeApp {
                         self.notice = Some(err.to_string());
                     }
                 }
-                // The write changed state (or failed): refresh the strip,
+                // The write changed state (or failed): refresh status,
                 // the conflict warning and the autostart oracle at once.
                 self.request_poll_now();
             }
@@ -711,7 +751,7 @@ impl CascadeApp {
     /// than trusting a payload it does not understand.
     fn apply_event(&mut self, event: Event) {
         match event.event.as_str() {
-            // Mode/pause/applied-video changed: refresh the strip. The
+            // Mode/pause/applied-video changed: refresh status. The
             // scheduled poll would do it within 1 s anyway — this makes
             // it immediate (design-m5-p4 §5).
             "state" => self.request_poll_now(),
@@ -818,79 +858,36 @@ impl CascadeApp {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(12.0);
-        ui.label(egui::RichText::new("Cascade").strong().size(18.0));
-        ui.add_space(14.0);
-        // Two of the four reserved surfaces exist; Monitors is S4 (only
-        // meaningful with >1 monitor) — design-m5-p4 §15 S1.
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Cascade").strong().size(20.0));
+        ui.add_space(18.0);
+        // Three of the four reserved surfaces exist. Monitors only makes
+        // sense with >1 monitor (§18 S1); the count comes from `status`,
+        // never from a captured machine id.
+        // Full-width nav rows, not buttons: the active row gets a tint and
+        // a left accent bar, hover only a faint fill (§16 refinement).
         let tab = self.tab;
-        if ui
-            .selectable_label(tab == Tab::Library, "Library")
-            .clicked()
-        {
+        if sidebar_nav_item(ui, "Library", tab == Tab::Library) {
             self.tab = Tab::Library;
         }
-        if ui
-            .selectable_label(tab == Tab::Settings, "Settings")
-            .clicked()
-        {
+        ui.add_space(4.0);
+        if sidebar_nav_item(ui, "Settings", tab == Tab::Settings) {
             self.tab = Tab::Settings;
+        }
+        let monitor_count = self
+            .status
+            .as_ref()
+            .map_or(0, |status| status.monitors.len());
+        if monitor_count > 1 {
+            ui.add_space(4.0);
+            if sidebar_nav_item(ui, "Monitors", tab == Tab::Monitors) {
+                self.tab = Tab::Monitors;
+            }
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             theme::muted(ui, concat!("cascade ", env!("CARGO_PKG_VERSION")));
             ui.add_space(8.0);
         });
-    }
-
-    fn strip(&mut self, ui: &mut egui::Ui) {
-        let mut resume = false;
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            let (color, mode) = match &self.status {
-                Some(status) => (mode_color(&status.mode), status.mode.clone()),
-                None => (theme::MUTED, "offline".to_string()),
-            };
-            ui.colored_label(color, "\u{2022}");
-            ui.label(mode);
-            if let Some(status) = &self.status {
-                if !status.paused_reasons.is_empty() {
-                    let label = format!(
-                        "Paused: {} (click to resume)",
-                        status.paused_reasons.join(", ")
-                    );
-                    if ui.small_button(label).clicked() {
-                        resume = true;
-                    }
-                }
-            }
-            ui.separator();
-            ui.label(match &self.settings {
-                Some(settings) => settings.engine_mode.as_str().to_string(),
-                None => "\u{2014}".to_string(),
-            });
-            ui.separator();
-            let fps = self
-                .status
-                .as_ref()
-                .and_then(|status| status.monitors.iter().find_map(|monitor| monitor.fps));
-            ui.label(match fps {
-                Some(fps) => format!("{fps:.0} fps"),
-                None => "\u{2014} fps".to_string(),
-            });
-            ui.separator();
-            ui.label(match &self.status {
-                Some(status) => format!("{} MB", status.memory.working_set_mb),
-                None => "\u{2014} MB".to_string(),
-            });
-            ui.separator();
-            ui.label(match &self.settings {
-                Some(settings) => format!("vol {}", settings.volume),
-                None => "vol \u{2014}".to_string(),
-            });
-        });
-        if resume {
-            self.send(Cmd::Resume);
-        }
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
@@ -910,6 +907,7 @@ impl CascadeApp {
             Conn::Connected => match self.tab {
                 Tab::Library => self.library_screen(ui),
                 Tab::Settings => self.settings_screen(ui),
+                Tab::Monitors => self.monitor_screen(ui),
             },
         }
     }
@@ -948,6 +946,116 @@ impl CascadeApp {
                 self.request_poll_now();
             }
         });
+    }
+
+    /// The Monitors surface (design-m5-p4 §18). Read-only except for two
+    /// actions that reuse existing wire commands: choosing the target for
+    /// the next Set (a UI-local value sent in `SetData.monitor`) and
+    /// re-targeting the current video with `wallpaper.set --monitor`.
+    fn monitor_screen(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Monitors").size(20.0).strong());
+        ui.add_space(6.0);
+        theme::muted(
+            ui,
+            "Cascade plays one video on one target monitor. Choose where the next \
+             \"Set as wallpaper\" should appear, or use Play here to move the current video.",
+        );
+        ui.add_space(12.0);
+
+        let Some(status) = self.status.clone() else {
+            theme::muted(ui, "Monitor information is unavailable.");
+            return;
+        };
+        let source_id = self.selected.clone().or_else(|| active_source_id(&status));
+        let mut choose_target: Option<Option<String>> = None;
+        let mut play_here: Option<String> = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if ui
+                .radio(
+                    self.target_monitor.is_none(),
+                    "Daemon default (primary monitor)",
+                )
+                .clicked()
+            {
+                choose_target = Some(None);
+            }
+            theme::muted(
+                ui,
+                "No monitor id is invented by the UI; the daemon picks primary, then first.",
+            );
+            ui.add_space(12.0);
+
+            for monitor in &status.monitors {
+                let is_target = self.target_monitor.as_deref() == Some(monitor.id.as_str());
+                ui.horizontal_wrapped(|ui| {
+                    if ui.radio(is_target, monitor.id.as_str()).clicked() {
+                        choose_target = Some(Some(monitor.id.clone()));
+                    }
+                    if monitor.primary {
+                        ui.label(egui::RichText::new("PRIMARY").small().color(theme::ACCENT));
+                    }
+                    theme::muted(ui, &format_monitor_rect(&monitor.rect));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(24.0);
+                    if let Some(source) = &monitor.source {
+                        theme::muted(
+                            ui,
+                            &format!(
+                                "playing: {} \u{b7} {} \u{b7} {}",
+                                source.title,
+                                monitor.video.map_or_else(
+                                    || "unknown size".to_string(),
+                                    |v| format!("{}x{}", v.w, v.h)
+                                ),
+                                monitor.fps.map_or_else(
+                                    || "fps unknown".to_string(),
+                                    |fps| format!("{fps:.0} fps")
+                                )
+                            ),
+                        );
+                    } else {
+                        theme::muted(ui, "idle");
+                    }
+                    if let Some(hwdec) = monitor.hwdec {
+                        theme::muted(
+                            ui,
+                            if hwdec {
+                                "(hardware decode)"
+                            } else {
+                                "(software decode)"
+                            },
+                        );
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    let button =
+                        ui.add_enabled(source_id.is_some(), egui::Button::new("Play here"));
+                    let button = if source_id.is_some() {
+                        button.on_hover_text("Send wallpaper.set with this monitor id")
+                    } else {
+                        button
+                    };
+                    if button.clicked() {
+                        play_here = Some(monitor.id.clone());
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            if source_id.is_none() {
+                theme::muted(ui, "Select a library item first to enable Play here.");
+            }
+        });
+
+        if let Some(target) = choose_target {
+            self.target_monitor = target;
+        }
+        if let (Some(id), Some(monitor)) = (source_id, play_here) {
+            self.send(Cmd::Set(id, Some(monitor)));
+        }
     }
 
     /// The Settings surface (design-m5 §5, design-m5-p4 §15). Pure wire
@@ -1005,135 +1113,138 @@ impl CascadeApp {
                 ui.add_space(8.0);
                 ui.separator();
 
-                ui.label(egui::RichText::new("Playback").strong());
-                ui.horizontal(|ui| {
-                    ui.label("Volume");
-                    // The slider owns the draft value directly. A drag
-                    // changes it every frame; `dirty` (computed below)
-                    // keeps the poll from reverting it, and the write is
-                    // sent on release (or on a discrete wheel/key step).
-                    let response =
-                        ui.add(egui::Slider::new(&mut self.form.volume, 0..=100).suffix("%"));
-                    slider_settled =
-                        response.drag_stopped() || (response.changed() && !response.dragged());
-                    ui.label(format!("{} / 100", self.form.volume));
-                });
-                theme::muted(
-                    ui,
-                    if listening {
-                        "Applies at the next load — no engine to restart."
-                    } else {
-                        "Applies to the playing video immediately; no restart."
-                    },
-                );
-                ui.add_space(10.0);
-
-                ui.label(egui::RichText::new("Engine").strong());
-                ui.horizontal(|ui| {
-                    ui.label("Engine mode");
-                    egui::ComboBox::from_id_salt("cascade-engine-mode")
-                        .selected_text(self.form.engine_mode.as_str())
-                        .show_ui(ui, |ui| {
-                            for mode in [PresentationMode::Accurate, PresentationMode::Efficient] {
-                                ui.selectable_value(
-                                    &mut self.form.engine_mode,
-                                    mode,
-                                    mode.as_str(),
-                                );
-                            }
-                        });
-                });
-                if engine_mode_changing {
-                    if listening {
-                        theme::muted(ui, "No engine to restart — applied at the next start.");
-                    } else {
-                        ui.colored_label(
-                            theme::WARN,
-                            "Changing the engine mode restarts the engine when a video is playing; the desktop is restored during the switch.",
-                        );
-                    }
-                    apply_engine = theme::accent_button(ui, "Apply & restart").clicked();
-                } else {
+                settings_group(ui, "Playback", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Volume");
+                        // The slider owns the draft value directly. A drag
+                        // changes it every frame; `dirty` (computed below)
+                        // keeps the poll from reverting it, and the write
+                        // is sent on release (or on a discrete step).
+                        let response =
+                            ui.add(egui::Slider::new(&mut self.form.volume, 0..=100).suffix("%"));
+                        slider_settled =
+                            response.drag_stopped() || (response.changed() && !response.dragged());
+                        ui.label(format!("{} / 100", self.form.volume));
+                    });
                     theme::muted(
                         ui,
-                        "Changing this restarts the engine when a video is playing; the desktop is restored during the switch.",
+                        if listening {
+                            "Applies at the next load — no engine to restart."
+                        } else {
+                            "Applies to the playing video immediately; no restart."
+                        },
                     );
-                }
-                ui.add_space(10.0);
-
-                ui.label(egui::RichText::new("Pause rules").strong());
-                ui.checkbox(&mut self.form.pause.fullscreen, "Pause on fullscreen");
-                ui.checkbox(&mut self.form.pause.maximized, "Pause on maximized window");
-                ui.checkbox(&mut self.form.pause.display_off, "Pause when display turns off");
-                ui.checkbox(&mut self.form.pause.session_lock, "Pause on session lock");
-                ui.checkbox(&mut self.form.pause.screensaver, "Pause on screensaver");
-                ui.checkbox(&mut self.form.pause.remote_session, "Pause on remote session");
-                ui.add_space(10.0);
-
-                ui.label(egui::RichText::new("Power").strong());
-                ui.horizontal(|ui| {
-                    ui.label("Power profile");
-                    egui::ComboBox::from_id_salt("cascade-power-profile")
-                        .selected_text(self.form.power_profile.as_str())
-                        .show_ui(ui, |ui| {
-                            for profile in [
-                                PowerProfile::Off,
-                                PowerProfile::Balanced,
-                                PowerProfile::Battery,
-                                PowerProfile::Quality,
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.form.power_profile,
-                                    profile,
-                                    profile.as_str(),
-                                );
-                            }
-                        });
                 });
-                ui.horizontal(|ui| {
-                    ui.label("On battery");
-                    egui::ComboBox::from_id_salt("cascade-on-battery")
-                        .selected_text(self.form.on_battery.as_str())
-                        .show_ui(ui, |ui| {
-                            for action in [
-                                BatteryAction::Off,
-                                BatteryAction::Pause,
-                                BatteryAction::Stop,
-                                BatteryAction::Continue,
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.form.on_battery,
-                                    action,
-                                    action.as_str(),
-                                );
-                            }
-                        });
+
+                settings_group(ui, "Engine", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Engine mode");
+                        egui::ComboBox::from_id_salt("cascade-engine-mode")
+                            .selected_text(self.form.engine_mode.as_str())
+                            .show_ui(ui, |ui| {
+                                for mode in
+                                    [PresentationMode::Accurate, PresentationMode::Efficient]
+                                {
+                                    ui.selectable_value(
+                                        &mut self.form.engine_mode,
+                                        mode,
+                                        mode.as_str(),
+                                    );
+                                }
+                            });
+                    });
+                    if engine_mode_changing {
+                        if listening {
+                            theme::muted(ui, "No engine to restart — applied at the next start.");
+                        } else {
+                            ui.colored_label(
+                                theme::WARN,
+                                "Changing the engine mode restarts the engine when a video is playing; the desktop is restored during the switch.",
+                            );
+                        }
+                        apply_engine = theme::accent_button(ui, "Apply & restart").clicked();
+                    } else {
+                        theme::muted(
+                            ui,
+                            "Changing this restarts the engine when a video is playing; the desktop is restored during the switch.",
+                        );
+                    }
                 });
-                if self.form.on_battery == BatteryAction::Stop {
-                    ui.colored_label(
-                        theme::WARN,
-                        "A full stop: the real wallpaper is restored and a zero-compute listener serves the tray until AC returns.",
+
+                settings_group(ui, "Pause rules", |ui| {
+                    ui.checkbox(&mut self.form.pause.fullscreen, "Pause on fullscreen");
+                    ui.checkbox(&mut self.form.pause.maximized, "Pause on maximized window");
+                    ui.checkbox(&mut self.form.pause.display_off, "Pause when display turns off");
+                    ui.checkbox(&mut self.form.pause.session_lock, "Pause on session lock");
+                    ui.checkbox(&mut self.form.pause.screensaver, "Pause on screensaver");
+                    ui.checkbox(&mut self.form.pause.remote_session, "Pause on remote session");
+                });
+
+                settings_group(ui, "Power", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Power profile");
+                        egui::ComboBox::from_id_salt("cascade-power-profile")
+                            .selected_text(self.form.power_profile.as_str())
+                            .show_ui(ui, |ui| {
+                                for profile in [
+                                    PowerProfile::Off,
+                                    PowerProfile::Balanced,
+                                    PowerProfile::Battery,
+                                    PowerProfile::Quality,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.form.power_profile,
+                                        profile,
+                                        profile.as_str(),
+                                    );
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("On battery");
+                        egui::ComboBox::from_id_salt("cascade-on-battery")
+                            .selected_text(self.form.on_battery.as_str())
+                            .show_ui(ui, |ui| {
+                                for action in [
+                                    BatteryAction::Off,
+                                    BatteryAction::Pause,
+                                    BatteryAction::Stop,
+                                    BatteryAction::Continue,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.form.on_battery,
+                                        action,
+                                        action.as_str(),
+                                    );
+                                }
+                            });
+                    });
+                    if self.form.on_battery == BatteryAction::Stop {
+                        ui.colored_label(
+                            theme::WARN,
+                            "A full stop: the real wallpaper is restored and a zero-compute listener serves the tray until AC returns.",
+                        );
+                    }
+                    if let Some(warning) = &conflict {
+                        ui.colored_label(theme::WARN, warning);
+                    }
+                });
+
+                settings_group(ui, "System", |ui| {
+                    ui.checkbox(
+                        &mut self.form.restore_wallpaper_on_exit,
+                        "Restore wallpaper on exit",
                     );
-                }
-                if let Some(warning) = &conflict {
-                    ui.colored_label(theme::WARN, warning);
-                }
-                ui.add_space(10.0);
-
-                ui.label(egui::RichText::new("System").strong());
-                ui.checkbox(
-                    &mut self.form.restore_wallpaper_on_exit,
-                    "Restore wallpaper on exit",
-                );
-                theme::muted(
-                    ui,
-                    "Desktop is restored on every exit regardless; this is stored state only.",
-                );
-                ui.checkbox(&mut self.form.tray, "Tray icon");
-                ui.checkbox(&mut self.form.autostart, "Start Cascade with Windows");
-                if windows_disabled {
-                    ui.colored_label(theme::WARN, "Disabled in Settings → Apps → Startup");
-                }
+                    theme::muted(
+                        ui,
+                        "Desktop is restored on every exit regardless; this is stored state only.",
+                    );
+                    ui.checkbox(&mut self.form.tray, "Tray icon");
+                    ui.checkbox(&mut self.form.autostart, "Start Cascade with Windows");
+                    if windows_disabled {
+                        ui.colored_label(theme::WARN, "Disabled in Settings → Apps → Startup");
+                    }
+                });
             });
 
         // Apply after the widgets updated the draft: one write in flight,
@@ -1165,32 +1276,48 @@ impl CascadeApp {
     }
 
     fn library_screen(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Library").strong().size(16.0));
-            theme::muted(ui, &format!("{} video(s)", self.library.len()));
-        });
+        let mut add = false;
+        let was_open = self.search_open;
+        // "Library" owns its row alone — no count, no button beside it
+        // (§16 refinement).
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("Library").strong().size(20.0));
         ui.add_space(8.0);
 
-        // Search **above** the grid (`design-m5.md` §5 sketch): a
-        // client-side filter over title + path (D6).
+        // Action row below the title: compact Add + icon-only search
+        // toggle on the left; the revealed field sits directly after the
+        // toggle at exactly the same box height as the two buttons.
+        let mut search_rects: Vec<egui::Rect> = Vec::new();
         ui.horizontal(|ui| {
-            let width = (ui.available_width() - 32.0).max(80.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search)
+            let button = egui::Button::new(egui::RichText::new("+ Add").size(13.0))
+                .fill(theme::ACCENT)
+                .min_size(vec2(ADD_W, ACTION_H));
+            if ui.add(button).clicked() {
+                add = true;
+            }
+
+            let toggle = search_button(ui, ACTION_H);
+            search_rects.push(toggle.rect);
+            if toggle.clicked() {
+                self.search_open = !self.search_open;
+                if !self.search_open {
+                    self.search.clear();
+                }
+            }
+
+            if self.search_open {
+                let width = SEARCH_W.min(ui.available_width());
+                // No right-pinning: the field sits immediately after the
+                // magnifier, sharing the same action row and box height
+                // (§16 Settings/search pass).
+                let field = egui::TextEdit::singleline(&mut self.search)
                     .hint_text("Search title or path\u{2026}")
-                    .desired_width(width),
-            );
-            if !self.search.is_empty()
-                && ui
-                    .small_button("\u{d7}")
-                    .on_hover_text("Clear search")
-                    .clicked()
-            {
-                self.search.clear();
+                    .desired_width(width)
+                    .min_size(vec2(width, ACTION_H));
+                search_rects.push(ui.add(field).rect);
             }
         });
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
         if self.library.is_empty() {
             ui.add_space(28.0);
@@ -1199,7 +1326,7 @@ impl CascadeApp {
                 ui.add_space(6.0);
                 theme::muted(
                     ui,
-                    "Files are referenced, never copied \u{2014} use + Add below, or drop files onto this window.",
+                    "Files are referenced, never copied \u{2014} use + Add above, or drop files onto this window.",
                 );
             });
             ui.add_space(28.0);
@@ -1207,14 +1334,29 @@ impl CascadeApp {
             self.library_grid(ui);
         }
 
-        // The actions live **below** the grid (`design-m5.md` §5). They
-        // are drawn last on purpose: a ScrollArea can only grow down, so
-        // nothing the list does can push them off-panel (the P2b lesson,
-        // now on the other side of the grid).
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-        self.action_row(ui);
+        // A click anywhere outside the search affordances hides the
+        // field — including a click on a thumbnail (the "active" case
+        // the user called out). Clicks on the toggle itself are excluded
+        // so the opening frame is not immediately undone (§16 refinement).
+        if was_open && self.search_open {
+            let click = ui.ctx().input(|input| {
+                if input.pointer.any_click() {
+                    input.pointer.latest_pos()
+                } else {
+                    None
+                }
+            });
+            if let Some(pos) = click {
+                if !search_rects.iter().any(|rect| rect.contains(pos)) {
+                    self.search_open = false;
+                    self.search.clear();
+                }
+            }
+        }
+
+        if add {
+            self.add_files();
+        }
     }
 
     /// The virtualized tile grid (design-m5-p4 §11.4): `show_rows`
@@ -1250,12 +1392,14 @@ impl CascadeApp {
         let columns =
             (((ui.available_width() + spacing.x) / (TILE_W + spacing.x)).floor() as usize).max(1);
         let total_rows = filtered.len().div_ceil(columns);
-        // Reserve the action row's height under the grid (BOTTOM_H).
-        let grid_h = (ui.available_height() - BOTTOM_H).max(MIN_GRID_H);
+        // No action row below the grid any more: the whole panel height
+        // belongs to the tiles (§16 refinement).
+        let grid_h = ui.available_height().max(MIN_GRID_H);
 
         let mut enqueue: Vec<ThumbReq> = Vec::new();
         let mut select: Option<String> = None;
         let mut set_row: Option<String> = None;
+        let mut remove_row: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .max_height(grid_h)
@@ -1286,21 +1430,37 @@ impl CascadeApp {
                             let texture = self.textures.get_touch(&item.id);
                             let failure = self.thumb_failed.get(&item.id).map(String::as_str);
                             let meta = item_meta(item);
-                            let response = ui.add(LibraryTile {
-                                // Ordinals renumber over the *filtered*
-                                // list (search keeps 1..n contiguous).
-                                ordinal: index + 1,
+                            let tile = LibraryTile {
+                                id: &item.id,
                                 title: &item.title,
                                 meta: &meta,
                                 path: &item.path,
                                 selected: self.selected.as_deref() == Some(item.id.as_str()),
                                 texture,
                                 failure,
+                            }
+                            .show(ui);
+                            // Show the menu *before* gating the card:
+                            // `Popup::menu` applies its open/toggle command
+                            // inside `show`, so skipping the call on the
+                            // click frame would never open the popup.
+                            egui::Popup::menu(&tile.info).show(|ui| {
+                                if ui.button("Set as wallpaper").clicked() {
+                                    set_row = Some(item.id.clone());
+                                }
+                                if ui.button("Remove from library").clicked() {
+                                    remove_row = Some(item.id.clone());
+                                }
                             });
-                            if response.clicked() {
+                            // The info button wins over the tile: clicking
+                            // it must not also select or set the wallpaper.
+                            if tile.info.clicked() {
+                                continue;
+                            }
+                            if tile.tile.clicked() {
                                 select = Some(item.id.clone());
                             }
-                            if response.double_clicked() {
+                            if tile.tile.double_clicked() {
                                 set_row = Some(item.id.clone());
                             }
                         }
@@ -1311,60 +1471,16 @@ impl CascadeApp {
             self.selected = Some(id);
         }
         if let Some(id) = set_row {
-            self.send(Cmd::Set(id));
+            self.send(Cmd::Set(id, self.target_monitor.clone()));
+        }
+        if let Some(id) = remove_row {
+            self.send(Cmd::Remove(id));
         }
         // Hand the collected requests to the thumb thread (T6). The
         // worker wakes the UI itself when a result arrives.
         if let Some(tx) = self.thumb_tx.as_ref() {
             for req in enqueue {
                 let _ = tx.send(req);
-            }
-        }
-    }
-
-    /// The three actions under the grid: Add / Remove / Set as
-    /// wallpaper — unchanged semantics (`design-m5.md` §5).
-    fn action_row(&mut self, ui: &mut egui::Ui) {
-        let has_selection = self.selected_item().is_some();
-        let mut add = false;
-        let mut remove = false;
-        let mut set = false;
-        ui.horizontal(|ui| {
-            if theme::accent_button(ui, "+ Add").clicked() {
-                add = true;
-            }
-            if ui
-                .add_enabled(has_selection, egui::Button::new("Remove"))
-                .on_hover_text(
-                    "Remove from the library \u{2014} the video file itself is never touched",
-                )
-                .clicked()
-            {
-                remove = true;
-            }
-            if ui
-                .add_enabled(
-                    has_selection,
-                    egui::Button::new("Set as wallpaper").fill(theme::ACCENT),
-                )
-                .clicked()
-            {
-                set = true;
-            }
-        });
-        if add {
-            self.add_files();
-        }
-        if remove {
-            if let Some(item) = self.selected_item() {
-                let id = item.id.clone();
-                self.send(Cmd::Remove(id));
-            }
-        }
-        if set {
-            if let Some(item) = self.selected_item() {
-                let id = item.id.clone();
-                self.send(Cmd::Set(id));
             }
         }
     }
@@ -1386,16 +1502,8 @@ impl eframe::App for CascadeApp {
             )
             .show(ui, |ui| self.sidebar(ui));
 
-        egui::Panel::bottom("status_strip")
-            .resizable(false)
-            .default_size(30.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                    .inner_margin(6.0),
-            )
-            .show(ui, |ui| self.strip(ui));
+        // The bottom status strip is gone (§16 refinement): mode, engine
+        // mode, fps, memory and volume are CLI facts, not UI chrome.
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(16.0))
@@ -1409,7 +1517,111 @@ impl eframe::App for CascadeApp {
     }
 }
 
+// --- drawing helpers -----------------------------------------------------
+
+/// Hand-painted icon-only search button: a zoom glass drawn as shapes,
+/// not a text glyph, so it renders at any DPI without font coverage
+/// (§16 refinement).
+fn search_button(ui: &mut egui::Ui, size: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), egui::Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        6.0,
+        if response.hovered() {
+            theme::BORDER
+        } else {
+            theme::SURFACE
+        },
+    );
+    let center = rect.center() - vec2(1.5, 1.5);
+    let radius = size * 0.22;
+    let stroke = egui::Stroke::new(1.5, theme::TEXT);
+    painter.circle_stroke(center, radius, stroke);
+    let start = center + vec2(radius * 0.72, radius * 0.72);
+    painter.line_segment([start, start + vec2(size * 0.16, size * 0.16)], stroke);
+    response.on_hover_text("Search")
+}
+
+/// One Settings category: a slightly larger bold heading, then its
+/// controls indented forward so they do not align with the heading. The
+/// manual indent (instead of `ui.indent`) keeps the layout free of egui's
+/// optional guide line; only presentation changes, no wire shape (§16
+/// Settings pass).
+fn settings_group(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
+    ui.label(egui::RichText::new(title).size(15.0).strong());
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.vertical(contents);
+    });
+    ui.add_space(10.0);
+}
+
+/// Geometry straight from the wire rect — no assumed origin or size
+/// (§18 S11). Negative coordinates are normal for a monitor left of the
+/// primary one and must be shown, not clamped.
+fn format_monitor_rect(rect: &Rect) -> String {
+    format!("{},{} {}×{}", rect.x, rect.y, rect.w, rect.h)
+}
+
+/// The library id currently playing, if any. The daemon attaches `source`
+/// only to the active monitor row (`ipc.md` §4), so this is never a guess.
+fn active_source_id(status: &Status) -> Option<String> {
+    status
+        .monitors
+        .iter()
+        .find_map(|monitor| monitor.source.as_ref().map(|source| source.id.clone()))
+}
+
+/// Drop a UI-local target that no longer exists after a display change.
+/// Returns true when it was cleared so the caller can report it honestly.
+fn retain_target(target: &mut Option<String>, status: &Status) -> bool {
+    let Some(id) = target.as_deref() else {
+        return false;
+    };
+    if status.monitors.iter().any(|monitor| monitor.id == id) {
+        return false;
+    }
+    *target = None;
+    true
+}
+
 // --- pure helpers (unit-tested) ------------------------------------------
+
+/// One full-width sidebar row. A hand-painted nav item rather than a
+/// `selectable_label`/`Button`: no border, no button padding, a tinted bar
+/// with a left accent for the active tab, and a faint fill on hover
+/// (§16 refinement).
+fn sidebar_nav_item(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), SIDEBAR_ITEM_H),
+        egui::Sense::click(),
+    );
+    let fill = if active {
+        theme::ACCENT_SOFT
+    } else if response.hovered() {
+        theme::SURFACE
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6.0, fill);
+    if active {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
+            0.0,
+            theme::ACCENT,
+        );
+    }
+    painter.text(
+        rect.left_center() + vec2(14.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(16.0),
+        if active { theme::TEXT } else { theme::MUTED },
+    );
+    response.clicked()
+}
 
 /// `1.2 s`-style duration in the CLI's shape: `m:ss`, `h:mm:ss` past an
 /// hour (`cascade library ls` prints the same).
@@ -1447,12 +1659,13 @@ fn matches_query(item: &LibraryItem, query: &str) -> bool {
     item.title.to_lowercase().contains(&needle) || item.path.to_lowercase().contains(&needle)
 }
 
-/// One grid tile: thumbnail + ordinal/title line + meta line inside a
-/// single 160×124 allocation (design-m5-p4 §11.4). Painted by hand so
-/// the row's cursor math stays exactly one `allocate_exact_size`.
+/// One grid tile: a large thumbnail, a wrapping title and a wrapping
+/// metadata line inside one `allocate_exact_size` (§16 refinement).
+/// Painted by hand so the row's cursor math stays exactly one allocation.
 struct LibraryTile<'a> {
-    /// 1-based position in the *filtered* list (renumbers with search).
-    ordinal: usize,
+    /// Stable id, used to keep the menu popup anchored to the same widget
+    /// even when search renumbers or scroll virtualization moves the tile.
+    id: &'a str,
     title: &'a str,
     meta: &'a str,
     path: &'a str,
@@ -1463,9 +1676,16 @@ struct LibraryTile<'a> {
     failure: Option<&'a str>,
 }
 
-impl egui::Widget for LibraryTile<'_> {
-    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
-        let (rect, response) = ui.allocate_exact_size(vec2(TILE_W, ROW_H), egui::Sense::click());
+/// The card and its (i) button are separate click targets. The button
+/// owns the item menu; the card keeps click-to-select / double-click-set.
+struct TileInteractions {
+    tile: egui::Response,
+    info: egui::Response,
+}
+
+impl LibraryTile<'_> {
+    fn show(self, ui: &mut egui::Ui) -> TileInteractions {
+        let (rect, tile) = ui.allocate_exact_size(vec2(TILE_W, ROW_H), egui::Sense::click());
         let thumb = egui::Rect::from_min_size(rect.min, vec2(TILE_W, THUMB_H));
         let painter = ui.painter();
         match self.texture {
@@ -1486,7 +1706,7 @@ impl egui::Widget for LibraryTile<'_> {
                         thumb.center(),
                         egui::Align2::CENTER_CENTER,
                         "no preview",
-                        egui::FontId::proportional(12.0),
+                        egui::FontId::proportional(14.0),
                         theme::MUTED,
                     );
                 }
@@ -1499,44 +1719,89 @@ impl egui::Widget for LibraryTile<'_> {
         };
         painter.rect(
             thumb,
-            2.0,
+            4.0,
             egui::Color32::TRANSPARENT,
             stroke,
             egui::StrokeKind::Inside,
         );
 
-        // The two text lines live in their own scope: `Ui::put` is a
-        // `scope_builder` that advances the *calling* ui's cursor to the
-        // widget rect (verified, egui 0.37 `ui.rs:1691`) — without this
-        // scope the puts would pull the row's cursor back under the
-        // tile. Both rects span the full tile width and the meta line
-        // ends exactly at the tile bottom, so the scope's advance
-        // lands on the same point as the allocation above.
-        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-            let title_rect =
-                egui::Rect::from_min_size(rect.min + vec2(0.0, THUMB_H + 4.0), vec2(TILE_W, 15.0));
-            ui.put(
-                title_rect,
-                egui::Label::new(format!("{}. {}", self.ordinal, self.title))
-                    .truncate()
-                    .halign(egui::Align::Min),
-            );
-            let meta_rect =
-                egui::Rect::from_min_size(rect.min + vec2(0.0, THUMB_H + 21.0), vec2(TILE_W, 13.0));
-            ui.put(
-                meta_rect,
-                egui::Label::new(egui::RichText::new(self.meta).color(theme::MUTED))
-                    .truncate()
-                    .halign(egui::Align::Min),
-            );
-        });
+        // The two text lines live in a scoped child ui whose cursor
+        // starts under the thumbnail; `ui.add` gives each label only the
+        // height it actually needs, so a one-line title sits directly on
+        // top of the metadata (a 4 pt gap) instead of being pushed down by
+        // a fixed two-line reservation. Long titles and codec/fps strings
+        // still wrap instead of truncating (§16 refinement).
+        //
+        // CORRECTION 1 (2026-11-22, user-observed): this scope originally
+        // inherited the parent's horizontal layout, so the two labels sat
+        // side by side and the metadata was squeezed into 2-3 characters
+        // per line. `top_down` is what actually stacks them.
+        //
+        // CORRECTION 2 (same day, user-observed): `scope_builder` calls
+        // `advance_cursor_after_rect(child_ui.min_rect())`. Since the
+        // tile was already allocated above, that advanced the parent
+        // cursor a second time and the next column overlapped this one.
+        // `new_child` allocates nothing in the parent — exactly what a
+        // paint-only overlay inside an already-allocated tile needs.
+        let text_top = rect.min + vec2(0.0, THUMB_H + 6.0);
+        let text_rect = egui::Rect::from_min_max(
+            text_top,
+            egui::pos2(rect.max.x, (text_top.y + TEXT_H).min(rect.max.y)),
+        );
+        let mut text_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        text_ui.add(
+            egui::Label::new(egui::RichText::new(self.title).size(15.0).strong())
+                .wrap()
+                .halign(egui::Align::Min),
+        );
+        text_ui.add_space(TEXT_GAP);
+        text_ui.add(
+            egui::Label::new(
+                egui::RichText::new(self.meta)
+                    .size(12.0)
+                    .color(theme::MUTED),
+            )
+            .wrap()
+            .halign(egui::Align::Min),
+        );
+
+        // The menu button sits inside the thumbnail, top-right: a plain
+        // circle filled with the sidebar-active tint, no outline, three
+        // vertical dots. A per-item explicit id keeps the popup anchored
+        // across search renumbering and scroll virtualization.
+        let info_rect = egui::Rect::from_min_size(
+            egui::pos2(thumb.max.x - INFO_SIZE - 8.0, thumb.min.y + 8.0),
+            vec2(INFO_SIZE, INFO_SIZE),
+        );
+        let info_id = egui::Id::unique(("library-menu", self.id));
+        let info = ui.interact(info_rect, info_id, egui::Sense::click());
+        if ui.is_rect_visible(info_rect) {
+            let painter = ui.painter();
+            let center = info_rect.center();
+            let radius = INFO_SIZE / 2.0;
+            let fill = if info.hovered() {
+                theme::ACCENT
+            } else {
+                theme::ACCENT_SOFT
+            };
+            painter.circle_filled(center, radius, fill);
+            for offset in [-5.0, 0.0, 5.0] {
+                painter.circle_filled(center + vec2(0.0, offset), 1.4, theme::TEXT);
+            }
+        }
+        let info = info.on_hover_text("Item actions");
 
         // Hover: the path always; a failed decode adds its reason
         // (T8) — the placeholder explains itself, never a banner.
-        match self.failure {
-            Some(reason) => response.on_hover_text(format!("{}\n{}", self.path, reason)),
-            None => response.on_hover_text(self.path),
-        }
+        let tile = match self.failure {
+            Some(reason) => tile.on_hover_text(format!("{}\n{}", self.path, reason)),
+            None => tile.on_hover_text(self.path),
+        };
+        TileInteractions { tile, info }
     }
 }
 
@@ -1559,17 +1824,6 @@ fn drop_missing_selection(library: &[LibraryItem], selected: &mut Option<String>
     };
     if !present {
         *selected = None;
-    }
-}
-
-/// Strip dot colour for a `status.mode` string (ipc.md §4). Unknown
-/// modes stay muted rather than guessing.
-fn mode_color(mode: &str) -> egui::Color32 {
-    match mode {
-        "attached" => theme::OK,
-        "paused" => theme::WARN,
-        "degraded" | "safe_mode" => theme::ERR,
-        _ => theme::MUTED,
     }
 }
 
@@ -1605,15 +1859,14 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Reply>) {
             }
             Cmd::Add(paths) => Reply::Added(ask_data("library.add", LibraryAddData { paths })),
             Cmd::Remove(id) => Reply::Simple(ask_ok("library.remove", LibraryRemoveData { id })),
-            Cmd::Set(id) => Reply::SetDone(ask_data(
+            Cmd::Set(id, monitor) => Reply::SetDone(ask_data(
                 "wallpaper.set",
                 SetData {
                     path: None,
                     id: Some(id),
-                    monitor: None,
+                    monitor,
                 },
             )),
-            Cmd::Resume => Reply::Simple(ask_ok("playback.resume", no_data())),
             Cmd::StartEngine => Reply::Started(start_engine()),
             Cmd::SettingsSet(patch) => Reply::SettingsChanged(ask_data("settings.set", patch)),
             Cmd::AutostartSet(enabled) => {
@@ -1776,25 +2029,14 @@ mod tests {
     }
 
     #[test]
-    fn ordinals_are_the_list_position_and_meta_is_complete() {
+    fn item_meta_is_complete_without_an_ordinal() {
         let library = [item("aa11"), item("bb22")];
-        // D1: the display number is the 1-based position, never the id.
-        let first = format!("{}. {}", 1, library[0].title);
-        assert_eq!(first, "1. aa11");
+        // §16: the displayed title is the bare file title — no ordinal.
+        assert_eq!(library[0].title, "aa11");
         let meta = item_meta(&library[0]);
         assert!(meta.contains("1920x1080"), "{meta}");
         assert!(meta.contains("H264"), "{meta}");
         assert!(meta.contains("1:05"), "{meta}");
-    }
-
-    #[test]
-    fn strip_colours_map_documented_modes_only() {
-        assert_eq!(mode_color("attached"), theme::OK);
-        assert_eq!(mode_color("paused"), theme::WARN);
-        assert_eq!(mode_color("degraded"), theme::ERR);
-        assert_eq!(mode_color("safe_mode"), theme::ERR);
-        assert_eq!(mode_color("boot"), theme::MUTED);
-        assert_eq!(mode_color("something-new"), theme::MUTED);
     }
 
     #[test]
@@ -1811,11 +2053,15 @@ mod tests {
             theme::ACCENT_HOVER,
             egui::Color32::from_rgb(0x4F, 0x51, 0xD6)
         );
+        assert_eq!(
+            theme::ACCENT_SOFT,
+            egui::Color32::from_rgb(0x22, 0x24, 0x4A)
+        );
     }
 
     // --- design-m5-p4 §5: event consumption ------------------------------
 
-    use cascade_core::ipc::{AutostartStatus, HostStatus, MemoryStatus};
+    use cascade_core::ipc::{AutostartStatus, HostStatus, LibraryRef, MemoryStatus, MonitorStatus};
     use cascade_core::PROTOCOL_VERSION;
 
     fn status_fixture() -> Status {
@@ -1839,12 +2085,101 @@ mod tests {
         }
     }
 
+    fn monitor(id: &str, primary: bool, rect: Rect, source: Option<LibraryRef>) -> MonitorStatus {
+        MonitorStatus {
+            id: id.to_string(),
+            rect,
+            primary,
+            source,
+            hwdec: None,
+            fps: None,
+            dropped: None,
+            video: None,
+            engine: None,
+        }
+    }
+
     fn snapshot(library: Option<Result<LibraryItemsData, ClientError>>) -> Reply {
         Reply::Snapshot {
             status: Ok(status_fixture()),
             library,
             settings: Ok(Settings::default()),
         }
+    }
+
+    fn snapshot_with_status(status: Status) -> Reply {
+        Reply::Snapshot {
+            status: Ok(status),
+            library: None,
+            settings: Ok(Settings::default()),
+        }
+    }
+
+    #[test]
+    fn monitors_tab_only_survives_a_real_multimonitor_snapshot() {
+        assert_eq!(Tab::Library.normalize(1), Tab::Library);
+        assert_eq!(Tab::Settings.normalize(0), Tab::Settings);
+        assert_eq!(Tab::Monitors.normalize(1), Tab::Library);
+        assert_eq!(Tab::Monitors.normalize(2), Tab::Monitors);
+    }
+
+    #[test]
+    fn monitor_geometry_comes_from_the_wire_rect() {
+        assert_eq!(
+            format_monitor_rect(&Rect::new(-1920, 120, 1920, 1080)),
+            "-1920,120 1920×1080"
+        );
+        assert_eq!(
+            format_monitor_rect(&Rect::new(0, 0, 1366, 768)),
+            "0,0 1366×768"
+        );
+    }
+
+    #[test]
+    fn active_source_and_target_follow_the_status_snapshot() {
+        let mut status = status_fixture();
+        status.monitors = vec![
+            monitor("\\\\.\\DISPLAY1", true, Rect::new(0, 0, 1366, 768), None),
+            monitor(
+                "\\\\.\\DISPLAY2",
+                false,
+                Rect::new(-1920, 0, 1920, 1080),
+                Some(LibraryRef {
+                    id: "aa11".to_string(),
+                    title: "clip".to_string(),
+                }),
+            ),
+        ];
+        assert_eq!(active_source_id(&status).as_deref(), Some("aa11"));
+        let mut target = Some("\\\\.\\DISPLAY2".to_string());
+        assert!(!retain_target(&mut target, &status));
+        assert_eq!(target.as_deref(), Some("\\\\.\\DISPLAY2"));
+
+        status.monitors.pop();
+        assert!(retain_target(&mut target, &status));
+        assert_eq!(target, None);
+        assert_eq!(active_source_id(&status), None);
+    }
+
+    #[test]
+    fn snapshot_normalizes_tab_and_stale_target() {
+        let mut app = CascadeApp::detached();
+        let mut status = status_fixture();
+        status.monitors = vec![monitor(
+            "\\\\.\\DISPLAY1",
+            true,
+            Rect::new(0, 0, 1366, 768),
+            None,
+        )];
+        app.tab = Tab::Monitors;
+        app.target_monitor = Some("\\\\.\\DISPLAY9".to_string());
+        app.apply(snapshot_with_status(status));
+        assert_eq!(app.tab, Tab::Library, "one monitor closes the surface");
+        assert_eq!(app.target_monitor, None, "a vanished id is never kept");
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|text| text.contains("no longer attached")));
     }
 
     fn event(name: &str, data: serde_json::Value) -> Event {
@@ -1901,7 +2236,7 @@ mod tests {
         )));
         assert!(
             app.poll_at <= Instant::now(),
-            "a state event refreshes the strip immediately"
+            "a state event refreshes the status immediately"
         );
 
         app.apply(snapshot(None));

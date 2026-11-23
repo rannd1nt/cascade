@@ -27,13 +27,12 @@ pub use app::CascadeApp;
 /// Errors are plain strings: they print on the CLI like every other
 /// command (`main.rs` maps them into its `Result<ExitCode, String>`).
 pub fn run() -> Result<(), String> {
-    // 980×590 default, 640×400 floor: the grid needs room to scan a
-    // list, but the window must stay usable on the smallest supported
-    // desktop (AGENTS §1 — no resolution assumptions; the size persists
-    // in the platform storage, D4). 590 keeps the status strip clear of
-    // the taskbar on a 1366×768 machine: measured 2026-11-12, default
-    // 640 opened at y=78 and its bottom (757) sat behind the taskbar
-    // (top 728).
+    // 980×590 default, 640×400 floor in **logical** points. These are
+    // usability choices, not monitor assumptions: eframe/winit applies
+    // per-monitor DPI scaling, the window can be dragged to any monitor,
+    // and its geometry persists in platform storage (D4). AGENTS §1
+    // forbids tuning to one desktop size, so no target resolution or
+    // taskbar coordinate is encoded here (design-m5-p4 §18 S10).
     // winit leaves the window class icon null; without this the window
     // and its taskbar button show Windows' generic icon (§13.1).
     let icon = icon::window_icon()?;
@@ -52,6 +51,10 @@ pub fn run() -> Result<(), String> {
         "cascade",
         options,
         Box::new(|cc| {
+            // OS CJK fallbacks must be registered before the first frame
+            // so non-ASCII library titles get real glyphs, not tofu
+            // (§16 refinement). No bundled font, no UI→daemon coupling.
+            theme::install_system_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
             // The reader thread needs the same context to request a
             // frame when an event arrives (design-m5-p4 §5).
