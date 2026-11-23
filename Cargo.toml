@@ -19,33 +19,29 @@ cascade-core = { path = "crates/cascade-core" }
 cascade-win = { path = "crates/cascade-win" }
 cascade-media = { path = "crates/cascade-media" }
 cascade-ui = { path = "crates/cascade-ui" }
-# design-m5 D11 (AGENTS §11 license check): first GUI framework. MIT OR
-# Apache-2.0, no third-party GPL/LGPL (Cascade itself is GPL-3.0-only).
-# glow renderer (D5) + bundled fonts only; the
-# default wgpu/wayland/x11/accesskit/clipboard features are not wanted.
-# "persistence" restores the window size across launches (design-m5 D4)
-# into %APPDATA%\Cascade\data\app.ron — inside our own data directory.
+# First GUI framework. MIT OR Apache-2.0, no third-party GPL/LGPL
+# (Cascade itself is GPL-3.0-only). The glow renderer and bundled fonts are
+# used; the default wgpu/wayland/x11/accesskit/clipboard features are not.
+# "persistence" restores the window size across launches into our own data
+# directory, %APPDATA%\Cascade\data\app.ron.
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence"] }
-# design-m5 P4-S2 / design-m5-p4 §11 T2: JPEG encode/decode for library
-# thumbnails. Already in Cargo.lock via eframe (which pulls it with the
-# `png` feature only); enabling `jpeg` adds zune-core + zune-jpeg — both
-# MIT OR Apache-2.0 (license check, AGENTS §11). Pure Rust, no GPL, and
-# the daemon never calls it (thumbnails decode in the UI process only).
-# design-m5-p4 §13 I1/I2: `png` is the decoder for the embedded GUI window
-# icon; it was already enabled through eframe, so this adds no crate.
+# JPEG encode/decode for library thumbnails. Already in Cargo.lock via eframe
+# (which enables only `png`); `jpeg` adds zune-core + zune-jpeg, both
+# MIT OR Apache-2.0. Pure Rust, no GPL, and the daemon never calls it.
+# `png` decodes the embedded GUI window icon and adds no new crate.
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# config.toml (architecture §10): settings persistence. MIT OR Apache-2.0,
-# pure Rust (winnow parser) so it cross-compiles under cargo-xwin.
+# Settings persistence. MIT OR Apache-2.0, pure Rust (winnow parser) so it
+# cross-compiles under cargo-xwin.
 toml = "0.8"
 windows = "0.62"
 # Direct dependency only for the `#[implement]` macro, which emits
 # `::windows_core::` paths; same version windows already pulls in.
 windows-core = "0.62"
-# One version for the pipe client (cascade-core, design-m5 D10) and the
-# pipe server (cascade-win). MIT OR Apache-2.0 (AGENTS §11).
+# One version for the pipe client (cascade-core) and the pipe server
+# (cascade-win). MIT OR Apache-2.0.
 windows-sys = "0.61"
 
 [profile.release]

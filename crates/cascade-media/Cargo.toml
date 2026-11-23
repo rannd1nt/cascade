@@ -6,12 +6,12 @@ license.workspace = true
 
 [dependencies]
 cascade-core = { workspace = true }
-# design-m5-p4 §11 T2: JPEG encode/decode for the thumbnail cache (first
-# frame → RGB → JPEG). MIT OR Apache-2.0; called by cascade-ui only — the
-# daemon never links a decode *call path* (isolation DoD, §11.5 V6).
+# JPEG encode/decode for the thumbnail cache (first frame → RGB → JPEG).
+# MIT OR Apache-2.0; called by cascade-ui only — the daemon never links a
+# decode call path.
 image = { workspace = true }
-# Media Foundation COM bindings (design-m2 §2.3): windows-sys ships no MF
-# APIs. License MIT OR Apache-2.0, same as the rest of the workspace.
+# Media Foundation COM bindings; windows-sys ships no MF APIs.
+# License MIT OR Apache-2.0, same as the rest of the workspace.
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
@@ -19,7 +19,7 @@ windows = { workspace = true, features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_UI_WindowsAndMessaging",
-    # Tier 2 SourceReader backend: D3D11 device + NV12 textures, DXGI swapchain.
+    # SourceReader backend: D3D11 device + NV12 textures, DXGI swapchain.
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",

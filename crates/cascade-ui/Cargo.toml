@@ -3,23 +3,23 @@ name = "cascade-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# eframe 0.37's MSRV outranks the workspace's 1.80 (design-m5 D11a).
+# eframe 0.37's MSRV outranks the workspace's 1.80.
 rust-version = "1.95"
 
 [dependencies]
 cascade-core = { workspace = true }
-# design-m5-p4 §11 T1: thumbnails decode in the UI process only — the UI
-# is the sole caller of cascade-media::thumbnail (architecture §3).
+# Thumbnails decode in the UI process only; the UI is the sole caller of
+# cascade-media::thumbnail.
 cascade-media = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# design-m5 D11a: the GUI framework (glow renderer + bundled fonts).
+# The GUI framework (glow renderer + bundled fonts).
 eframe = { workspace = true }
-# design-m5-p4 §13 I1: decode the embedded cascade-256.png into egui's
-# IconData for the window/taskbar icon. UI-process only; no new crate.
+# Decode the embedded cascade-256.png into egui's IconData for the
+# window/taskbar icon. UI-process only; no new crate.
 image = { workspace = true }
-# design-m5 D11b: IFileOpenDialog straight from the workspace's windows
-# crate — no rfd, no custom file browser (architecture §9, AGENTS §2).
+# IFileOpenDialog straight from the workspace's windows crate — no rfd, no
+# custom file browser.
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Com",

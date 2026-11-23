@@ -8,13 +8,13 @@ license.workspace = true
 cascade-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# config.toml persistence (design-m4 D10, architecture §10).
+# config.toml persistence.
 toml = { workspace = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_HiDpi",
-    # M5 P3 tray (design-m5 §6): Shell_NotifyIcon on the control window.
+    # Tray icon: Shell_NotifyIcon on the control window.
     "Win32_UI_Shell",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
@@ -24,20 +24,19 @@ windows-sys = { workspace = true, features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
     "Win32_Storage_FileSystem",
-    # M4 IPC (design-m4 §2): named-pipe server/client + process counters
-    # for the `status` payload (`ipc.md` §4).
+    # Named-pipe server/client + process counters for the `status` payload.
     "Win32_System_Pipes",
     "Win32_System_IO",
     "Win32_System_ProcessStatus",
-    # M4 S2b power collector (design-m4 §2.6): RegisterPowerSettingNotification
-    # + GetSystemPowerStatus (Power) and GUID_ACDC_POWER_SOURCE (SystemServices).
+    # Power collector: RegisterPowerSettingNotification + GetSystemPowerStatus
+    # (Power) and GUID_ACDC_POWER_SOURCE (SystemServices).
     "Win32_System_Power",
     "Win32_System_SystemServices",
     # CreateFileW / CreateNamedPipeW are cfg-gated on this feature in
     # windows-sys 0.61 (their signatures take SECURITY_ATTRIBUTES).
     "Win32_Security",
-    # design-m5-p4 §13 I4: raw CoInitializeEx HRESULT, so a successful
-    # S_FALSE is not mistaken for an apartment we own and must release.
+    # Raw CoInitializeEx HRESULT, so a successful S_FALSE is not mistaken for
+    # an apartment we own and must release.
     "Win32_System_Com",
 ] }
 # `windows-sys` no longer ships the D3D11/DXGI (nor Media Foundation) bindings,
@@ -49,16 +48,14 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
-    # M4 S4 device profile (design-m4 §5.1): `IDXGIOutput6::GetDesc1` is
-    # cfg-gated on Common + Gdi (the desc carries an HMONITOR).
+    # `IDXGIOutput6::GetDesc1` is cfg-gated on Common + Gdi (the desc carries
+    # an HMONITOR).
     "Win32_Graphics_Gdi",
-    # M4 S4 device profile (design-m4 §5.1): hardware-MFT enumeration for the
-    # decode capability (windows-sys ships no MF APIs) + the COM apartment
-    # MFTEnumEx needs on the calling thread.
+    # Hardware-MFT enumeration for decode capability (windows-sys ships no MF
+    # APIs) plus the COM apartment MFTEnumEx needs on the calling thread.
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
-    # design-m5-p4 §13 I4: IShellLinkW + IPersistFile, FOLDERID_{Programs,
-    # Desktop}, SHGetKnownFolderPath and SHChangeNotify for the per-user
-    # Start Menu / Desktop shortcuts.
+    # IShellLinkW + IPersistFile, FOLDERID_{Programs, Desktop},
+    # SHGetKnownFolderPath and SHChangeNotify for the per-user shortcuts.
     "Win32_UI_Shell",
 ] }
