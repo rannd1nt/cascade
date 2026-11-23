@@ -5,6 +5,11 @@
 //! general-Windows-11 rule outranks pixel-matching.
 
 use eframe::egui;
+use egui::{
+    class::HasClasses as _,
+    theme::{DefaultStyle, StyleProvider},
+    widget_style::{CheckboxStyle, StyleArgs, WidgetState},
+};
 
 // Palette.
 pub const BG: egui::Color32 = egui::Color32::from_rgb(0x0A, 0x0A, 0x0A);
@@ -17,11 +22,35 @@ pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x5D, 0x5F, 0xEF);
 pub const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(0x4F, 0x51, 0xD6);
 /// Tinted row behind the active sidebar tab — not a button fill.
 pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0x22, 0x24, 0x4A);
+/// Class added to a checked checkbox so the style provider can fill it with
+/// the accent colour.
+const CHECKED_CLASS: &str = "cascade-checked";
 
 // Status colours for notices (UI-only; the daemon never sends colours —
 // `status.mode` is a plain string).
 pub const WARN: egui::Color32 = egui::Color32::from_rgb(0xE0, 0xA0, 0x3C);
 pub const ERR: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x5C, 0x5C);
+
+/// egui 0.37 derives the checkbox frame from interaction state, which has no
+/// "checked" value. The class added by `checkbox` carries that state here.
+struct AccentCheckbox;
+
+impl StyleProvider<CheckboxStyle> for AccentCheckbox {
+    fn style(&mut self, args: &StyleArgs<'_>) -> CheckboxStyle {
+        let mut style: CheckboxStyle = DefaultStyle.style(args);
+        if args.has_class(CHECKED_CLASS) {
+            let fill = if matches!(args.state, WidgetState::Hovered | WidgetState::Active) {
+                ACCENT_HOVER
+            } else {
+                ACCENT
+            };
+            style.checkbox_frame.fill = fill;
+            style.checkbox_frame.stroke = egui::Stroke::new(1.0, fill);
+            style.check_stroke = egui::Stroke::new(2.0, TEXT);
+        }
+        style
+    }
+}
 
 /// Install OS font fallbacks so titles outside ASCII (Japanese, Chinese,
 /// Korean, and other non-Latin scripts) render instead of showing tofu
@@ -101,6 +130,7 @@ pub fn apply(ctx: &egui::Context) {
     // egui 0.37 styles per `Theme` (the palette is dark-only).
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_visuals(visuals);
+    ctx.replace_widget_theme::<CheckboxStyle>(AccentCheckbox);
 
     ctx.style_mut_of(egui::Theme::Dark, |style| {
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
@@ -112,6 +142,12 @@ pub fn apply(ctx: &egui::Context) {
 /// wallpaper, Start engine).
 pub fn accent_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(egui::Button::new(label).fill(ACCENT))
+}
+
+/// A checkbox whose checked frame uses the accent palette.
+pub fn checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
+    let is_checked = *checked;
+    ui.add(egui::Checkbox::new(checked, label).with_class_if(CHECKED_CLASS, is_checked))
 }
 
 /// The small muted caption used for hints and empty states.

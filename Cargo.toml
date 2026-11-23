@@ -24,7 +24,7 @@ cascade-ui = { path = "crates/cascade-ui" }
 # used; the default wgpu/wayland/x11/accesskit/clipboard features are not.
 # "persistence" restores the window size across launches into our own data
 # directory, %APPDATA%\Cascade\data\app.ron.
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence", "experimental"] }
 # JPEG encode/decode for library thumbnails. Already in Cargo.lock via eframe
 # (which enables only `png`); `jpeg` adds zune-core + zune-jpeg, both
 # MIT OR Apache-2.0. Pure Rust, no GPL, and the daemon never calls it.

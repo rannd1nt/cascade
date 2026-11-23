@@ -1120,8 +1120,11 @@ impl CascadeApp {
                         // changes it every frame; `dirty` (computed below)
                         // keeps the poll from reverting it, and the write
                         // is sent on release (or on a discrete step).
-                        let response =
-                            ui.add(egui::Slider::new(&mut self.form.volume, 0..=100).suffix("%"));
+                        let response = ui.add(
+                            egui::Slider::new(&mut self.form.volume, 0..=100)
+                                .suffix("%")
+                                .trailing_fill(true),
+                        );
                         slider_settled =
                             response.drag_stopped() || (response.changed() && !response.dragged());
                         ui.label(format!("{} / 100", self.form.volume));
@@ -1172,12 +1175,24 @@ impl CascadeApp {
                 });
 
                 settings_group(ui, "Pause rules", |ui| {
-                    ui.checkbox(&mut self.form.pause.fullscreen, "Pause on fullscreen");
-                    ui.checkbox(&mut self.form.pause.maximized, "Pause on maximized window");
-                    ui.checkbox(&mut self.form.pause.display_off, "Pause when display turns off");
-                    ui.checkbox(&mut self.form.pause.session_lock, "Pause on session lock");
-                    ui.checkbox(&mut self.form.pause.screensaver, "Pause on screensaver");
-                    ui.checkbox(&mut self.form.pause.remote_session, "Pause on remote session");
+                    theme::checkbox(ui, &mut self.form.pause.fullscreen, "Pause on fullscreen");
+                    theme::checkbox(
+                        ui,
+                        &mut self.form.pause.maximized,
+                        "Pause on maximized window",
+                    );
+                    theme::checkbox(
+                        ui,
+                        &mut self.form.pause.display_off,
+                        "Pause when display turns off",
+                    );
+                    theme::checkbox(ui, &mut self.form.pause.session_lock, "Pause on session lock");
+                    theme::checkbox(ui, &mut self.form.pause.screensaver, "Pause on screensaver");
+                    theme::checkbox(
+                        ui,
+                        &mut self.form.pause.remote_session,
+                        "Pause on remote session",
+                    );
                 });
 
                 settings_group(ui, "Power", |ui| {
@@ -1231,7 +1246,8 @@ impl CascadeApp {
                 });
 
                 settings_group(ui, "System", |ui| {
-                    ui.checkbox(
+                    theme::checkbox(
+                        ui,
                         &mut self.form.restore_wallpaper_on_exit,
                         "Restore wallpaper on exit",
                     );
@@ -1239,8 +1255,12 @@ impl CascadeApp {
                         ui,
                         "Desktop is restored on every exit regardless; this is stored state only.",
                     );
-                    ui.checkbox(&mut self.form.tray, "Tray icon");
-                    ui.checkbox(&mut self.form.autostart, "Start Cascade with Windows");
+                    theme::checkbox(ui, &mut self.form.tray, "Tray icon");
+                    theme::checkbox(
+                        ui,
+                        &mut self.form.autostart,
+                        "Start Cascade with Windows",
+                    );
                     if windows_disabled {
                         ui.colored_label(theme::WARN, "Disabled in Settings → Apps → Startup");
                     }
