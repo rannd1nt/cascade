@@ -1,0 +1,99 @@
+name: release
+
+# Tagged release only. The desktop host and the reliability matrix cannot be
+# validated in CI; release notes must say so explicitly.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Rust stable
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+          cargo --version
+
+      - name: Install LLVM resource compiler
+        shell: pwsh
+        run: |
+          $rc = (Get-Command llvm-rc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $rc -and (Test-Path 'C:\Program Files\LLVM\bin\llvm-rc.exe')) {
+            $rc = 'C:\Program Files\LLVM\bin\llvm-rc.exe'
+          }
+          if (-not $rc) {
+            choco install llvm -y --no-progress
+            $rc = 'C:\Program Files\LLVM\bin\llvm-rc.exe'
+          }
+          if (-not (Test-Path $rc)) { throw "llvm-rc not found at $rc" }
+          "CASCADE_LLVM_RC=$rc" >> $env:GITHUB_ENV
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --workspace
+
+      - name: Verify tag matches Cargo version
+        shell: pwsh
+        run: |
+          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' -List
+          if (-not $match) { throw 'workspace version not found in Cargo.toml' }
+          $version = $match.Matches[0].Groups[1].Value
+          $tag = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($version -ne $tag) { throw "tag $tag does not match Cargo version $version" }
+
+      - name: Release build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Stage release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\cascade.exe release\
+          Copy-Item LICENSE release\
+          Push-Location release
+          $hash = (Get-FileHash cascade.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  cascade.exe" | Out-File SHA256SUMS -Encoding ascii
+          Pop-Location
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @"
+          Cascade 0.1.0
+
+          - One binary: `cascade.exe`. Verify it with `SHA256SUMS`.
+          - Windows 11, D3D11, H.264 8-bit 4:2:0 up to 1080p60.
+          - CI cannot validate the desktop host or the reliability matrix; manual verification on the target machine is still required.
+          - Unsigned build: some antivirus products may warn on first run.
+          "@ | Set-Content release\notes.md -Encoding utf8
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME.TrimStart('v')
+          gh release create $env:GITHUB_REF_NAME `
+            release\cascade.exe `
+            release\SHA256SUMS `
+            release\LICENSE `
+            --title "Cascade $tag" `
+            --notes-file release\notes.md
