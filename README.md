@@ -121,18 +121,6 @@ and deletes Cascade's installed copy and its own files under `%LOCALAPPDATA%\Cas
 `library.json` and `state.json` are kept unless you pass `--purge`. Your videos are
 never touched.
 
-## Build from source
-
-On WSL with a stable Rust toolchain:
-
-```bash
-cargo install cargo-xwin --locked
-rustup target add x86_64-pc-windows-msvc
-cargo xwin build --release --target x86_64-pc-windows-msvc
-```
-
-Copy the resulting `cascade.exe` to Windows and run it there.
-
 ## License
 
 GPL-3.0-only. See [`LICENSE`](LICENSE). No third-party GPL/LGPL code is compiled into
