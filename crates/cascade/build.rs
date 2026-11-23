@@ -100,7 +100,7 @@ fn find_llvm_rc() -> PathBuf {
     );
 }
 
-/// `0.1.0-alpha.0` -> `[0, 1, 0]`; non-numeric parts become 0.
+/// `0.1.0` -> `[0, 1, 0]`; non-numeric parts become 0.
 fn numeric_version(version: &str) -> [u16; 3] {
     let mut numbers = [0u16; 3];
     for (slot, part) in numbers.iter_mut().zip(version.split('.')) {
