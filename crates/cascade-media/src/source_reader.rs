@@ -75,10 +75,11 @@ use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFActivate, IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer,
     IMFMediaType, IMFSample, IMFSourceReader, MFCreateAttributes, MFCreateDXGIDeviceManager,
     MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Video, MFShutdown, MFStartup,
-    MFTEnumEx, MFVideoFormat_NV12, MFVideoFormat_RGB32, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_DECODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
-    MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_VERSION,
+    MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoFormat_RGB32, MFSTARTUP_FULL,
+    MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_REGISTER_TYPE_INFO, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_D3D_MANAGER,
+    MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_VERSION,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::VT_I8;
@@ -94,70 +95,129 @@ pub(crate) const MF_SOURCE_READER_FLAG_END_OF_STREAM: u32 = 0x2;
 pub(crate) const MF_SOURCE_READER_FLAG_ERROR: u32 = 0x8;
 
 // H.264 / AVC is the only codec Cascade ships support for in v1. Everything
-// else is rejected with a clear, actionable message. The probe below checks
-// for any hardware video decoder MFT; H.264 is the de facto standard on all
-// Windows 11 machines with hardware decode.
+// else is rejected with a clear, actionable message. The probe below answers
+// two *different* questions, and M7-P0 keeps them separate because a bool
+// cannot express "we could not tell" (docs/design-m7-p0-honesty.md §3).
 
-/// Probe for a hardware video decoder MFT.
+/// What the H.264 probe could actually prove about this machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum H264Evidence {
+    /// A hardware MFT explicitly registered `MFVideoFormat_H264` as input.
+    MftRegistered,
+    /// Hardware decode may still be active, but no H.264 MFT registration
+    /// proves it. Measured D12: Intel UHD registers only an M-JPEG MFT while
+    /// GPU VideoDecode handles H.264. `stats()` must report `None`, never
+    /// `Some(false)` — an unobservable capability is not an absent one.
+    Unobservable,
+}
+
+impl H264Evidence {
+    /// Map evidence onto the honest `Option<bool>` wire answer.
+    fn as_backend_report(self) -> Option<bool> {
+        match self {
+            Self::MftRegistered => Some(true),
+            Self::Unobservable => None,
+        }
+    }
+}
+
+/// Enumerate hardware video decoder MFTs, optionally restricted to one input
+/// subtype. The caller owns the returned array and must release it exactly
+/// once with [`release_activate_array`], including when `count == 0`.
 ///
-/// Returns `Ok(())` when at least one hardware H.264 decoder is registered
-/// on this machine. Returns `Err` with a human-readable message when none
-/// is found — the caller should degrade to the colour background rather
-/// than silently fail.
-///
-/// This is M2.5 slice 1: codec probe before load. It keeps `load()` from
-/// opening a file MF cannot decode, and gives the user a clear reason why.
-fn probe_h264_hw_decoder() -> BackendResult<()> {
-    // SAFETY: `MFTEnumEx` is a flat Win32 API; the out-params are initialised
-    // locals passed by reference. Each `IMFActivate` in the returned array is
-    // released below, and the array itself is freed with `CoTaskMemFree`.
-    // The array out-param must be a *pointer to* a null variable, not a null
-    // pointer: passing null made `MFTEnumEx` fail with E_POINTER (0x80004003)
-    // on every call, so the probe rejected every file (fixed 2026-11-07).
+/// SAFETY: `MFTEnumEx` is a flat Win32 API. The array out-param must be a
+/// *pointer to* a null variable, not a null pointer: passing null made
+/// `MFTEnumEx` fail with E_POINTER (0x80004003) on every call, so the probe
+/// rejected every file (fixed 2026-11-07).
+unsafe fn enum_hw_decoders(
+    input: Option<&MFT_REGISTER_TYPE_INFO>,
+) -> BackendResult<(*mut Option<IMFActivate>, u32)> {
     let mut activate_array: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count: u32 = 0;
-    let hr = unsafe {
-        MFTEnumEx(
-            MFT_CATEGORY_VIDEO_DECODER,
-            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-            None,
-            None,
-            &mut activate_array,
-            &mut count,
-        )
-    };
-    if let Err(err) = hr {
-        return Err(BackendError::Unsupported(format!(
+    MFTEnumEx(
+        MFT_CATEGORY_VIDEO_DECODER,
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+        input.map(|value| value as *const _),
+        None,
+        &mut activate_array,
+        &mut count,
+    )
+    .map_err(|err| {
+        BackendError::Unsupported(format!(
             "cannot enumerate video decoder MFTs: 0x{:08X}",
             err.code().0
-        )));
+        ))
+    })?;
+    Ok((activate_array, count))
+}
+
+/// Release an `IMFActivate` array returned by [`enum_hw_decoders`].
+///
+/// SAFETY: `array` must come from a successful `enum_hw_decoders` call and
+/// must not have been released before. `ptr::read` moves each interface
+/// pointer out exactly once; the raw array memory is then freed without
+/// dropping it again, so no element is released twice.
+unsafe fn release_activate_array(array: *mut Option<IMFActivate>, count: u32) {
+    if array.is_null() {
+        return;
     }
+    for i in 0..count as usize {
+        drop(unsafe { std::ptr::read(array.add(i)) });
+    }
+    // SAFETY: the array came from MFTEnumEx's CoTaskMemAlloc.
+    unsafe {
+        windows::Win32::System::Com::CoTaskMemFree(Some(array as *const _));
+    }
+}
+
+/// Probe the machine's hardware decoder support before `load()`.
+///
+/// Two questions are answered, and they must not be confused:
+///
+/// 1. **Load acceptance** (the `Result`): does *any* hardware decoder MFT
+///    exist? This stays unfiltered by subtype because measured D12 case has
+///    an Intel UHD that registers only M-JPEG while GPU decode is active;
+///    filtering acceptance by H.264 would reject every video there.
+/// 2. **Evidence** (the returned [`H264Evidence`]): did a hardware MFT
+///    explicitly register H.264? Only that permits `hwdec: true` on the wire.
+///
+/// A failure of the second, filtered query is `Unobservable`, not a load
+/// error: the unfiltered call already proved MF works (design note §3 S5).
+fn probe_hw_decoder() -> BackendResult<H264Evidence> {
+    // SAFETY: initialised out-params, released below on every success path.
+    let (array, count) = unsafe { enum_hw_decoders(None)? };
     if count == 0 {
+        unsafe { release_activate_array(array, count) };
         return Err(BackendError::Unsupported(
             "no hardware video decoder MFT found on this machine".to_string(),
         ));
     }
-    if activate_array.is_null() {
+    if array.is_null() {
         // Defensive: the API returns an array with a non-zero count. Refuse
         // instead of dereferencing null below.
         return Err(BackendError::Unsupported(
             "MFTEnumEx reported decoders but returned no array".to_string(),
         ));
     }
-    // Release every IMFActivate in the array.
-    for i in 0..count as usize {
-        // SAFETY: `activate_array` has `count` elements written by MFTEnumEx;
-        // `ptr::read` moves each interface pointer out exactly once (the raw
-        // array memory is freed below without dropping it again), so the
-        // local's drop calls `Release` on the inner `IMFActivate`.
-        drop(unsafe { std::ptr::read(activate_array.add(i)) });
-    }
-    // Free the array allocated by MFTEnumEx (null is a valid argument).
-    // SAFETY: the array came from MFTEnumEx's CoTaskMemAlloc.
-    unsafe {
-        windows::Win32::System::Com::CoTaskMemFree(Some(activate_array as *const _));
-    }
-    Ok(())
+    unsafe { release_activate_array(array, count) };
+
+    let h264_input = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_H264,
+    };
+    let evidence = match unsafe { enum_hw_decoders(Some(&h264_input)) } {
+        Ok((array, count)) => {
+            let registered = count > 0 && !array.is_null();
+            unsafe { release_activate_array(array, count) };
+            if registered {
+                H264Evidence::MftRegistered
+            } else {
+                H264Evidence::Unobservable
+            }
+        }
+        Err(_) => H264Evidence::Unobservable,
+    };
+    Ok(evidence)
 }
 
 /// Log the DXGI adapter driving the D3D11 device. Useful for diagnosing
@@ -203,8 +263,9 @@ pub struct SourceReaderBackend {
     source: Option<PathBuf>,
     #[allow(dead_code)]
     opts: PlaybackOptions,
-    /// True when `probe_h264_hw_decoder()` succeeded in `load()`.
-    hw_decoder_available: bool,
+    /// What `probe_hw_decoder()` could prove in `load()`. `None` before load;
+    /// `Unobservable` still maps to `None` on the wire (never `Some(false)`).
+    h264_evidence: Option<H264Evidence>,
     /// Measured video FPS, updated on each presented frame for `stats()`.
     measured_fps: Arc<AtomicU32>,
     /// Command channel to the playback thread.
@@ -271,7 +332,7 @@ impl SourceReaderBackend {
         Ok(Self {
             source: None,
             opts: PlaybackOptions::default(),
-            hw_decoder_available: false,
+            h264_evidence: None,
             measured_fps: Arc::new(AtomicU32::new(0)),
             cmd_tx: None,
             thread: None,
@@ -1143,17 +1204,17 @@ impl Drop for SourceReaderBackend {
 
 impl MediaBackend for SourceReaderBackend {
     fn load(&mut self, source: &Path, opts: &PlaybackOptions) -> BackendResult<()> {
-        // M2.5: probe for hardware H.264 decoder before touching the file.
-        // If no H.264 decoder exists on this machine, fail fast with a
-        // clear message instead of silently degrading to colour.
-        probe_h264_hw_decoder()?;
-        self.hw_decoder_available = true;
+        // M2.5 + M7-P0: prove a hardware decoder exists (unfiltered, the
+        // load gate), then record whether H.264 registration was actually
+        // observed. The two answers must not be conflated.
+        let evidence = probe_hw_decoder()?;
         std::fs::metadata(source).map_err(|err| BackendError::Open {
             path: source.display().to_string(),
             reason: err.to_string(),
         })?;
         self.source = Some(source.to_path_buf());
         self.opts = opts.clone();
+        self.h264_evidence = Some(evidence);
         Ok(())
     }
 
@@ -1190,9 +1251,10 @@ impl MediaBackend for SourceReaderBackend {
 
     fn stats(&self) -> BackendStats {
         BackendStats {
-            // `load` refuses to run without a successful probe, so a
-            // loaded backend always answers `Some(true)` here.
-            hardware_decode: Some(self.hw_decoder_available),
+            // Only a confirmed H.264 MFT registration may answer `true`.
+            // `Unobservable` (and no load at all) stays `None` — claiming
+            // `Some(false)` would be a guess, which `ipc.md` forbids.
+            hardware_decode: self.h264_evidence.and_then(H264Evidence::as_backend_report),
             decoded_frames: self.frames_read.load(Ordering::Acquire),
             dropped_frames: 0,
             video_size: (
@@ -2666,7 +2728,19 @@ mod tests {
     }
 
     #[test]
-    fn probe_h264_hw_decoder_returns_result() {
+    fn h264_evidence_maps_to_honest_backend_report() {
+        // Pure mapping: confirmed registration is the only path to `true`.
+        assert_eq!(H264Evidence::MftRegistered.as_backend_report(), Some(true));
+        assert_eq!(H264Evidence::Unobservable.as_backend_report(), None);
+        // Before `load()` no probe has run, so `stats()` must omit `hwdec`
+        // rather than assert a `false` it has not observed.
+        let backend = SourceReaderBackend::new().expect("backend must construct");
+        assert_eq!(backend.h264_evidence, None);
+        assert_eq!(backend.stats().hardware_decode, None);
+    }
+
+    #[test]
+    fn probe_hw_decoder_returns_result() {
         // The probe needs MF + COM started on the calling thread — the
         // production order is `new()` then `load()`. Called bare on a virgin
         // thread `MFTEnumEx` blocks indefinitely (observed 2026-11-07).
@@ -2675,7 +2749,7 @@ mod tests {
         // decoder returns Err — either is valid; the test ensures the probe
         // neither panics nor hangs.
         let _backend = SourceReaderBackend::new().expect("backend must construct");
-        let _ = probe_h264_hw_decoder();
+        let _ = probe_hw_decoder();
     }
 
     #[test]
@@ -2685,8 +2759,6 @@ mod tests {
         let backend = SourceReaderBackend::new().expect("backend must construct");
         let stats = backend.stats();
         assert_eq!(stats.fps, 0.0);
-        // No load yet, so no probe has run: the answer is a known `false`,
-        // not `None` — `load` is what probes and would have failed otherwise.
-        assert_eq!(stats.hardware_decode, Some(false));
+        assert_eq!(stats.hardware_decode, None);
     }
 }
