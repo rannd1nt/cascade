@@ -109,7 +109,7 @@ jobs:
             "Cascade $env:RELEASE_VERSION"
             ""
             "- One binary: ``cascade.exe``. Verify it with ``SHA256SUMS``."
-            "- Windows 11, D3D11, H.264 8-bit 4:2:0 up to 1080p60."
+            "- Windows 11, D3D11, H.264 8-bit 4:2:0. 1080p60 is the tested baseline, not a resolution cap."
             "- CI cannot validate the desktop host or the reliability matrix; manual verification on the target machine is still required."
             "- Unsigned build: some antivirus products may warn on first run."
           ) | Set-Content release\notes.md -Encoding utf8
