@@ -1,11 +1,18 @@
 name: release
 
-# Tagged release only. The desktop host and the reliability matrix cannot be
+# A version-bump commit squash-merged to main starts the release. Pull requests
+# to main run the same gates without tagging or publishing, so a private Free
+# repo can still see red checks before merging. On public/paid plans, protect
+# main and require the "release" check before merging. The tag is created only
+# after every gate passes. The desktop host and reliability matrix cannot be
 # validated in CI; release notes must say so explicitly.
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -17,6 +24,23 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve release version from bump commit
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $subject = git log -1 --pretty=%s
+          if ($subject -notmatch '^chore\(repo\): bump version to (\d+\.\d+\.\d+)$') {
+            throw "main HEAD is not a version-bump commit: $subject"
+          }
+          $commitVersion = $Matches[1]
+          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' -List
+          if (-not $match) { throw 'workspace version not found in Cargo.toml' }
+          $cargoVersion = $match.Matches[0].Groups[1].Value
+          if ($commitVersion -ne $cargoVersion) {
+            throw "commit version $commitVersion does not match Cargo version $cargoVersion"
+          }
+          "RELEASE_VERSION=$cargoVersion" >> $env:GITHUB_ENV
 
       - name: Ensure Rust stable
         shell: pwsh
@@ -50,15 +74,6 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace
 
-      - name: Verify tag matches Cargo version
-        shell: pwsh
-        run: |
-          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' -List
-          if (-not $match) { throw 'workspace version not found in Cargo.toml' }
-          $version = $match.Matches[0].Groups[1].Value
-          $tag = $env:GITHUB_REF_NAME.TrimStart('v')
-          if ($version -ne $tag) { throw "tag $tag does not match Cargo version $version" }
-
       - name: Release build
         run: cargo build --release --target x86_64-pc-windows-msvc
 
@@ -73,27 +88,42 @@ jobs:
           "$hash  cascade.exe" | Out-File SHA256SUMS -Encoding ascii
           Pop-Location
 
-      - name: Write release notes
-        shell: pwsh
-        run: |
-          @"
-          Cascade 0.1.0
-
-          - One binary: `cascade.exe`. Verify it with `SHA256SUMS`.
-          - Windows 11, D3D11, H.264 8-bit 4:2:0 up to 1080p60.
-          - CI cannot validate the desktop host or the reliability matrix; manual verification on the target machine is still required.
-          - Unsigned build: some antivirus products may warn on first run.
-          "@ | Set-Content release\notes.md -Encoding utf8
-
-      - name: Publish GitHub Release
+      - name: Create release tag
+        if: github.event_name == 'push'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME.TrimStart('v')
-          gh release create $env:GITHUB_REF_NAME `
+          $tag = "v$env:RELEASE_VERSION"
+          git ls-remote --exit-code --tags origin "refs/tags/$tag" 2>$null
+          if ($LASTEXITCODE -eq 0) { throw "tag $tag already exists" }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a $tag -m "Cascade $env:RELEASE_VERSION"
+          git push origin $tag
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @(
+            "Cascade $env:RELEASE_VERSION"
+            ""
+            "- One binary: ``cascade.exe``. Verify it with ``SHA256SUMS``."
+            "- Windows 11, D3D11, H.264 8-bit 4:2:0. 1080p60 is the tested baseline, not a resolution cap."
+            "- CI cannot validate the desktop host or the reliability matrix; manual verification on the target machine is still required."
+            "- Unsigned build: some antivirus products may warn on first run."
+          ) | Set-Content release\notes.md -Encoding utf8
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:RELEASE_VERSION"
+          gh release create $tag `
             release\cascade.exe `
             release\SHA256SUMS `
             release\LICENSE `
-            --title "Cascade $tag" `
+            --title "Cascade $env:RELEASE_VERSION" `
             --notes-file release\notes.md

@@ -1108,8 +1108,7 @@ impl CascadeApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("Settings").strong().size(16.0));
+                screen_title(ui, "Settings");
                 ui.add_space(8.0);
                 ui.separator();
 
@@ -1300,8 +1299,7 @@ impl CascadeApp {
         let was_open = self.search_open;
         // "Library" owns its row alone — no count, no button beside it
         // (refinement).
-        ui.add_space(2.0);
-        ui.label(egui::RichText::new("Library").strong().size(20.0));
+        screen_title(ui, "Library");
         ui.add_space(8.0);
 
         // Action row below the title: compact Add + icon-only search
@@ -1538,6 +1536,14 @@ impl eframe::App for CascadeApp {
 }
 
 // drawing helpers -----------------------------------------------------
+
+/// Page title shared by the Library and Settings surfaces. One helper keeps
+/// their font, weight and top spacing identical instead of letting the two
+/// screens drift apart.
+fn screen_title(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new(title).strong().size(20.0));
+}
 
 /// Hand-painted icon-only search button: a zoom glass drawn as shapes,
 /// not a text glyph, so it renders at any DPI without font coverage
