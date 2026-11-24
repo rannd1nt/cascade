@@ -85,7 +85,7 @@ jobs:
           Copy-Item LICENSE release\
           Push-Location release
           $hash = (Get-FileHash cascade.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  cascade.exe" | Out-File SHA256SUMS -Encoding ascii
+          [System.IO.File]::WriteAllText('SHA256SUMS', "$hash  cascade.exe`n", [System.Text.Encoding]::ASCII)
           Pop-Location
 
       - name: Create release tag
